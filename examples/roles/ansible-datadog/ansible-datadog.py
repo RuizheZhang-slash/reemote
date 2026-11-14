@@ -32,7 +32,7 @@ it. The barriers below are therefore load-bearing, not stylistic:
 1. ``build_pre_cleanup``   -- legacy installer removal (needs the unit list)
 2. ``deploy_bootstrap``    -- apt-transport-https + gnupg (branch-free)
 3. ``build_repository``    -- keyring, legacy repo sweep, agent repo
-4. ``build_agent``         -- the agent + signing-keys packages
+4. ``deploy_agent``        -- the agent + signing-keys packages (branch-free)
 5. ``build_configure``     -- additional groups, every config file, the units
 6. ``build_cleanup_conf_d``-- the untracked/default/example check sweep
 7. ``compose(restart_handler(...), restart_handler(...))`` -- the handlers
@@ -40,20 +40,22 @@ it. The barriers below are therefore load-bearing, not stylistic:
 Implementation gaps
 -------------------
 
-Five genuine library gaps were proven while mapping the role. Two are now
+Five genuine library gaps were proven while mapping the role. Three are now
 **closed**: GAP-1 (#11, additive multi-key import into a non-default
 keyring) -- ``gpg.import_key`` gained ``dest=``, so the five signing keys
-import additively into the shared keyring, each fingerprint-pinned; and
-GAP-2 (#12, unprivileged read-back of ``0640`` service-owned files) --
+import additively into the shared keyring, each fingerprint-pinned; GAP-2
+(#12, unprivileged read-back of ``0640`` service-owned files) --
 ``FileContents`` now re-reads a present-but-unreadable file elevated, so
 ``files.install`` converges on service-owned configs and the login-user
-group-membership workaround is gone. The three remaining gaps are worked
-around here, marked ``GAP-n`` at the point of use, and tracked as GitHub
-issues; the workarounds carry a documented deviation. They are all
-bridgeable, so the migration completes -- a second pass will replace them
-once the library extensions land:
+group-membership workaround is gone; and GAP-3 (#13, non-idempotent
+``latest``) -- ``apt.packages(latest=True)`` now upgrades only packages
+with a pending upgrade, so the agent deploy passes ``latest=True``
+directly and its ``AptUpgradable`` gather barrier is gone. The two
+remaining gaps are worked around here, marked ``GAP-n`` at the point of
+use, and tracked as GitHub issues; the workarounds carry a documented
+deviation. They are both bridgeable, so the migration completes -- a
+second pass will replace them once the library extensions land:
 
-* GAP-3 (#13) -- ``apt.packages(latest=True)`` is non-idempotent
 * GAP-4 (#14) -- ``apt.repo`` has no ``update_cache``
 * GAP-5 (#15) -- ``apt.repo`` removal is file-scoped, no source provenance
 
@@ -81,7 +83,6 @@ from typing import Any
 from reemote import (
     AptPackages,
     AptSources,
-    AptUpgradable,
     CommandError,
     FindFiles,
     FindInFiles,
@@ -864,65 +865,56 @@ def build_repository(
     return repository
 
 
-def build_agent(
-    snapshot: dict[str, frozenset[str]],
-) -> Callable[[Host], Generator[OperationRequest]]:
+def deploy_agent(host: Host) -> Generator[OperationRequest]:
     """``pkg-debian/install-pinned.yml`` / ``install-latest.yml`` + signing keys.
 
-    GAP-3 (#13): ``apt.packages(latest=True)`` is non-idempotent -- it upgrades
-    every installed, unpinned package it is given *without checking whether
-    an upgrade exists* (apt.py's own comment says so), so a converged host
-    reports a change on every run. The snapshot froze ``AptUpgradable``
-    after the repository deploy refreshed the index; ``latest`` is set only
-    for a package that actually has a pending upgrade. Once the upgrade
-    lands, the next pass reads an empty upgradable set and the request
-    converges to a plain presence check.
+    GAP-3 (#13, closed): ``apt.packages(latest=True)`` now upgrades only
+    packages with a pending upgrade -- the operation reads ``AptUpgradable``
+    itself -- so ``latest=True`` is passed directly and the former
+    gather -> snapshot -> factory gate is gone. A converged host reports no
+    change, which is what keeps the restart handlers quiet on a second
+    pass. Branch-free, so this deploy needs no snapshot.
 
     ``skip_install`` is not reproduced as a request gate: reemote's
     ``apt.packages`` is version-aware for a ``name=version`` pin, so an
     already-installed pin is a no-op by construction. The flag still gates
     the ``__pycache__`` cleanup, which is what the role uses it for first.
     """
-
-    def agent(host: Host) -> Generator[OperationRequest]:
-        settings = role_settings(host)
-        flavor = settings["flavor"]
-        upgradable = snapshot.get(host.name, frozenset())
-        pin = settings["pin"]
-        if pin:
-            yield op(
-                apt.packages,
-                name=f"Install pinned {flavor} package",
-                packages=(f"{flavor}={pin}",),
-                allow_downgrades=settings["allow_downgrade"],
-                update=True,
-                cache_valid_time=settings["cache_valid_time"],
-                sudo=True,
-                when=is_ubuntu,
-            )
-        else:
-            yield op(
-                apt.packages,
-                name=f"Install latest {flavor} package",
-                packages=(flavor,),
-                latest=flavor in upgradable,
-                update=True,
-                cache_valid_time=settings["cache_valid_time"],
-                sudo=True,
-                when=is_ubuntu,
-            )
-        # The role installs datadog-signing-keys with state=latest and no
-        # update_cache ("that was just done by the repository task above").
+    settings = role_settings(host)
+    flavor = settings["flavor"]
+    pin = settings["pin"]
+    if pin:
         yield op(
             apt.packages,
-            name=f"Install latest {SIGNING_KEYS_PACKAGE} package",
-            packages=(SIGNING_KEYS_PACKAGE,),
-            latest=SIGNING_KEYS_PACKAGE in upgradable,
+            name=f"Install pinned {flavor} package",
+            packages=(f"{flavor}={pin}",),
+            allow_downgrades=settings["allow_downgrade"],
+            update=True,
+            cache_valid_time=settings["cache_valid_time"],
             sudo=True,
             when=is_ubuntu,
         )
-
-    return agent
+    else:
+        yield op(
+            apt.packages,
+            name=f"Install latest {flavor} package",
+            packages=(flavor,),
+            latest=True,
+            update=True,
+            cache_valid_time=settings["cache_valid_time"],
+            sudo=True,
+            when=is_ubuntu,
+        )
+    # The role installs datadog-signing-keys with state=latest and no
+    # update_cache ("that was just done by the repository task above").
+    yield op(
+        apt.packages,
+        name=f"Install latest {SIGNING_KEYS_PACKAGE} package",
+        packages=(SIGNING_KEYS_PACKAGE,),
+        latest=True,
+        sudo=True,
+        when=is_ubuntu,
+    )
 
 
 def build_configure(
@@ -1504,22 +1496,10 @@ async def main() -> None:
             await execute(inventory, repository, "Deploy 3: signing keys and apt repo")
         )
 
-        # GAP-3 (#13): read the upgrade candidates *after* the repository
-        # deploy refreshed the index, so `latest` is a real delta rather than
-        # an unconditional upgrade.
-        try:
-            upgradable = await gather_fact(targets, AptUpgradable)
-        finally:
-            for host in hosts:
-                await host.aclose()
-        agent = build_agent(
-            {
-                name: frozenset(entry["name"] for entry in entries)
-                for name, entries in upgradable.items()
-            }
-        )
+        # GAP-3 (#13) is closed: apt.packages(latest=True) reads the upgrade
+        # candidates itself, so the agent deploy needs no gather barrier.
         reports.append(
-            await execute(inventory, agent, "Deploy 4: the Datadog agent package")
+            await execute(inventory, deploy_agent, "Deploy 4: the Datadog agent package")
         )
 
         # service_facts, after the install: which agent units exist now, and

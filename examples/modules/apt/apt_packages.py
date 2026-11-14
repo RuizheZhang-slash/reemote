@@ -36,8 +36,10 @@ ensures on every machine. It reads the installed versions through the
 ``AptPackages`` fact and installs only what is missing, so re-running is a
 no-op. A name can be pinned as ``<pkg>=<version>``: a pin counts as present
 only when that *exact* version is installed, the baseline's ``ensure_packages``
-version match. ``latest=True`` would additionally upgrade every installed,
-unpinned name (the baseline's legacy blind upgrade); ``update=True`` runs a
+version match. ``latest=True`` would additionally upgrade installed,
+unpinned names that have a pending upgrade (the ``AptUpgradable`` fact
+gates it, so a converged host is a no-op -- Ansible's ``state=latest``);
+``update=True`` runs a
 stateless ``apt-get update`` first, and ``upgrade=True`` an
 ``apt-get upgrade`` gated by the ``SimulateOperationWillChange`` simulation,
 exactly like ``apt.dist_upgrade``. ``default_release`` would add apt's

@@ -239,8 +239,8 @@ fetch_keys(5 URLs)                                                        (contr
 ├─ run 3  build_repository       keyring, 5 × gpg.import_key(dest=…), legacy repo sweep,
 │                                agent repo, custom-file removal, gated apt.update
 │
-├─ gather: AptUpgradable                             ← after the index refresh (GAP-3)
-├─ run 4  build_agent            datadog-agent (pinned or latest), datadog-signing-keys
+├─ run 4  deploy_agent           datadog-agent (pinned or latest), datadog-signing-keys
+│                                (latest=True directly — GAP-3 closed by #13)
 │
 ├─ gather: SystemdUnitFiles, SystemdServiceState(datadog-agent-exp.service)
 │          + render every template control-side      ← the role's service_facts
@@ -283,7 +283,7 @@ filed) · **out** (scoped out).
 
 | Ansible task | reemote target | Status |
 | --- | --- | --- |
-| Gather Ansible Facts (`setup`) | `gather_fact` in `main`: `AptPackages`, `AptSources`, `AptUpgradable`, `SystemdUnitFiles`, `SystemdServiceState`, `FindFiles`, `FindInFiles` | recipe |
+| Gather Ansible Facts (`setup`) | `gather_fact` in `main`: `AptPackages`, `AptSources`, `SystemdUnitFiles`, `SystemdServiceState`, `FindFiles`, `FindInFiles` (`AptUpgradable` is read in-operation by `apt.packages(latest=True)`) | recipe |
 | Initialize internal `datadog_config` | `role_settings()` — defaults ⊕ `host.extra` | covered |
 | Check if OS is supported (`os-check.yml`) | `is_ubuntu` guard; non-Ubuntu hosts are **skipped, not failed** | covered (deviation D1) |
 | Windows remote update check | — | out |
@@ -325,8 +325,8 @@ filed) · **out** (scoped out).
 | (Custom) Remove Datadog custom repository file | `files.file(CUSTOM_REPO_FILE, present=False)` — the `datadog_apt_repo | length == 0` half | covered |
 | (Custom) Ensure Datadog repository is up-to-date | — | out |
 | `install-pinned.yml` | `apt.packages(packages=("<flavor>=<pin>",), allow_downgrades=…, update=True, cache_valid_time=…)` | covered |
-| `install-latest.yml` | `apt.packages(packages=(flavor,), latest=flavor in upgradable, …)` | **GAP-3 → [#13](https://github.com/kimjarvis/reemote/issues/13)** |
-| Install latest `datadog-signing-keys` (`state=latest`, no `update_cache`) | `apt.packages(latest=pkg in upgradable)` | **GAP-3 → [#13](https://github.com/kimjarvis/reemote/issues/13)** |
+| `install-latest.yml` | `apt.packages(packages=(flavor,), latest=True, …)` in `deploy_agent` — the operation gates upgrades on its own `AptUpgradable` read | covered (GAP-3 closed by [#13](https://github.com/kimjarvis/reemote/issues/13)) |
+| Install latest `datadog-signing-keys` (`state=latest`, no `update_cache`) | `apt.packages(latest=True)` | covered (GAP-3 closed) |
 | `update_cache: true` on every `apt_repository` | snapshot-gated stateless `apt.update()` at the end of deploy 3 | **GAP-4 → [#14](https://github.com/kimjarvis/reemote/issues/14)** |
 
 ### `tasks/_apt-key-import.yml` (the 5-key loop)
@@ -396,8 +396,9 @@ each handler's own `when:`.
 
 Five genuine library gaps were proven (full module surface enumerated, then
 corroborated by identifier greps), classified and ranked. **All five are
-bridgeable, so the migration completes.** G1 and G2 have since been closed by #11
-and #12 and their workarounds removed from the program ([§10](#10-second-pass)).
+bridgeable, so the migration completes.** G1, G2 and G3 have since been closed
+by #11, #12 and #13 and their workarounds removed from the program
+([§10](#10-second-pass)).
 Each gap is marked `GAP-n (#issue)` at its point of use in the program, and each
 ticket carries the evidence, the workaround, the acceptance criteria and the
 second-pass plan.
@@ -406,7 +407,7 @@ second-pass plan.
 | --- | --- | --- | --- | --- |
 | **G1** `gpg.import_key` had no `dest`/`keyring` — **closed** | [#11](https://github.com/kimjarvis/reemote/issues/11) | core | none left — five additive `gpg.import_key(dest=USR_SHARE_KEYRING, keyid=…)` requests | none left; the retired bundle workaround overwrote the whole file, left CURRENT unpinned and failed all five on one bad URL |
 | **G2** `files.install` read the destination back **unprivileged**, so `0640` service-owned files re-installed every deploy — **closed** | [#12](https://github.com/kimjarvis/reemote/issues/12) | core | none left — `FileContents` re-reads a present-but-unreadable file elevated (`run_shell_privileged`), so `install`/`transform`/`download` converge on service-owned configs | none left; the retired workaround added the login user to `dd-agent` in an earlier run — an extra privileged change the role never makes, widening API-key readability |
-| **G3** `apt.packages(latest=True)` upgrades unconditionally — non-idempotent | [#13](https://github.com/kimjarvis/reemote/issues/13) | core | gather `AptUpgradable` after the repo deploy; `latest = pkg in upgradable_names` | the decision is pre-state, so a candidate appearing between gather and apply waits for the next run |
+| **G3** `apt.packages(latest=True)` upgraded unconditionally — non-idempotent — **closed** | [#13](https://github.com/kimjarvis/reemote/issues/13) | core | none left — `deploy_agent` passes `latest=True` directly; the operation gates the upgrade set on its own in-namespace `AptUpgradable` read | none left; the retired workaround froze the decision from pre-state, so a candidate appearing between gather and apply waited for the next run |
 | **G4** `apt.repo` has no `update_cache` (`**kwargs` absorbs it silently) | [#14](https://github.com/kimjarvis/reemote/issues/14) | core (ordering) | snapshot boolean `needs_update` gates a **stateless** `apt.update()` | the refresh decision is frozen one barrier early; whole-index rather than scoped |
 | **G5** `apt.repo` removal is file-scoped and `AptSources` discards provenance | [#15](https://github.com/kimjarvis/reemote/issues/15) | core for the deprecation path | one `FindInFiles("/etc/apt", LEGACY_REPO_PATTERN)` grep → fan the six lines out across every file that holds one | hand-written ERE to keep in sync; `6 × files` requests; deb822 / `.list.save` hits cannot be edited and are dropped; an extra barrier |
 
@@ -423,10 +424,10 @@ Evidence highlights (line numbers in `src/reemote/modules/`):
   elevation from the host's inventory `privilege`, no API change. `install`,
   `transform` and `download` inherit the fix. The `SimulatedHost` seam gained a
   mode-aware `login_can_read`, so the offline suite proves the fallback.
-- **G3** — `apt/apt.py` L2688-L2720: the `latest` candidate set is *installed ∧
-  unpinned*, with no upgrade check; the comment at L2592-L2596 says so explicitly.
-  The `upgrade=True` branch **is** fact-gated (L2652-L2667), and `AptUpgradable`
-  (L1428) already ships.
+- **G3** — closed: `apt/apt.py` `packages` now intersects the *installed ∧
+  unpinned* set with the `AptUpgradable` fact (read in-operation, only when
+  there are candidates), so `latest=True` upgrades only pending names and the
+  reason lists each `pkg -> candidate` jump. A converged host yields nothing.
 - **G4** — `grep update_cache apt/apt.py` → **0 matches**; `repo` L3171-L3270,
   `sources_file` L3395, `key` L2213 all absorb it. `dnf/dnf.py`
   `packages(update_cache=…)` L1323/L1452-L1454 is the cross-namespace precedent.
@@ -484,20 +485,21 @@ preview. Four tests:
 3. **the second pass reports `changed=False` everywhere and queues no handler**;
 4. a dry preview mutates nothing.
 
-Three simulation limits are bridged explicitly between passes, because the
-in-memory host models no real subsystem: `apt_upgradable` is not cleared by a
-simulated install; `gpg_keyrings` entries hold content-hash stub keys (the
-simulation parses no OpenPGP), so the real imported fingerprints are seeded by
-hand; `systemd_unit_files` is a static table, so a removed unit is forgotten by
-hand — what `daemon-reload` does for real. The `find`/`grep` seams are recomputed
-from the simulated filesystem after every pass, so the second pass really
-observes the first pass's removals.
+Two simulation limits are bridged explicitly between passes, because the
+in-memory host models no real subsystem: `gpg_keyrings` entries hold
+content-hash stub keys (the simulation parses no OpenPGP), so the real
+imported fingerprints are seeded by hand; `systemd_unit_files` is a static
+table, so a removed unit is forgotten by hand — what `daemon-reload` does for
+real. No `apt_upgradable` bridge is needed: the simulated install applies a
+pending upgrade's candidate and retires the entry itself. The `find`/`grep`
+seams are recomputed from the simulated filesystem after every pass, so the
+second pass really observes the first pass's removals.
 
 `tests/test_examples.py` also scans the program statically (no mutable-container
 literals in `op()`, import-time-constructible module constants) and drives every
 factory with a `SNAPSHOT_ARGS` fixture.
 
-Gates: `uv run pytest tests/ -q` → **4277 passed**; `uv run ruff check .` → clean.
+Gates: `uv run pytest tests/ -q` → **4283 passed**; `uv run ruff check .` → clean.
 The docs build is unaffected (`examples/roles` is not in `mkdocs.yml`'s example
 scan paths).
 
@@ -531,15 +533,16 @@ Agreed in Phase 0: one target OS, the role's default path, opt-in branches exclu
 ## 10. Second pass
 
 As the tickets land, the workarounds come out and the program gets closer to the
-role's own shape. #11 and #12 have landed:
+role's own shape. #11, #12 and #13 have landed:
 
 | Ticket | What disappears from the program |
 | --- | --- |
 | [#11](https://github.com/kimjarvis/reemote/issues/11) — **done** | `fetch_key_bundle()`'s concatenation and the single-bundle `gpg.key` are gone: `fetch_keys()` keeps the five bodies separate and deploy 3 issues five additive `gpg.import_key(dest=…)` imports, CURRENT fingerprint-pinned |
 | [#12](https://github.com/kimjarvis/reemote/issues/12) — **done** | the login-user group-membership deploy is gone (and its deviation): `FileContents` re-reads unreadable files elevated, so the `0640` configs stay service-owned and converge. The eight-deploy sequence is now seven, with `datadog_additional_groups` folded into the configure deploy |
-| [#13](https://github.com/kimjarvis/reemote/issues/13) | the `AptUpgradable` gather and its snapshot; `latest=True` directly — one barrier fewer |
+| [#13](https://github.com/kimjarvis/reemote/issues/13) — **done** | the `AptUpgradable` gather, its snapshot and `build_agent` are gone: `deploy_agent` passes `latest=True` directly and the operation gates upgrades on its own fact read — one barrier fewer |
 | [#14](https://github.com/kimjarvis/reemote/issues/14) | `repository_snapshot`'s `needs_update` and the gated `apt.update`; `update_cache=True` on each `apt.repo` request |
 | [#15](https://github.com/kimjarvis/reemote/issues/15) | `LEGACY_REPO_PATTERN`, `legacy_repo_targets()`, the `FindInFiles` gather and the per-file fan-out; six `apt.repo(present=False)` requests exactly as the role has them |
 
-The offline test's between-pass bridges shrink accordingly (no `apt_upgradable`
-retirement once `latest` is fact-gated in-namespace).
+The offline test's between-pass bridges have shrunk accordingly: the simulated
+install retires a pending upgrade itself, so only the keyring fingerprints and
+the systemd unit table are bridged by hand.

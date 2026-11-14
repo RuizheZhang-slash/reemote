@@ -482,10 +482,18 @@ takes no `DPkg::Lock::Timeout` wrapper.
 fact supplies the installed versions, so a pin counts as present only
 when that *exact* version is installed (the baseline's `ensure_packages`
 version match). `present=True` installs only what is missing;
-`latest=True` additionally upgrades every installed, *unpinned* name —
-the baseline's legacy behavior, which upgrades blindly without checking
-whether a newer version exists (the upgrade reuses the install command
-without `extra_install_args`, as the baseline builds it). `present=False`
+`latest=True` additionally upgrades installed, *unpinned* names — but
+only those with a **pending upgrade**, read through the in-namespace
+`AptUpgradable` fact (`apt list --upgradable`), so a converged host is a
+no-op and the reason names each upgraded package's candidate version
+(`2 package(s) to upgrade (git -> 2.0, vim -> 2:9.1-2)`). That is
+Ansible's idempotent `state=latest` semantics, a deliberate deviation
+from the baseline's legacy blind upgrade of every installed, unpinned
+name (issue #13): an unconditional upgrade reports a change on every
+run, which breaks the change contract the handler notification relies
+on. The fact is read only when at least one requested package is
+installed and unpinned; the upgrade itself reuses the install command
+without `extra_install_args`, as the baseline builds it. `present=False`
 removes only what is installed, with `purge=True` switching `remove` to
 `purge` so configuration files go too. `update=True` runs `apt-get
 update` first and is **stateless** — it always yields, like the baseline's

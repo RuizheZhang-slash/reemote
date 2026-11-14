@@ -2848,21 +2848,35 @@ class SimulatedHost(Host):
         ``apt.packages``' install (and ``latest`` upgrade) mutation. A
         version pin (``pkg=version``) records exactly that version in
         ``apt_packages`` (the name -> sorted version list ``AptPackages``
-        reads), so a repeat pinned install is a no-op; an unpinned name
-        carries no repository metadata to resolve a version from, so it
-        gets the ``[""]`` placeholder the baseline's own operation fixtures use
-        for an unknown version -- and an already-installed name keeps its
-        versions (the ``latest`` path is non-idempotent by design, so no
-        candidate convergence is modeled). Kept separate from
-        ``packages``/``rpm_packages`` (the dnf-side state) so apt and dnf
-        never mix.
+        reads), so a repeat pinned install is a no-op. An unpinned name
+        with a pending ``apt_upgradable`` entry moves to that candidate
+        version and retires the entry -- what a real ``apt-get install``
+        does, and what makes the fact-gated ``latest`` upgrade converge on
+        a second pass; a pin retires the entry only when it names the
+        candidate version (any other pin leaves the package still
+        upgradable). An unpinned name without a pending upgrade carries no
+        repository metadata to resolve a version from, so it gets the
+        ``[""]`` placeholder the baseline's own operation fixtures use for
+        an unknown version -- and an already-installed name keeps its
+        versions. Kept separate from ``packages``/``rpm_packages`` (the
+        dnf-side state) so apt and dnf never mix.
         """
         for package in packages:
             name, sep, version = package.rpartition("=")
+            if not sep:
+                name = package
+            pending = next(
+                (entry for entry in self.apt_upgradable if entry["name"] == name),
+                None,
+            )
             if sep:
                 self.apt_packages[name] = [version]
+            elif pending is not None:
+                self.apt_packages[name] = [pending["candidate"]]
             else:
-                self.apt_packages.setdefault(package, [""])
+                self.apt_packages.setdefault(name, [""])
+            if pending is not None and (not sep or version == pending["candidate"]):
+                self.apt_upgradable.remove(pending)
 
     def remove_apt_packages(self, packages: tuple[str, ...]) -> None:
         """Record a simulated ``apt-get remove``/``purge``: drop the versions.

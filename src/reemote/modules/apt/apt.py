@@ -1478,10 +1478,12 @@ class AptUpgradable:
     # one package at a time, while this listing names every package an
     # upgrade would move and both versions of each jump -- the
     # change-management and auditing view to read before executing
-    # ``apt upgrade``. The row's source-info (offering suite) and
-    # architecture columns are deliberately dropped, like ``AptPackages``
-    # drops them; ``AptPolicy`` reports the offering repositories when
-    # they matter. If a name appears twice the last row wins (apt prints
+    # ``apt upgrade``. ``apt.packages(latest=True)`` reads it in-operation
+    # to gate its upgrade set on a real pending upgrade (issue #13). The
+    # row's source-info (offering suite) and architecture columns are
+    # deliberately dropped, like ``AptPackages`` drops them; ``AptPolicy``
+    # reports the offering repositories when they matter. If a name appears
+    # twice the last row wins (apt prints
     # one row per package) and the entries are sorted by name. No pending
     # upgrades (or no output at all) read as ``[]``. A missing ``apt``
     # exits 127, which ``run_shell`` reports as ``CommandNotFoundError``.
@@ -2527,7 +2529,12 @@ async def packages(
         present (bool, optional): Whether the packages should be installed.
             Defaults to True.
         latest (bool, optional): Whether to upgrade installed packages without
-            a pinned version. Defaults to False.
+            a pinned version to their candidate version. Only packages with a
+            pending upgrade (the in-namespace ``AptUpgradable`` fact) are
+            upgraded, so a converged host is a no-op -- Ansible's
+            ``state=latest`` semantics, replacing the baseline's unconditional
+            upgrade (issue #13). The reason names each upgraded package's
+            candidate version. Defaults to False.
         update (bool, optional): Run ``apt-get update`` before installing
             packages. Defaults to False.
         upgrade (bool, optional): Run ``apt-get upgrade`` before installing
@@ -2589,14 +2596,21 @@ async def packages(
     # runs the real ``upgrade`` anyway. The ``AptPackages`` fact supplies
     # the installed versions, so a pinned ``<pkg>=<version>`` is present
     # only when that *exact* version is installed (the baseline's
-    # ``ensure_packages`` version match), and ``latest`` follows the baseline's
-    # legacy behavior: every installed, unpinned package is upgraded
-    # without checking whether an upgrade actually exists (the upgrade
-    # command reuses ``install`` without ``extra_install_args``, as the baseline
-    # builds it). Removing needs root, as do installing and upgrading, so
+    # ``ensure_packages`` version match). The ``latest`` upgrade command
+    # reuses ``install`` without ``extra_install_args``, as the baseline
+    # builds it. Removing needs root, as do installing and upgrading, so
     # flag the request ``sudo=True`` (or ``su=True``).
     #
-    # Deliberate deviations from the baseline: the installed-versions fact is
+    # Deliberate deviations from the baseline: ``latest`` is gated on the
+    # in-namespace ``AptUpgradable`` fact (``apt list --upgradable``): only
+    # installed, unpinned packages with a *pending upgrade* are upgraded,
+    # and the reason names each candidate version. The baseline's legacy
+    # behavior upgraded every installed, unpinned package unconditionally,
+    # which breaks reemote's change contract (a converged host must report
+    # no change, or every notifying handler fires on every run), so issue
+    # #13 replaced it with Ansible's idempotent ``state=latest`` semantics.
+    # The fact is read only when at least one requested package is
+    # installed and unpinned. The installed-versions fact is
     # ``AptPackages`` (``apt list --installed``) rather than the baseline's
     # ``DebPackages`` (``dpkg -l``) -- the same substitution ``apt.deb``
     # made, reading the same per-name version information from its
@@ -2687,16 +2701,27 @@ async def packages(
 
         if present:
             to_install = tuple(pkg for pkg in requested if not is_installed(pkg))
-            # ``latest``: installed, unpinned packages are upgrade candidates.
-            to_upgrade = (
-                tuple(
+            # ``latest``: installed, unpinned packages are upgrade candidates,
+            # but only those the ``AptUpgradable`` fact names as having a
+            # pending upgrade are actually upgraded -- a converged host is a
+            # no-op (Ansible's ``state=latest``, issue #13). The fact is read
+            # only when there is a candidate to check.
+            to_upgrade: tuple[str, ...] = ()
+            candidates: dict[str, str] = {}
+            if latest:
+                installed_unpinned = tuple(
                     pkg
                     for pkg in requested
                     if _split_version(pkg)[1] is None and is_installed(pkg)
                 )
-                if latest
-                else ()
-            )
+                if installed_unpinned:
+                    candidates = {
+                        entry["name"]: entry["candidate"]
+                        for entry in await ctx.facts.get(AptUpgradable)
+                    }
+                    to_upgrade = tuple(
+                        pkg for pkg in installed_unpinned if pkg in candidates
+                    )
             if to_install:
                 ctx.changed = True
                 reasons.append(f"{len(to_install)} package(s) to install")
@@ -2710,7 +2735,10 @@ async def packages(
                 )
             if to_upgrade:
                 ctx.changed = True
-                reasons.append(f"{len(to_upgrade)} package(s) to upgrade")
+                jumps = ", ".join(
+                    f"{pkg} -> {candidates[pkg]}" for pkg in to_upgrade
+                )
+                reasons.append(f"{len(to_upgrade)} package(s) to upgrade ({jumps})")
                 yield AptInstallCommand(
                     packages=to_upgrade,
                     default_release=default_release,

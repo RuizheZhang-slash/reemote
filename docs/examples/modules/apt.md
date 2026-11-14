@@ -69,7 +69,9 @@ installing, upgrading or removing packages by name. It reads the
 versions, so a `<pkg>=<version>` pin counts as present only when that exact
 version is installed (the baseline's `ensure_packages` version match) —
 `present=True` installs only what is missing, `latest=True` additionally
-upgrades installed unpinned names (the baseline's legacy blind upgrade), and
+upgrades installed unpinned names that have a pending upgrade (the
+[`AptUpgradable`][reemote.modules.apt.apt.AptUpgradable] fact gates it, so
+a converged host is a no-op — Ansible's `state=latest` semantics), and
 `present=False` removes only what is installed, `purge=True` switching
 `remove` to `purge`. `update=True` runs a stateless `apt-get update` first;
 `upgrade=True` runs `apt-get upgrade`, gated by the

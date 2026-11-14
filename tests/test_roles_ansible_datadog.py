@@ -16,15 +16,13 @@ hosts, and the second pass must report ``changed=False`` everywhere and
 queue no restart handler. That is what proves the GAP workarounds converge
 rather than churn -- in particular the additive per-key import (GAP-1, now
 closed), the elevated read-back of ``0640`` service-owned configs (GAP-2,
-now closed), the ``AptUpgradable``-gated ``latest`` (GAP-3), the
-snapshot-gated ``apt.update`` (GAP-4) and the per-file legacy repo fan-out
-(GAP-5).
+now closed), the fact-gated ``latest`` (GAP-3, now closed -- the operation
+reads ``AptUpgradable`` itself), the snapshot-gated ``apt.update`` (GAP-4)
+and the per-file legacy repo fan-out (GAP-5).
 
-Three simulation limits are bridged explicitly between the passes, each
+Two simulation limits are bridged explicitly between the passes, each
 because the in-memory host models no real subsystem:
 
-* ``apt_upgradable`` is not cleared by a simulated ``apt-get install``, so
-  the pending upgrade is retired by hand once it has been applied;
 * ``gpg_keyrings`` entries hold content-hash stub keys (the simulation
   parses no OpenPGP), so the real imported fingerprints are seeded by hand;
 * ``systemd_unit_files`` is a static table, so a unit whose file the deploy
@@ -45,7 +43,6 @@ import pytest
 from reemote import (
     AptPackages,
     AptSources,
-    AptUpgradable,
     FindFiles,
     FindInFiles,
     SystemdServiceState,
@@ -240,10 +237,7 @@ def seed(host: SimulatedHost) -> None:
 
 
 def settle(host: SimulatedHost) -> None:
-    """Bridge the three subsystems the simulation does not model, between passes."""
-    # apt-get install applied the pending upgrade; the simulation keeps the
-    # candidate list, so retire it (a real `apt list --upgradable` is empty).
-    host.apt_upgradable = []
+    """Bridge the two subsystems the simulation does not model, between passes."""
     # The keyring import stored content-hash stub keys; the simulation parses
     # no OpenPGP, so replace them with the real fingerprints the keys carry.
     for keyring in host.gpg_keyrings:
@@ -320,15 +314,7 @@ async def migrate(
         )
     )
 
-    upgradable = await gather_fact(targets, AptUpgradable)
-    await execute(
-        datadog.build_agent(
-            {
-                name: frozenset(entry["name"] for entry in entries)
-                for name, entries in upgradable.items()
-            }
-        )
-    )
+    await execute(datadog.deploy_agent)
 
     units_after = await gather_fact(targets, SystemdUnitFiles)
     exp_state = await gather_fact(
@@ -427,6 +413,12 @@ async def test_first_pass_installs_and_configures_the_agent(rig):
     # Bootstrap, agent and signing keys are installed.
     for package in (*datadog.BOOTSTRAP_PACKAGES, "datadog-agent", "datadog-signing-keys"):
         assert package in host.apt_packages
+
+    # GAP-3 (#13) closed: latest=True upgraded the agent to its candidate
+    # version, and the simulated install retired the pending upgrade -- no
+    # between-pass bridge needed for the second pass to read it as gone.
+    assert host.apt_packages["datadog-agent"] == ["1:7.60.0-1"]
+    assert host.apt_upgradable == []
 
     # The five per-key imports accumulated additively in the shared,
     # non-default keyring (gpg.import_key dest=), and never touched the

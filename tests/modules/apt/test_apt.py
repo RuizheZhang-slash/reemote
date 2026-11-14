@@ -40,7 +40,8 @@ into: simulation-gated idempotence, the standalone autoremove, descriptor
 rendering parity with the baseline's operation fixtures, the SimulatedHost
 mutations and end-to-end lockstep runs. ``apt.packages`` is covered against
 the baseline's ``apt.packages`` operation fixtures (install/remove/purge,
-version pins, ``latest``, ``no_recommends``/``allow_downgrades``, extra
+version pins, the ``AptUpgradable``-gated ``latest`` (issue #13),
+``no_recommends``/``allow_downgrades``, extra
 args, ``wait_for_lock``, the ``update``/``upgrade`` prefixes), plus its
 dropped ``cache_time``/``force`` options, the SimulatedHost mutations and
 end-to-end / dry-run runs. ``apt.update`` and ``apt.upgrade`` are covered
@@ -3206,7 +3207,11 @@ async def test_apt_packages_default_release_carried_on_latest_upgrade():
     """Unlike ``extra_install_args`` -- which the ``latest`` upgrade path drops
     for baseline parity -- ``default_release`` rides the upgrade command too,
     so release targeting stays consistent and a re-run converges."""
-    host = SimulatedHost(name="h", apt_packages={"git": ["1.0"]})
+    host = SimulatedHost(
+        name="h",
+        apt_packages={"git": ["1.0"]},
+        apt_upgradable=[{"name": "git", "installed": "1.0", "candidate": "2.0"}],
+    )
     ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
     commands = [
         c
@@ -3321,16 +3326,23 @@ async def test_apt_packages_removal_respects_version_pins():
 
 
 async def test_apt_packages_latest_upgrades_installed_unpinned():
-    """The baseline's ``upgrade_packages.json``: ``latest=True`` installs the
-    absent package first, then upgrades the installed unpinned one with a
-    second ``install`` command (non-idempotent by design)."""
-    host = SimulatedHost(name="h", apt_packages={"git": ["1.0"]})
+    """The baseline's ``upgrade_packages.json``, with issue #13's gate:
+    ``latest=True`` installs the absent package first, then upgrades the
+    installed unpinned one *because it has a pending upgrade* with a second
+    ``install`` command, naming the candidate in the reason."""
+    host = SimulatedHost(
+        name="h",
+        apt_packages={"git": ["1.0"]},
+        apt_upgradable=[{"name": "git", "installed": "1.0", "candidate": "2.0"}],
+    )
     ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
     commands = [
         c async for c in apt.packages(ctx, packages=["git", "another"], latest=True)
     ]
     assert ctx.changed
-    assert ctx.reason == "1 package(s) to install; 1 package(s) to upgrade"
+    assert ctx.reason == (
+        "1 package(s) to install; 1 package(s) to upgrade (git -> 2.0)"
+    )
     assert commands == [
         AptInstallCommand(packages=("another",)),
         AptInstallCommand(packages=("git",)),
@@ -3340,11 +3352,17 @@ async def test_apt_packages_latest_upgrades_installed_unpinned():
 
 
 async def test_apt_packages_latest_skips_pins_and_carries_no_extra_args():
-    """Pinned packages are never ``latest`` candidates, and the upgrade
-    command omits ``extra_install_args`` (the baseline builds it before appending
-    them) while keeping the install flags."""
+    """Pinned packages are never ``latest`` candidates -- even with a pending
+    upgrade -- and the upgrade command omits ``extra_install_args`` (the
+    baseline builds it before appending them) while keeping the install
+    flags."""
     host = SimulatedHost(
-        name="h", apt_packages={"git": ["1.0"], "something": ["1.0"]}
+        name="h",
+        apt_packages={"git": ["1.0"], "something": ["1.0"]},
+        apt_upgradable=[
+            {"name": "git", "installed": "1.0", "candidate": "2.0"},
+            {"name": "something", "installed": "1.0", "candidate": "2.0"},
+        ],
     )
     ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
     commands = [
@@ -3363,6 +3381,129 @@ async def test_apt_packages_latest_skips_pins_and_carries_no_extra_args():
     assert commands[0].shell() == (
         f"{APT_GET_PREFIX}install --no-install-recommends git"
     )
+
+
+async def test_apt_packages_latest_no_pending_upgrade_is_a_noop():
+    """Issue #13: ``latest=True`` on a converged host reports no change and
+    yields nothing -- the upgrade set is gated on the ``AptUpgradable``
+    fact, not just "installed and unpinned" (Ansible's ``state=latest``)."""
+    host = SimulatedHost(name="h", apt_packages={"nginx": ["1.24.0"]})
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c async for c in apt.packages(ctx, packages=("nginx",), latest=True)
+    ]
+    assert not ctx.changed
+    assert ctx.reason == "all packages present"
+    assert commands == []
+
+
+async def test_apt_packages_latest_upgrades_only_pending_names():
+    """Only the names ``AptUpgradable`` reports are upgraded; an installed
+    unpinned name without a pending upgrade is left alone."""
+    host = SimulatedHost(
+        name="h",
+        apt_packages={"git": ["1.0"], "curl": ["8.0"]},
+        apt_upgradable=[{"name": "git", "installed": "1.0", "candidate": "2.0"}],
+    )
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c async for c in apt.packages(ctx, packages=["git", "curl"], latest=True)
+    ]
+    assert ctx.changed
+    assert ctx.reason == "1 package(s) to upgrade (git -> 2.0)"
+    assert commands == [AptInstallCommand(packages=("git",))]
+
+
+async def test_apt_packages_latest_reason_names_candidates_in_request_order():
+    """Every upgraded package's candidate version lands in the reason, in
+    request order (epoch prefixes intact, exactly as the fact reports
+    them)."""
+    host = SimulatedHost(
+        name="h",
+        apt_packages={"git": ["1.0"], "vim": ["2:9.1-1"]},
+        apt_upgradable=[
+            {"name": "git", "installed": "1.0", "candidate": "2.0"},
+            {"name": "vim", "installed": "2:9.1-1", "candidate": "2:9.1-2"},
+        ],
+    )
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c async for c in apt.packages(ctx, packages=["vim", "git"], latest=True)
+    ]
+    assert ctx.changed
+    assert ctx.reason == "2 package(s) to upgrade (vim -> 2:9.1-2, git -> 2.0)"
+    assert commands == [AptInstallCommand(packages=("vim", "git"))]
+
+
+async def test_apt_packages_latest_second_apply_is_a_noop():
+    """Issue #13's acceptance, end to end: the first run upgrades to the
+    candidate (the simulated install retires the pending entry, as real
+    apt does), and a second full run reports no change -- the ``latest``
+    request converges instead of churn."""
+
+    def latest_deploy(host):
+        yield op(
+            apt.packages, name="latest", packages=("git",), latest=True, sudo=True
+        )
+
+    host = SimulatedHost(
+        name="h",
+        apt_packages={"git": ["1.0"]},
+        apt_upgradable=[{"name": "git", "installed": "1.0", "candidate": "2.0"}],
+    )
+
+    def factory(entry):
+        return host
+
+    _plans, report, _hosts = await run(
+        [{"host": "h", "connection": {}}], latest_deploy, host_factory=factory
+    )
+    (entry,) = report.log
+    assert entry.changed
+    assert entry.commands == (AptInstallCommand(packages=("git",)),)
+    assert host.apt_packages == {"git": ["2.0"]}
+    assert host.apt_upgradable == []
+
+    _plans2, report2, _hosts2 = await run(
+        [{"host": "h", "connection": {}}], latest_deploy, host_factory=factory
+    )
+    (entry2,) = report2.log
+    assert not entry2.changed
+    assert entry2.reason == "all packages present"
+    assert entry2.commands == ()
+
+
+async def test_apt_install_seam_retires_the_pending_upgrade():
+    """The simulated ``apt-get install`` of an unpinned name applies its
+    pending candidate and clears the ``apt_upgradable`` entry -- the
+    subsystem bridge the fact-gated ``latest`` converges through."""
+    host = SimulatedHost(
+        name="h",
+        apt_packages={"git": ["1.0"]},
+        apt_upgradable=[{"name": "git", "installed": "1.0", "candidate": "2.0"}],
+    )
+    await send_command(host, AptInstallCommand(packages=("git",)))
+    assert host.apt_packages == {"git": ["2.0"]}
+    assert host.apt_upgradable == []
+
+
+async def test_apt_install_seam_pin_retires_only_the_candidate_pin():
+    """A pinned install records the pin; the pending upgrade is retired only
+    when the pin names the candidate version -- any other pin leaves the
+    package still upgradable, as real apt would."""
+    host = SimulatedHost(
+        name="h",
+        apt_packages={"git": ["1.0"]},
+        apt_upgradable=[{"name": "git", "installed": "1.0", "candidate": "2.0"}],
+    )
+    await send_command(host, AptInstallCommand(packages=("git=1.5",)))
+    assert host.apt_packages == {"git": ["1.5"]}
+    assert host.apt_upgradable == [
+        {"name": "git", "installed": "1.0", "candidate": "2.0"}
+    ]
+    await send_command(host, AptInstallCommand(packages=("git=2.0",)))
+    assert host.apt_packages == {"git": ["2.0"]}
+    assert host.apt_upgradable == []
 
 
 async def test_apt_packages_update_is_stateless():
