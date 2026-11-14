@@ -19,7 +19,8 @@ closed), the elevated read-back of ``0640`` service-owned configs (GAP-2,
 now closed), the fact-gated ``latest`` (GAP-3, now closed -- the operation
 reads ``AptUpgradable`` itself), the per-request ``update_cache`` refresh
 (GAP-4, now closed -- each ``apt.repo`` refreshes the index on a real change)
-and the per-file legacy repo fan-out (GAP-5).
+and the global legacy repo sweep (GAP-5, now closed -- ``apt.repo`` removes
+the line wherever it lives, consulting the ``AptSource`` filename).
 
 Two simulation limits are bridged explicitly between the passes, each
 because the in-memory host models no real subsystem:
@@ -29,13 +30,12 @@ because the in-memory host models no real subsystem:
 * ``systemd_unit_files`` is a static table, so a unit whose file the deploy
   removed is forgotten by hand -- what ``daemon-reload`` does for real.
 
-The ``find``/``grep`` seams are recomputed from the simulated filesystem
-after every pass, so the second pass really does observe the first pass's
-removals instead of a stale fixture.
+The ``find`` seam is recomputed from the simulated filesystem after every
+pass, so the second pass really does observe the first pass's removals
+instead of a stale fixture.
 """
 
 import importlib.util
-import re
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +44,6 @@ import pytest
 from reemote import (
     AptPackages,
     FindFiles,
-    FindInFiles,
     SystemdServiceState,
     SystemdUnitFiles,
     compose,
@@ -141,12 +140,12 @@ def user_row(name: str, group: str, groups: list[str], uid: int) -> dict[str, An
 
 
 def refresh_search_seams(host: SimulatedHost) -> None:
-    """Re-derive the ``find``/``grep`` answers from the simulated filesystem.
+    """Re-derive the ``find`` answer from the simulated filesystem.
 
-    Both seams are keyed by the question (the rendered ``find`` command, the
-    ``(path, pattern)`` pair), so the keys are built with the facts' own
-    ``command`` helpers rather than spelled out. The ERE the migration greps
-    for is plain enough that Python's ``re`` answers it identically.
+    The seam is keyed by the question (the rendered ``find`` command), so
+    the key is built with the fact's own ``command`` helper rather than
+    spelled out. The legacy-repo ``grep`` seam is gone (GAP-5/#15, closed):
+    ``apt.repo`` consults the ``AptSource`` filename provenance directly.
     """
     conf_d = Path(datadog.CONF_D)
     host.find_results = {
@@ -155,14 +154,6 @@ def refresh_search_seams(host: SimulatedHost) -> None:
             for path in host.remote_files
             if Path(path).parent.parent == conf_d
             and Path(path).name.startswith("conf.yaml")
-        ),
-    }
-    host.grep_files = {
-        ("/etc/apt", datadog.LEGACY_REPO_PATTERN): sorted(
-            path
-            for path, data in host.remote_files.items()
-            if path.startswith("/etc/apt/")
-            and re.search(datadog.LEGACY_REPO_PATTERN, data.decode(), re.MULTILINE)
         ),
     }
 
@@ -188,6 +179,7 @@ def seed(host: SimulatedHost) -> None:
             "distribution": "stable",
             "components": ["7"],
             "options": {},
+            "filename": LEGACY_LIST,
         },
         {
             "type": "deb",
@@ -195,6 +187,7 @@ def seed(host: SimulatedHost) -> None:
             "distribution": "noble",
             "components": ["main", "restricted"],
             "options": {},
+            "filename": "/etc/apt/sources.list",
         },
     ]
     host.remote_files = {
@@ -289,7 +282,6 @@ async def migrate(
         return report
 
     installed = await gather_fact(targets, AptPackages)
-    hits = await gather_fact(targets, FindInFiles, "/etc/apt", datadog.LEGACY_REPO_PATTERN)
     units_before = await gather_fact(targets, SystemdUnitFiles)
 
     await execute(
@@ -299,9 +291,7 @@ async def migrate(
     )
     await execute(datadog.deploy_bootstrap)
     await execute(
-        datadog.build_repository(
-            datadog.repository_snapshot(KEYS, hits, settings)
-        )
+        datadog.build_repository(datadog.repository_snapshot(KEYS, settings))
     )
 
     await execute(datadog.deploy_agent)
@@ -420,8 +410,9 @@ async def test_first_pass_installs_and_configures_the_agent(rig):
     assert keyring_entry["path"] == datadog.USR_SHARE_KEYRING
     assert len(keyring_entry["keys"]) == len(KEYS)
 
-    # GAP-5: the legacy line is gone from the file that held it, and the
-    # signed-by repo for the chosen major replaced it.
+    # GAP-5 (#15) closed: the global apt.repo(present=False) found the legacy
+    # line in the file that held it (via its AptSource filename) and removed
+    # it; the signed-by repo for the chosen major replaced it.
     assert LEGACY_LINE not in host.remote_files[LEGACY_LIST].decode()
     assert datadog.repo_entry("7") in host.apt_sources
     assert not any(datadog.is_legacy_datadog_source(s) for s in host.apt_sources)
@@ -522,11 +513,7 @@ async def test_dry_preview_matches_the_apply_for_every_deploy(rig):
         inventory[:1],
         datadog.build_repository(
             datadog.repository_snapshot(
-                KEYS,
-                await gather_fact(
-                    [untouched], FindInFiles, "/etc/apt", datadog.LEGACY_REPO_PATTERN
-                ),
-                {"ubuntu": datadog.role_settings(untouched)},
+                KEYS, {"ubuntu": datadog.role_settings(untouched)}
             )
         ),
         host_factory=factory,

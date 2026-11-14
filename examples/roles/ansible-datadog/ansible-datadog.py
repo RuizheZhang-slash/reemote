@@ -40,8 +40,8 @@ it. The barriers below are therefore load-bearing, not stylistic:
 Implementation gaps
 -------------------
 
-Five genuine library gaps were proven while mapping the role. Four are now
-**closed**: GAP-1 (#11, additive multi-key import into a non-default
+Five genuine library gaps were proven while mapping the role. All five are
+now **closed**: GAP-1 (#11, additive multi-key import into a non-default
 keyring) -- ``gpg.import_key`` gained ``dest=``, so the five signing keys
 import additively into the shared keyring, each fingerprint-pinned; GAP-2
 (#12, unprivileged read-back of ``0640`` service-owned files) --
@@ -50,16 +50,16 @@ import additively into the shared keyring, each fingerprint-pinned; GAP-2
 group-membership workaround is gone; GAP-3 (#13, non-idempotent
 ``latest``) -- ``apt.packages(latest=True)`` now upgrades only packages
 with a pending upgrade, so the agent deploy passes ``latest=True``
-directly and its ``AptUpgradable`` gather barrier is gone; and GAP-4
+directly and its ``AptUpgradable`` gather barrier is gone; GAP-4
 (#14, ``apt.repo`` had no ``update_cache``) -- the repository operations
 gained ``update_cache``, so each ``apt.repo`` request refreshes the index
 after a real sources change and the snapshot-gated ``apt.update`` barrier
-is gone. The one remaining gap is worked around here, marked ``GAP-n`` at
-the point of use, and tracked as a GitHub issue; the workaround carries a
-documented deviation. It is bridgeable, so the migration completes -- a
-second pass will replace it once the library extension lands:
-
-* GAP-5 (#15) -- ``apt.repo`` removal is file-scoped, no source provenance
+is gone; and GAP-5 (#15, ``apt.repo`` removal was file-scoped with no
+source provenance) -- ``AptSource`` now carries its ``filename`` and
+``apt.repo(present=False)`` with no ``filename`` removes the line from
+every sources file that holds it, so the legacy sweep is the role's six
+global ``apt_repository`` tasks again -- the ``FindInFiles`` grep, the
+per-file fan-out and the ``legacy_repo_targets`` helper are gone.
 
 See ``ansible-datadog.md`` for the full gap register, the coverage table
 and every deliberate deviation.
@@ -87,7 +87,6 @@ from reemote import (
     AptSources,
     CommandError,
     FindFiles,
-    FindInFiles,
     Host,
     HostConnectionError,
     InventoryError,
@@ -185,15 +184,6 @@ LEGACY_REPO_URLS = frozenset(
     {"http://apt.datadoghq.com/", "https://apt.datadoghq.com/"}
 )
 LEGACY_REPO_COMPONENTS = frozenset({"main", "6", "7"})
-
-#: GAP-5 (#15) workaround: ``AptSources`` reports *what* is configured
-#: but not *which file* holds it, and ``apt.repo(present=False)`` only edits
-#: the one file ``filename`` names. One recursive content grep recovers the
-#: provenance the fact drops, so the sweep can be fanned out per file.
-#: The ERE matches exactly the six legacy lines: no ``[options]`` block (so
-#: a modern ``signed-by`` line is never touched), ``stable`` suite, and one
-#: of the three deprecated components.
-LEGACY_REPO_PATTERN = r"^deb +https?://apt\.datadoghq\.com/ +stable +(main|6|7) *$"
 
 LEGACY_INSTALLER_UNITS = (
     "datadog-installer-exp.service",
@@ -548,7 +538,9 @@ def repo_entry(major: str) -> dict[str, Any]:
 
     Built by hand rather than by calling the private ``_parse_list_line``:
     the shape is public (``AptSources``' documented return type) and this
-    keeps the comparison independent of the parser's internals.
+    keeps the comparison independent of the parser's internals. The
+    ``filename`` is the provenance ``AptSources`` attaches -- the ``.list``
+    file ``apt.repo(filename=...)`` writes the line into.
     """
     return {
         "type": "deb",
@@ -556,29 +548,8 @@ def repo_entry(major: str) -> dict[str, Any]:
         "distribution": "stable",
         "components": [major],
         "options": {"signed-by": [USR_SHARE_KEYRING]},
+        "filename": f"{SOURCES_LIST_D}/ansible_datadog_{major}.list",
     }
-
-
-def legacy_repo_targets(hits: tuple[str, ...]) -> tuple[str | None, ...]:
-    """Map ``FindInFiles`` hits to the ``apt.repo`` ``filename`` arguments.
-
-    ``/etc/apt/sources.list`` is the ``filename=None`` case; a ``.list``
-    file under ``sources.list.d`` contributes its stem. Anything else (a
-    deb822 ``.sources`` file, a stray ``.list.save`` backup) cannot be
-    edited by ``apt.repo`` and is dropped -- the caller reports it. The
-    result is sorted for a stable request order, with the ``None`` entry
-    first because ``None`` and ``str`` do not compare.
-    """
-    stems = set()
-    main_file = False
-    for hit in hits:
-        if hit == "/etc/apt/sources.list":
-            main_file = True
-            continue
-        candidate = Path(hit)
-        if candidate.parent == Path(SOURCES_LIST_D) and candidate.suffix == ".list":
-            stems.add(candidate.stem)
-    return (None,) * main_file + tuple(sorted(stems))
 
 
 def fetch_keys(urls: tuple[str, ...]) -> tuple[bytes, ...]:
@@ -741,12 +712,14 @@ def build_repository(
 ) -> Callable[[Host], Generator[OperationRequest]]:
     """``pkg-debian.yml``: the keyring, the legacy sweep and the agent repo.
 
-    GAP-5 (#15: ``apt.repo`` removal is file-scoped, no source provenance)
-    is worked around here; see the comment at that site. Each ``apt.repo``
-    request carries ``update_cache=True`` (GAP-4/#14, now closed), so a real
-    sources change refreshes the index without a separate gated request.
-    The signing keys import additively into the shared keyring with
-    ``gpg.import_key(dest=...)`` (GAP-1/#11, now closed).
+    GAP-5 (#15: ``apt.repo`` removal was file-scoped, no source provenance)
+    is closed: each legacy line is removed with a global
+    ``apt.repo(present=False)`` that consults the ``AptSource`` filename
+    provenance, exactly as the role's six ``apt_repository`` tasks do. Each
+    ``apt.repo`` request carries ``update_cache=True`` (GAP-4/#14, now
+    closed), so a real sources change refreshes the index without a
+    separate gated request. The signing keys import additively into the
+    shared keyring with ``gpg.import_key(dest=...)`` (GAP-1/#11, now closed).
 
     The per-host ``io.BytesIO`` objects are built ONCE, in the factory body
     outside the generator: a stream is hashable but compared by *identity*,
@@ -805,27 +778,22 @@ def build_repository(
                 when=is_ubuntu,
             )
 
-        # GAP-5 (#15): AptSources entries carry no filename, and apt.repo's
-        # removal only edits the file `filename` names -- so "remove this
-        # repo line wherever it lives" needs the provenance the fact drops.
-        # The snapshot recovered it with one FindInFiles content grep; here
-        # the six legacy lines are fanned out across every file that holds
-        # one (plus /etc/apt/sources.list as filename=None). apt.repo
-        # no-ops when the line is not in the target file's own text, so the
-        # cross product is safe -- just verbose, exactly as Ansible's six
-        # global apt_repository tasks are.
-        for stem in plan["legacy_files"]:
-            for line in LEGACY_REPO_LINES:
-                yield op(
-                    apt.repo,
-                    name=f"Deprecate legacy Datadog repository {line!r} in {stem}",
-                    src=line,
-                    present=False,
-                    filename=stem,
-                    update_cache=True,
-                    sudo=True,
-                    when=is_ubuntu,
-                )
+        # GAP-5 (#15) is closed: AptSource entries carry their filename
+        # provenance, and apt.repo(present=False) with no filename removes
+        # the line from every sources file that holds it. The role's six
+        # global apt_repository tasks map one-to-one -- no FindInFiles grep,
+        # no per-file fan-out. A modern signed-by line for the same URL is a
+        # different repository identity and is left untouched.
+        for line in LEGACY_REPO_LINES:
+            yield op(
+                apt.repo,
+                name=f"Deprecate legacy Datadog repository {line!r}",
+                src=line,
+                present=False,
+                update_cache=True,
+                sudo=True,
+                when=is_ubuntu,
+            )
 
         # The role's with_dict over {6, 7}: present for the chosen major,
         # absent for the other. Both requests are always yielded -- the
@@ -1257,22 +1225,21 @@ def pre_cleanup_snapshot(
 
 def repository_snapshot(
     keys: tuple[bytes, ...],
-    hits: dict[str, Any],
     settings: dict[str, Any],
 ) -> dict[str, Any]:
-    """Freeze the signing-key bodies and the legacy-repo provenance the deploy needs.
+    """Freeze the signing-key bodies the repository deploy needs.
 
-    Each ``apt.repo`` request now carries ``update_cache=True`` (GAP-4/#14,
+    Each ``apt.repo`` request carries ``update_cache=True`` (GAP-4/#14,
     closed), so the index refresh rides the operation that changes a sources
     file. The former ``needs_update`` boolean -- and the ``sources``/``repo_files``
     reads that fed it -- are gone: there is no separate gated ``apt.update``.
+    The legacy-repo provenance is gone too (GAP-5/#15, closed): ``apt.repo``
+    consults the ``AptSource`` filename itself, so no ``FindInFiles`` grep is
+    frozen here.
     """
     snapshot: dict[str, Any] = {}
     for name in settings:
-        snapshot[name] = {
-            "keys": keys,
-            "legacy_files": legacy_repo_targets(tuple(hits.get(name, ()))),
-        }
+        snapshot[name] = {"keys": keys}
     return snapshot
 
 
@@ -1442,9 +1409,6 @@ async def main() -> None:
         try:
             installed = await gather_fact(targets, AptPackages)
             sources = await gather_fact(targets, AptSources)
-            hits = await gather_fact(
-                targets, FindInFiles, "/etc/apt", LEGACY_REPO_PATTERN
-            )
             units_before = await gather_fact(targets, SystemdUnitFiles)
         finally:
             for host in hosts:
@@ -1454,7 +1418,6 @@ async def main() -> None:
             print(
                 f"{host.name}: {len(installed.get(host.name, ()))} installed packages, "
                 f"{len(sources.get(host.name, ()))} apt sources, "
-                f"{len(hits.get(host.name, ()))} legacy repo file(s), "
                 f"{len(units_before.get(host.name, {}))} systemd units"
             )
 
@@ -1468,9 +1431,7 @@ async def main() -> None:
         reports.append(
             await execute(inventory, deploy_bootstrap, "Deploy 2: apt bootstrap packages")
         )
-        repository = build_repository(
-            repository_snapshot(keys, hits, settings)
-        )
+        repository = build_repository(repository_snapshot(keys, settings))
         reports.append(
             await execute(inventory, repository, "Deploy 3: signing keys and apt repo")
         )

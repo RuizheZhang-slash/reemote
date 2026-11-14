@@ -964,6 +964,13 @@ class AptSource(TypedDict):
             ``options["arch"]`` is always e.g. ``["amd64"]``. An inline
             armored ``Signed-By`` PGP block stays one entry holding the
             whole key text.
+        filename: The sources file the entry was read from (the absolute
+            path named by the ``#reemote-aptsource`` marker, e.g.
+            ``"/etc/apt/sources.list.d/datadog.list"``); absent when no
+            filename marker preceded it. Provenance, not identity: it
+            records *where* a repository is configured, so ``apt.repo``
+            can remove a line wherever it lives, while presence comparisons
+            ignore it (the ``DnfRepository.filename`` precedent).
     """
 
     # One configured apt repository, as a plain dict (``AptSources``' entry).
@@ -980,6 +987,7 @@ class AptSource(TypedDict):
     distribution: str
     components: list[str]
     options: dict[str, list[str]]
+    filename: NotRequired[str]
 
 
 class AptSources:
@@ -1020,6 +1028,7 @@ class AptSources:
     #             "distribution": "trusty",
     #             "components": ["restricted"],
     #             "options": {},
+    #             "filename": "/etc/apt/sources.list",
     #         },
     #     ]
     #
@@ -1036,9 +1045,13 @@ class AptSources:
     # Deliberate usability deviations from the baseline: entries are the plain
     # ``AptSource`` TypedDict-shaped dicts instead of its ``AptRepo``
     # dataclass/dict hybrid, and every ``options`` value is a list of strings
-    # instead of the baseline's single-value-collapses-to-str mix. The file
-    # marker is reemote's own (``#reemote-aptsource``, like
-    # ``DnfRepositories``' filename marker) instead of ``##UPSTREAM_FILE``.
+    # instead of the baseline's single-value-collapses-to-str mix. Each entry
+    # also keeps its ``filename`` provenance -- the marker is already parsed
+    # to pick the format, so the file each entry came from is attached rather
+    # than discarded (the ``DnfRepository.filename`` precedent), which is what
+    # lets ``apt.repo(present=False, filename=None)`` remove a line wherever it
+    # is configured. The file marker is reemote's own (``#reemote-aptsource``,
+    # like ``DnfRepositories``' filename marker) instead of ``##UPSTREAM_FILE``.
     # The baseline's ``requires_command`` gating on ``apt`` is deliberately
     # dropped: the command is pure shell and ``cat`` and never runs ``apt``,
     # so a host without apt simply reports its files (usually ``[]``).
@@ -1069,12 +1082,13 @@ class AptSources:
     )
 
     @classmethod
-    def _parse_list_line(cls, line: str) -> AptSource | None:
+    def _parse_list_line(cls, line: str, filename: str | None = None) -> AptSource | None:
         """Parse one legacy ``deb ...`` line, or None when it does not match.
 
         Each bracketed ``key=value`` option becomes a list: a comma-separated
         value splits into several entries, a single value stays a one-entry
         list (the usability deviation from the baseline's str-or-list mix).
+        ``filename`` is the source file's provenance, attached when known.
         """
         matches = cls.LINE_REGEX.match(line)
         if matches is None:
@@ -1086,16 +1100,21 @@ class AptSources:
                 key, value = option.split("=", 1)
                 options[key] = value.split(",")
 
-        return {
+        entry: AptSource = {
             "type": matches.group(1),
             "url": matches.group(3),
             "distribution": matches.group(4),
             "components": matches.group(5).split() if matches.group(5) else [],
             "options": options,
         }
+        if filename is not None:
+            entry["filename"] = filename
+        return entry
 
     @classmethod
-    def _parse_deb822_stanza(cls, lines: list[str]) -> list[AptSource]:
+    def _parse_deb822_stanza(
+        cls, lines: list[str], filename: str | None = None
+    ) -> list[AptSource]:
         """Parse one deb822 stanza into its expanded repository entries.
 
         Continuation lines (leading space/tab) fold into the current field
@@ -1141,7 +1160,7 @@ class AptSources:
             options["trusted"] = [data["Trusted"].lower()]
 
         components = data.get("Components", "").split()
-        return [
+        repos: list[AptSource] = [
             {
                 "type": repo_type,
                 "url": uri,
@@ -1154,9 +1173,13 @@ class AptSources:
             for uri in data.get("URIs", "").split()
             for suite in data.get("Suites", "").split()
         ]
+        if filename is not None:
+            for repo in repos:
+                repo["filename"] = filename
+        return repos
 
     @classmethod
-    def _parse_deb822_file(cls, lines: list[str]) -> list[AptSource]:
+    def _parse_deb822_file(cls, lines: list[str], filename: str | None = None) -> list[AptSource]:
         """Split a deb822 file on blank lines and parse each stanza."""
         repos: list[AptSource] = []
         stanza: list[str] = []
@@ -1164,7 +1187,7 @@ class AptSources:
             if raw.strip():
                 stanza.append(raw)
             elif stanza:
-                repos.extend(cls._parse_deb822_stanza(stanza))
+                repos.extend(cls._parse_deb822_stanza(stanza, filename))
                 stanza = []
         return repos
 
@@ -1175,7 +1198,8 @@ class AptSources:
         Each ``FILE_MARKER`` line starts a new file group; a ``.sources``
         group parses as deb822 stanzas, anything else as legacy lines
         (blank lines and ``#`` comments skipped, non-matching lines
-        ignored). Lines before the first marker are ignored. Pure and
+        ignored). Lines before the first marker are ignored. Every entry
+        carries its ``filename`` provenance (the marker's path). Pure and
         testable.
         """
         repos: list[AptSource] = []
@@ -1186,13 +1210,13 @@ class AptSources:
             nonlocal buffer
             if current_file is not None and buffer:
                 if current_file.endswith(".sources"):
-                    repos.extend(cls._parse_deb822_file(buffer))
+                    repos.extend(cls._parse_deb822_file(buffer, current_file))
                 else:
                     for raw in buffer:
                         line = raw.strip()
                         if not line or line.startswith("#"):
                             continue
-                        repo = cls._parse_list_line(line)
+                        repo = cls._parse_list_line(line, current_file)
                         if repo is not None:
                             repos.append(repo)
             buffer = []
@@ -1213,7 +1237,8 @@ class AptSources:
         if apt_sources is not None:
             # SimulatedHost seam: read the in-memory entries directly. Copy
             # each dict, its components list and every option list so
-            # callers never mutate the simulated state.
+            # callers never mutate the simulated state. ``**source`` carries
+            # the optional ``filename`` provenance through unchanged.
             return [
                 {
                     **source,
@@ -3177,6 +3202,25 @@ def _remove_repo_line(content: str | None, line: str) -> str:
     return new
 
 
+def _same_repository(a: AptSource, b: AptSource) -> bool:
+    """Whether two ``AptSource`` entries name the same repository.
+
+    Compares the five semantic keys -- type, url, distribution, components,
+    options -- and deliberately ignores ``filename``: provenance records
+    *where* a line was read from, not *what* it configures, so a repository
+    is present no matter which sources file holds it. This is what keeps
+    ``apt.repo`` and ``apt.sources_file`` idempotent now that fact entries
+    carry their source file (the ``DnfRepository.filename`` precedent).
+    """
+    return (
+        a["type"] == b["type"]
+        and a["url"] == b["url"]
+        and a["distribution"] == b["distribution"]
+        and a["components"] == b["components"]
+        and a["options"] == b["options"]
+    )
+
+
 @dataclass(frozen=True)
 class AptRepoUploadCommand(TransferCommand):
     """Spool the transformed sources content to a ``/tmp`` path on the target.
@@ -3266,7 +3310,10 @@ async def repo(
             system. Defaults to True.
         filename (str | None, optional): Base name under
             ``/etc/apt/sources.list.d/`` (the ``.list`` extension is appended);
-            by default ``/etc/apt/sources.list`` is managed. Defaults to None.
+            by default ``/etc/apt/sources.list`` is managed. For
+            ``present=False`` a name scopes the removal to that one file,
+            while ``None`` removes the line from *every* sources file that
+            holds it (provenance-driven, issue #15). Defaults to None.
         update_cache (bool, optional): Refresh the package index with
             ``apt-get update`` after the sources file changes -- Ansible's
             ``apt_repository`` ``update_cache: true`` spelling (issue #14).
@@ -3296,24 +3343,40 @@ async def repo(
 
     # baseline ``apt.repo`` parity, spool-and-install write family.
     #
-    # Presence is decided by parsing ``src`` with ``AptSources``' legacy
-    # line parser and comparing against the fact's entries -- the baseline's
-    # ``parse_apt_repo(src) in AptSources`` check -- so a repository already
-    # configured in *any* sources file (legacy or deb822) is a no-op, and an
-    # unparseable ``src`` counts as absent but is still appended when
-    # ``present=True`` (the baseline's tolerance). Either direction then *rewrites
-    # the managed file* instead of patching it in place: the file's current
-    # text is read with the in-namespace ``AptSourcesFile`` content fact (the
-    # ``DnfRepoFile`` pattern, path-generic), one pure transform of that text
-    # computes the desired content -- ``_add_repo_line`` appends the line once,
-    # ``_remove_repo_line`` drops every line the anchored pattern matches --
-    # and when the result differs from what is there the request yields *two*
-    # descriptors: an ``AptRepoUploadCommand`` transfer spooling the new text
-    # to a ``/tmp`` path over scp, then an ``AptRepoInstallCommand`` running
-    # the elevated install that overlays the protected file and removes the
-    # spool (the ``apt.key``/``apt.sources_file``/``dnf.repo`` pattern).
-    # Writing the apt sources needs root, so flag the request ``sudo=True``
-    # (or ``su=True``); the transfer stays unprivileged regardless.
+    # Presence is decided by parsing ``src`` with ``AptSources``' legacy line
+    # parser and comparing its *identity* against the fact's entries --
+    # ``_same_repository`` matches the five semantic keys (type, url,
+    # distribution, components, options) and ignores the ``filename``
+    # provenance each entry now carries, so a repository already configured
+    # in *any* sources file (legacy or deb822) is present regardless of where
+    # it lives. An unparseable ``src`` counts as absent but is still appended
+    # when ``present=True`` (the baseline's tolerance).
+    #
+    # Every edit *rewrites* a file instead of patching it in place: the file's
+    # current text is read with the in-namespace ``AptSourcesFile`` content
+    # fact (the ``DnfRepoFile`` pattern, path-generic), one pure transform of
+    # that text computes the desired content -- ``_add_repo_line`` appends the
+    # line once, ``_remove_repo_line`` drops every line the anchored pattern
+    # matches -- and when the result differs from what is there the request
+    # yields *two* descriptors per file: an ``AptRepoUploadCommand`` transfer
+    # spooling the new text to a ``/tmp`` path over scp, then an
+    # ``AptRepoInstallCommand`` running the elevated install that overlays the
+    # protected file and removes the spool (the
+    # ``apt.key``/``apt.sources_file``/``dnf.repo`` pattern). Writing the apt
+    # sources needs root, so flag the request ``sudo=True`` (or ``su=True``);
+    # the transfer stays unprivileged regardless.
+    #
+    # ``present=True`` always manages the one file ``filename`` names (or
+    # ``/etc/apt/sources.list``). ``present=False`` is where the scope differs
+    # (issue #15): a ``filename`` scopes the removal to that one file, while
+    # ``filename=None`` removes the line *wherever it is configured* -- the
+    # provenance of every matching entry names the target files, and each one
+    # whose raw text the remove transform actually changes gets its own
+    # upload+install pair. Only line-based files (``.list``/``sources.list``)
+    # are editable this way; a match that lives solely in a deb822 ``.sources``
+    # stanza is left untouched (the line transform cannot rewrite a stanza)
+    # and named in the no-op reason, as is a scoped removal aimed at a file
+    # that does not hold the line ("configured in <other>, not in <path>").
     #
     # Deliberate deviations from the baseline: the mutation rides self-contained
     # apt descriptors instead of delegating to ``files.line`` (reemote has
@@ -3323,12 +3386,11 @@ async def repo(
     # ``echo >>``/``sed -i``. That also drops the baseline's timestamped sed backup
     # dance (its timestamp is non-deterministic across phases) and keeps the
     # file's other lines, comments and blank lines exactly as they were,
-    # because the transform is line-based over the real content. Two further
-    # content-level no-ops round out the baseline's fact-level ones: an add whose
-    # line the file already carries (an unparseable ``src`` repeats cleanly)
-    # and a remove of a repository configured in some *other* sources file.
-    # ``**kwargs`` absorbs any further global arguments (``op()`` already
-    # strips ``name``/``sudo``/``su``).
+    # because the transform is line-based over the real content. A further
+    # content-level no-op rounds out the baseline's fact-level ones: an add
+    # whose line the file already carries (an unparseable ``src`` repeats
+    # cleanly). ``**kwargs`` absorbs any further global arguments (``op()``
+    # already strips ``name``/``sudo``/``su``).
     #
     # ``update_cache=True`` appends one ``AptUpdateCommand`` after the install,
     # on the real-change path only (issue #14, Ansible's ``apt_repository``
@@ -3343,36 +3405,65 @@ async def repo(
     path = f"/etc/apt/sources.list.d/{filename}.list" if filename else "/etc/apt/sources.list"
     sources = await ctx.facts.get(AptSources)
     parsed = AptSources._parse_list_line(src)
-    is_present = parsed is not None and parsed in sources
+    # Presence ignores provenance: the same repository line is present
+    # whichever sources file holds it (``_same_repository`` compares the five
+    # semantic keys, never ``filename``).
+    is_present = parsed is not None and any(_same_repository(entry, parsed) for entry in sources)
 
     if present:
         if is_present:
             ctx.reason = f'apt repo "{src}" exists'
             return
-    elif not is_present:
-        ctx.reason = f'apt repo "{src}" does not exist'
-        return
-
-    current = await ctx.facts.get(AptSourcesFile, path)
-    new = _add_repo_line(current, src) if present else _remove_repo_line(current, src)
-    if new == (current or ""):
-        # The fact wanted an edit the file's own text says is unnecessary.
-        ctx.reason = (
-            f'apt repo "{src}" is already listed in {path}'
-            if present
-            else f'apt repo "{src}" is not configured in {path}'
+        current = await ctx.facts.get(AptSourcesFile, path)
+        new = _add_repo_line(current, src)
+        if new == (current or ""):
+            # The fact wanted an edit the file's own text says is unnecessary.
+            ctx.reason = f'apt repo "{src}" is already listed in {path}'
+            return
+        edits = [(path, new)]
+        ctx.reason = f'apt repo "{src}" missing, will be added to {path}'
+    else:
+        if not is_present:
+            ctx.reason = f'apt repo "{src}" does not exist'
+            return
+        # The files provenance says hold this repository, in fact order.
+        configured_in = list(
+            dict.fromkeys(
+                entry["filename"]
+                for entry in sources
+                if _same_repository(entry, parsed) and entry.get("filename")
+            )
         )
-        return
+        # A ``filename`` scopes the removal to that one file; ``filename=None``
+        # removes the line wherever it is configured (issue #15) -- every
+        # provenance file, one upload+install pair each.
+        targets = [path] if filename is not None else configured_in
+        edits = []
+        for target in targets:
+            current = await ctx.facts.get(AptSourcesFile, target)
+            new = _remove_repo_line(current, src)
+            if new != (current or ""):
+                edits.append((target, new))
+        if not edits:
+            # Present, but not as a removable source line in any target file:
+            # a scoped removal aimed at the wrong file, or a global removal
+            # whose only match is a deb822 stanza (line-based edits leave
+            # ``.sources`` untouched). Name where it *is* configured.
+            where = ", ".join(configured_in) or "another sources file"
+            ctx.reason = (
+                f'apt repo "{src}" is configured in {where}, not in {path}'
+                if filename is not None
+                else f'apt repo "{src}" is configured in {where}, not as a removable source line'
+            )
+            return
+        removed_from = ", ".join(target for target, _ in edits)
+        ctx.reason = f'apt repo "{src}" present, will be removed from {removed_from}'
 
     ctx.changed = True
-    spool = _repo_spool_path(path)
-    ctx.reason = (
-        f'apt repo "{src}" missing, will be added to {path}'
-        if present
-        else f'apt repo "{src}" present, will be removed from {path}'
-    )
-    yield AptRepoUploadCommand(content=new, dest=spool)
-    yield AptRepoInstallCommand(spool=spool, dest=path)
+    for target, new in edits:
+        spool = _repo_spool_path(target)
+        yield AptRepoUploadCommand(content=new, dest=spool)
+        yield AptRepoInstallCommand(spool=spool, dest=target)
     if update_cache:
         ctx.reason += "; apt update"
         yield AptUpdateCommand()
@@ -3631,8 +3722,10 @@ async def sources_file(
         raise ValueError("apt.sources_file requires at least one URI and one suite")
 
     # Expand into the AptSources fact's shape (list-valued options) so the
-    # idempotence check is plain dict membership -- the baseline's
-    # AptSourcesFile.expand_to_repos() in this namespace's entry shape.
+    # idempotence check compares repository *identity* -- the five semantic
+    # keys, ignoring the ``filename`` provenance the fact now carries
+    # (``_same_repository``) -- the baseline's AptSourcesFile.expand_to_repos()
+    # in this namespace's entry shape.
     options: dict[str, list[str]] = {}
     if architectures_list:
         options["arch"] = architectures_list
@@ -3651,7 +3744,7 @@ async def sources_file(
         for suite in suites_list
     ]
     sources = await ctx.facts.get(AptSources)
-    if all(repo in sources for repo in desired):
+    if all(any(_same_repository(entry, repo) for entry in sources) for repo in desired):
         ctx.reason = f'apt sources file "{dest}" is already configured'
         return
 

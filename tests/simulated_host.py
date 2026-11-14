@@ -3012,19 +3012,27 @@ class SimulatedHost(Host):
         ``deb`` source with the ``main`` component and the host's codename (the
         ``lsb_release`` seam's ``Codename``, ``""`` when unset -- the simulation
         models no release detection). A repeat add of the same URL is a no-op.
+        The entry carries the ``filename`` of the ``.list`` file a real
+        ``apt-add-repository`` would write (``<owner>-ubuntu-<repo>-<codename>.list``).
         The signing key ``apt-add-repository`` also imports is not modeled,
         like ``install_apt_key`` leaves ``apt_keys`` to the test.
         """
         url = self._ppa_url(src)
         if any(source["url"] == url for source in self.apt_sources):
             return
+        # apt-add-repository writes one .list file per PPA, named
+        # <owner>-ubuntu-<repo>-<codename>.list; record that provenance so the
+        # entry matches the file a real add would create.
+        owner, _, repo = src.removeprefix("ppa:").partition("/")
+        codename = self.lsb_release.get("Codename", "")
         self.apt_sources.append(
             {
                 "type": "deb",
                 "url": url,
-                "distribution": self.lsb_release.get("Codename", ""),
+                "distribution": codename,
                 "components": ["main"],
                 "options": {},
+                "filename": f"/etc/apt/sources.list.d/{owner}-ubuntu-{repo}-{codename}.list",
             }
         )
 
@@ -3041,20 +3049,21 @@ class SimulatedHost(Host):
         self.apt_sources[:] = [s for s in self.apt_sources if s["url"] != url]
 
     @staticmethod
-    def _legacy_sources_entries(data: bytes) -> list[AptSource]:
+    def _legacy_sources_entries(data: bytes, filename: str | None = None) -> list[AptSource]:
         """Parse the ``AptSource`` entries one legacy sources file lists.
 
         Blank and ``#`` comment lines are skipped and lines the fact's regex
         cannot parse contribute nothing -- exactly how ``AptSources`` reads a
         ``.list`` group -- so the ``apt_sources`` seam stays consistent with
-        what the fact would report for the same bytes.
+        what the fact would report for the same bytes. ``filename`` is the
+        file's provenance, attached to every entry when known.
         """
         entries: list[AptSource] = []
         for raw in data.decode("utf-8").splitlines():
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            parsed = AptSources._parse_list_line(line)
+            parsed = AptSources._parse_list_line(line, filename)
             if parsed is not None:
                 entries.append(parsed)
         return entries
@@ -3072,21 +3081,18 @@ class SimulatedHost(Host):
         mode 644 -- the real command's ``chmod 0644``), so the content-read
         (``AptSourcesFile``), existence and metadata facts all see the
         installed file consistently. The ``apt_sources`` seam is refreshed
-        too: entries the *previous* content at ``dest`` parsed into are
-        dropped and the new content's legacy lines appended, so an add or a
-        removal replaces rather than accumulates and a repeat ``apt.repo``
-        is a no-op once the fresh per-step fact cache sees them. Like the
-        deb822 mutator below, the simulation tracks no per-entry
-        provenance, so an equal entry goes regardless of which file listed
-        it. An absent spool path installs nothing.
+        by provenance: every entry whose ``filename`` is ``dest`` is dropped
+        and the new content's legacy lines (each carrying ``filename=dest``)
+        appended, so an add or a removal replaces rather than accumulates
+        and a repeat ``apt.repo`` is a no-op once the fresh per-step fact
+        cache sees them. Entries from other files are left alone, which is
+        what lets a global removal rewrite one file without disturbing the
+        rest. An absent spool path installs nothing.
         """
         data = self.remote_files.pop(spool, None)
         if data is None:
             return
-        previous = self.remote_files.get(dest)
-        if previous is not None:
-            stale = self._legacy_sources_entries(previous)
-            self.apt_sources[:] = [s for s in self.apt_sources if s not in stale]
+        self.apt_sources[:] = [s for s in self.apt_sources if s.get("filename") != dest]
         self.remote_files[dest] = data
         self.existing_files.add(dest)
         self.file_stats[dest] = {
@@ -3095,7 +3101,7 @@ class SimulatedHost(Host):
             "mode": 644,
             "size": len(data),
         }
-        for entry in self._legacy_sources_entries(data):
+        for entry in self._legacy_sources_entries(data, dest):
             if entry not in self.apt_sources:
                 self.apt_sources.append(entry)
 
@@ -3111,22 +3117,18 @@ class SimulatedHost(Host):
         ``existing_files`` plus a minimal ``file_stats`` row (root-owned,
         mode 644 -- the real command's ``chmod 0644``), so the file facts
         see the installed file consistently. The ``apt_sources`` seam is
-        refreshed too: entries the *previous* content at ``dest`` parsed
-        into are dropped and the new content's entries (``AptSources``'
-        deb822 parser) appended, so a rewrite replaces rather than
-        accumulates and a repeat write is a no-op once the fresh per-step
-        fact cache sees them. The simulation does not track which file an
-        entry came from, so an equal entry goes regardless of its file
-        (mirrored by ``install_apt_repo_file``). An absent spool path
-        installs nothing.
+        refreshed by provenance: every entry whose ``filename`` is ``dest``
+        is dropped and the new content's entries (``AptSources``' deb822
+        parser, each carrying ``filename=dest``) appended, so a rewrite
+        replaces rather than accumulates and a repeat write is a no-op once
+        the fresh per-step fact cache sees them. Entries from other files
+        are left alone (mirrored by ``install_apt_repo_file``). An absent
+        spool path installs nothing.
         """
         data = self.remote_files.pop(spool, None)
         if data is None:
             return
-        previous = self.remote_files.get(dest)
-        if previous is not None:
-            stale = AptSources._parse_deb822_file(previous.decode("utf-8").splitlines())
-            self.apt_sources[:] = [s for s in self.apt_sources if s not in stale]
+        self.apt_sources[:] = [s for s in self.apt_sources if s.get("filename") != dest]
         self.remote_files[dest] = data
         self.existing_files.add(dest)
         self.file_stats[dest] = {
@@ -3135,7 +3137,7 @@ class SimulatedHost(Host):
             "mode": 644,
             "size": len(data),
         }
-        for entry in AptSources._parse_deb822_file(data.decode("utf-8").splitlines()):
+        for entry in AptSources._parse_deb822_file(data.decode("utf-8").splitlines(), dest):
             if entry not in self.apt_sources:
                 self.apt_sources.append(entry)
 
@@ -3144,17 +3146,14 @@ class SimulatedHost(Host):
 
         ``apt.sources_file``'s ``present=False`` mutation. The content
         bytes (``remote_files``), the existence marker (``existing_files``)
-        and any ``file_stats`` row all go, and the entries the file's
-        content parsed into are dropped from ``apt_sources`` so
-        ``AptSources`` no longer reports them (equal entries go regardless
-        of their file -- the simulation tracks no per-entry provenance).
-        An absent path is tolerated: ``rm -f`` exits 0 on a missing file
-        and the operation always yields the removal.
+        and any ``file_stats`` row all go, and every ``apt_sources`` entry
+        whose ``filename`` is ``path`` is dropped so ``AptSources`` no longer
+        reports them (provenance-based, like the install mutators). An
+        absent path is tolerated: ``rm -f`` exits 0 on a missing file and
+        the operation always yields the removal.
         """
-        data = self.remote_files.pop(path, None)
-        if data is not None:
-            stale = AptSources._parse_deb822_file(data.decode("utf-8").splitlines())
-            self.apt_sources[:] = [s for s in self.apt_sources if s not in stale]
+        self.remote_files.pop(path, None)
+        self.apt_sources[:] = [s for s in self.apt_sources if s.get("filename") != path]
         self.existing_files.discard(path)
         self.file_stats.pop(path, None)
 

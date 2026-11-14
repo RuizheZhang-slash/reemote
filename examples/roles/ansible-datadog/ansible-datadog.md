@@ -154,7 +154,7 @@ flag — for a rehearsal that touches nothing, use the offline test ([§8](#8-of
 
 **Run it twice.** The second invocation must report `0 changed request(s)` and an
 empty handler notification set. That is the migration's idempotence claim, and it
-is what the remaining gap workarounds exist to preserve.
+is what the fact-gated operations exist to preserve.
 
 Failures are typed and printed to stderr with exit status 1 — no traceback:
 
@@ -231,7 +231,7 @@ load_inventory + validate_inventory ──► Host.from_inventory ──► targ
 role_settings(host)  ──► API-key / custom-repo / removed-variable gates   (no host contacted)
 fetch_keys(5 URLs)                                                        (control-side HTTPS)
 │
-├─ gather: AptPackages, AptSources, FindInFiles(/etc/apt),
+├─ gather: AptPackages, AptSources,
 │          SystemdUnitFiles                          ← pre-state snapshot
 │
 ├─ run 1  build_pre_cleanup      __pycache__ + legacy datadog-installer package/units/files
@@ -283,7 +283,7 @@ filed) · **out** (scoped out).
 
 | Ansible task | reemote target | Status |
 | --- | --- | --- |
-| Gather Ansible Facts (`setup`) | `gather_fact` in `main`: `AptPackages`, `AptSources`, `SystemdUnitFiles`, `SystemdServiceState`, `FindFiles`, `FindInFiles` (`AptUpgradable` is read in-operation by `apt.packages(latest=True)`) | recipe |
+| Gather Ansible Facts (`setup`) | `gather_fact` in `main`: `AptPackages`, `AptSources`, `SystemdUnitFiles`, `SystemdServiceState`, `FindFiles` (`AptUpgradable` is read in-operation by `apt.packages(latest=True)`) | recipe |
 | Initialize internal `datadog_config` | `role_settings()` — defaults ⊕ `host.extra` | covered |
 | Check if OS is supported (`os-check.yml`) | `is_ubuntu` guard; non-Ubuntu hosts are **skipped, not failed** | covered (deviation D1) |
 | Windows remote update check | — | out |
@@ -319,7 +319,7 @@ filed) · **out** (scoped out).
 | Install apt keys from default URLs (5 × `_apt-key-import.yml`) | `fetch_keys()` control-side + **five** `gpg.import_key(src=stream, dest=USR_SHARE_KEYRING, keyid=fingerprint)` requests | covered (GAP-1 closed by [#11](https://github.com/kimjarvis/reemote/issues/11)) |
 | Install apt keys from custom URL (`datadog_apt_key_url_new`) | — | out |
 | Copy keyring to `trusted.gpg.d` (Debian < 9 / Ubuntu < 16) | — | out |
-| Deprecate non-https / non-`signed-by` repositories (6 × `apt_repository state=absent`, **no filename**, `update_cache: true`) | `FindInFiles("/etc/apt", LEGACY_REPO_PATTERN)` → `legacy_repo_targets()` → `apt.repo(present=False, filename=stem, update_cache=True)` per line × per file | **GAP-5 → [#15](https://github.com/kimjarvis/reemote/issues/15)** |
+| Deprecate non-https / non-`signed-by` repositories (6 × `apt_repository state=absent`, **no filename**, `update_cache: true`) | six `apt.repo(present=False, update_cache=True)` requests, **no filename** — the operation consults the `AptSource` filename provenance and removes the line from every file that holds it | covered (GAP-5 closed by [#15](https://github.com/kimjarvis/reemote/issues/15)) |
 | Ensure Datadog repository is up-to-date (`with_dict {6,7}`, `filename=ansible_datadog_<major>`) | `apt.repo(src=AGENT_REPOS[major], present=(major == chosen), filename=…, update_cache=True)` × 2 | covered (GAP-4 closed by [#14](https://github.com/kimjarvis/reemote/issues/14)) |
 | Custom repo: init flag / `stat` / `slurp` / compare | — | out (`datadog_apt_repo` rejected) |
 | (Custom) Remove Datadog custom repository file | `files.file(CUSTOM_REPO_FILE, present=False)` — the `datadog_apt_repo | length == 0` half | covered |
@@ -396,10 +396,10 @@ each handler's own `when:`.
 
 Five genuine library gaps were proven (full module surface enumerated, then
 corroborated by identifier greps), classified and ranked. **All five are
-bridgeable, so the migration completes.** G1, G2, G3 and G4 have since been
-closed by #11, #12, #13 and #14 and their workarounds removed from the program
+bridgeable, so the migration completes.** All five have since been closed by
+#11, #12, #13, #14 and #15 and their workarounds removed from the program
 ([§10](#10-second-pass)).
-Each gap is marked `GAP-n (#issue)` at its point of use in the program, and each
+Each gap was marked `GAP-n (#issue)` at its point of use in the program, and each
 ticket carries the evidence, the workaround, the acceptance criteria and the
 second-pass plan.
 
@@ -409,7 +409,7 @@ second-pass plan.
 | **G2** `files.install` read the destination back **unprivileged**, so `0640` service-owned files re-installed every deploy — **closed** | [#12](https://github.com/kimjarvis/reemote/issues/12) | core | none left — `FileContents` re-reads a present-but-unreadable file elevated (`run_shell_privileged`), so `install`/`transform`/`download` converge on service-owned configs | none left; the retired workaround added the login user to `dd-agent` in an earlier run — an extra privileged change the role never makes, widening API-key readability |
 | **G3** `apt.packages(latest=True)` upgraded unconditionally — non-idempotent — **closed** | [#13](https://github.com/kimjarvis/reemote/issues/13) | core | none left — `deploy_agent` passes `latest=True` directly; the operation gates the upgrade set on its own in-namespace `AptUpgradable` read | none left; the retired workaround froze the decision from pre-state, so a candidate appearing between gather and apply waited for the next run |
 | **G4** `apt.repo` had no `update_cache` (`**kwargs` absorbed it silently) — **closed** | [#14](https://github.com/kimjarvis/reemote/issues/14) | core (ordering) | none left — each `apt.repo` request carries `update_cache=True`, so the operation yields `apt-get update` after a real sources change and nothing on a no-op | none left; the retired workaround froze the refresh decision one barrier early and ran a whole-index `apt.update()` separate from the change |
-| **G5** `apt.repo` removal is file-scoped and `AptSources` discards provenance | [#15](https://github.com/kimjarvis/reemote/issues/15) | core for the deprecation path | one `FindInFiles("/etc/apt", LEGACY_REPO_PATTERN)` grep → fan the six lines out across every file that holds one | hand-written ERE to keep in sync; `6 × files` requests; deb822 / `.list.save` hits cannot be edited and are dropped; an extra barrier |
+| **G5** `apt.repo` removal was file-scoped and `AptSources` discarded provenance — **closed** | [#15](https://github.com/kimjarvis/reemote/issues/15) | core for the deprecation path | none left — `AptSource` carries its `filename` and six global `apt.repo(present=False, update_cache=True)` requests remove each line wherever it lives | none left; the retired workaround kept a hand-written ERE in sync, fanned `6 × files` requests out, dropped deb822 / `.list.save` hits it could not edit, and added an extra barrier |
 
 Evidence highlights (line numbers in `src/reemote/modules/`):
 
@@ -433,10 +433,13 @@ Evidence highlights (line numbers in `src/reemote/modules/`):
   `AptUpdateCommand` *after* the install on a real change; a no-op yields nothing.
   `apt.packages(update=…)` was the in-repo precedent, `dnf/dnf.py`
   `packages(update_cache=…)` the cross-namespace one.
-- **G5** — `apt.repo` computes one `path` (L3238), decides presence globally
-  (L3239-L3241) and silently no-ops when the line lives elsewhere (L3253-L3260).
-  `AptSource` L951-L982 has no filename; `AptSources.COMMAND` L1055-L1060 prints
-  `#reemote-aptsource <path>` and `parse` L1171-L1208 throws it away.
+- **G5** — closed: `apt/apt.py` `AptSource` gained a `filename` field and
+  `AptSources.parse` now attaches the `#reemote-aptsource <path>` marker it used
+  to discard (the `DnfRepository.filename` precedent). `apt.repo(present=False)`
+  with no `filename` consults that provenance and edits *every* line-based file
+  holding the line (one upload+install pair each); a scoped removal that misses
+  now names the file the line really lives in, and a deb822-only match is a named
+  no-op. `apt.sources_file` compares repository identity ignoring `filename`.
 
 **Not ticketed** (deliberate boundaries, not gaps): no per-request `become_user`;
 `files.file(touch=True)` being stateless (it matches Ansible); the host-side
@@ -493,15 +496,15 @@ content-hash stub keys (the simulation parses no OpenPGP), so the real
 imported fingerprints are seeded by hand; `systemd_unit_files` is a static
 table, so a removed unit is forgotten by hand — what `daemon-reload` does for
 real. No `apt_upgradable` bridge is needed: the simulated install applies a
-pending upgrade's candidate and retires the entry itself. The `find`/`grep`
-seams are recomputed from the simulated filesystem after every pass, so the
-second pass really observes the first pass's removals.
+pending upgrade's candidate and retires the entry itself. The `find` seam is
+recomputed from the simulated filesystem after every pass, so the second pass
+really observes the first pass's removals.
 
 `tests/test_examples.py` also scans the program statically (no mutable-container
 literals in `op()`, import-time-constructible module constants) and drives every
 factory with a `SNAPSHOT_ARGS` fixture.
 
-Gates: `uv run pytest tests/ -q` → **4301 passed**; `uv run ruff check .` → clean.
+Gates: `uv run pytest tests/ -q` → **4307 passed**; `uv run ruff check .` → clean.
 The docs build is unaffected (`examples/roles` is not in `mkdocs.yml`'s example
 scan paths).
 
@@ -535,7 +538,7 @@ Agreed in Phase 0: one target OS, the role's default path, opt-in branches exclu
 ## 10. Second pass
 
 As the tickets land, the workarounds come out and the program gets closer to the
-role's own shape. #11, #12, #13 and #14 have landed:
+role's own shape. #11, #12, #13, #14 and #15 have landed:
 
 | Ticket | What disappears from the program |
 | --- | --- |
@@ -543,7 +546,7 @@ role's own shape. #11, #12, #13 and #14 have landed:
 | [#12](https://github.com/kimjarvis/reemote/issues/12) — **done** | the login-user group-membership deploy is gone (and its deviation): `FileContents` re-reads unreadable files elevated, so the `0640` configs stay service-owned and converge. The eight-deploy sequence is now seven, with `datadog_additional_groups` folded into the configure deploy |
 | [#13](https://github.com/kimjarvis/reemote/issues/13) — **done** | the `AptUpgradable` gather, its snapshot and `build_agent` are gone: `deploy_agent` passes `latest=True` directly and the operation gates upgrades on its own fact read — one barrier fewer |
 | [#14](https://github.com/kimjarvis/reemote/issues/14) — **done** | `repository_snapshot`'s `needs_update` boolean, its `sources`/`repo_files` reads and the gated `apt.update` are gone: each `apt.repo` request carries `update_cache=True` and refreshes the index itself on a real change |
-| [#15](https://github.com/kimjarvis/reemote/issues/15) | `LEGACY_REPO_PATTERN`, `legacy_repo_targets()`, the `FindInFiles` gather and the per-file fan-out; six `apt.repo(present=False)` requests exactly as the role has them |
+| [#15](https://github.com/kimjarvis/reemote/issues/15) — **done** | `LEGACY_REPO_PATTERN`, `legacy_repo_targets()`, the `FindInFiles` gather and the per-file fan-out are gone: six global `apt.repo(present=False)` requests exactly as the role has them, the operation consulting the `AptSource` filename provenance itself |
 
 The offline test's between-pass bridges have shrunk accordingly: the simulated
 install retires a pending upgrade itself, so only the keyring fingerprints and

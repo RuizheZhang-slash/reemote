@@ -39,11 +39,12 @@ inventory comes from the shared ``inventory.json`` in the project root:
 ``/etc/apt/sources.list.d/*.sources`` (modern deb822 format), each behind
 a ``#reemote-aptsource`` marker line naming the file. Legacy lines and
 deb822 stanzas both expand into plain ``AptSource`` TypedDict-shaped
-dicts -- ``{type, url, distribution, components, options}`` -- with every
-``options`` value a list of strings (``options["arch"]`` is always e.g.
-``["amd64"]``, never a bare string), so the entries print as JSON without
-any reshaping. Disabled stanzas (``Enabled: no``) are skipped. The fact
-takes no arguments, so the default gather needs none.
+dicts -- ``{type, url, distribution, components, options, filename}`` --
+with every ``options`` value a list of strings (``options["arch"]`` is
+always e.g. ``["amd64"]``, never a bare string) and ``filename`` the source
+file the entry was read from, so the entries print as JSON without any
+reshaping. Disabled stanzas (``Enabled: no``) are skipped. The fact takes
+no arguments, so the default gather needs none.
 
 The path is resolved from ``__file__``, so the example works from any
 working directory. Point ``INVENTORY_PATH`` at your own file (or edit
@@ -129,7 +130,7 @@ async def main() -> None:
         # fans AptSources.process out with asyncio.gather and returns a
         # host-name-keyed mapping. process cats the sources files over SSH
         # and parses them into a list of {type, url, distribution,
-        # components, options} repository dicts.
+        # components, options, filename} repository dicts.
         apt_sources = await gather_fact(hosts, AptSources)
     except (OSError, json.JSONDecodeError) as exc:
         # The inventory file is missing, unreadable or not valid JSON. Python's

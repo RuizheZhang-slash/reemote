@@ -88,9 +88,10 @@ for exact-version idempotence and `SimulateOperationWillChange` to gate
 its optional `upgrade`; `apt.ppa`, which adds or removes an Ubuntu
 PPA with `apt-add-repository`, idempotent on `AptSources`;
 `apt.repo`, which adds or removes one apt source line in
-`/etc/apt/sources.list` or a `sources.list.d` file, idempotent on
-`AptSources` and on the managed file's own text, and rewrites that file
-through the spool-and-install pair; and `apt.sources_file`, which manages a
+`/etc/apt/sources.list` or a `sources.list.d` file — a removal with no
+`filename` consults the `AptSource` provenance and edits every file holding
+the line — idempotent on `AptSources` and on the managed files' own text,
+and rewrites them through the spool-and-install pair; and `apt.sources_file`, which manages a
 modern deb822 `.sources` file under `sources.list.d`, idempotent on
 `AptSources` for the write direction and on `AptSourcesFile` for the
 removal;
@@ -235,7 +236,8 @@ candidate and origins here. An unknown package prints nothing on stdout
 `/etc/apt/sources.list.d/*.list` (legacy one-line format) and every
 `/etc/apt/sources.list.d/*.sources` (modern deb822 format), each behind a
 `#reemote-aptsource` marker line naming the file so the parser can pick
-the format by extension, mirroring the baseline's `apt.AptSources` (whose
+the format by extension and attach the file as each entry's `filename`
+provenance, mirroring the baseline's `apt.AptSources` (whose
 `##UPSTREAM_FILE` marker is renamed here, like `DnfRepositories`' filename
 marker). Legacy lines parse with the baseline's regex — bracketed `[key=value]`
 options and flat `/`-suite repositories with no components included;
@@ -245,8 +247,11 @@ PGP block stays whole), stanzas missing `Types`/`URIs`/`Suites` or
 disabled with `Enabled: no` are skipped, and multi-valued
 `Types`/`URIs`/`Suites` expand into one entry per combination in the baseline's
 type-then-uri-then-suite order. The result is a list of `AptSource`
-dicts — `{type, url, distribution, components, options}` — in file order;
-no sources files at all read as `[]`.
+dicts — `{type, url, distribution, components, options, filename}` — in file
+order, each carrying the `filename` it was read from (the marker's path,
+attached rather than discarded — the `DnfRepository.filename` precedent,
+and what lets `apt.repo(present=False, filename=None)` remove a line wherever
+it is configured); no sources files at all read as `[]`.
 
 Two deliberate usability deviations from the baseline, which optimizes for
 backward compatibility: entries are plain dicts typed by the `AptSource`
@@ -583,16 +588,21 @@ refresh exactly when it is needed, so the stamp is never consulted (unlike
 parity). `src` is the full source string (`deb http://X hardy main`),
 `present` selects the direction, and `filename` scopes the edit to
 `/etc/apt/sources.list.d/<filename>.list` instead of the main
-`/etc/apt/sources.list`. Presence is decided by parsing `src` with
-`AptSources`' legacy line parser and comparing against the fact's entries
-— the baseline's `parse_apt_repo(src) in AptSources` check — so a repository
+`/etc/apt/sources.list`. For a removal, `filename=None` (the default) is
+*global*: the operation consults each matching `AptSource` entry's
+`filename` provenance and edits every line-based file that holds the line,
+one spool-and-install pair per file (issue #15). Presence is decided by
+parsing `src` with `AptSources`' legacy line parser and comparing against the
+fact's entries by repository identity — type, url, distribution, components
+and options, ignoring the `filename` provenance — the baseline's
+`parse_apt_repo(src) in AptSources` check — so a repository
 already configured in *any* sources file (legacy or deb822) is a no-op,
 and an unparseable `src` counts as absent but is still added when
 `present=True` (the baseline's tolerance). Either direction then *rewrites* the
-managed file rather than patching it in place: `AptSourcesFile` reads the
-file's current text, one pure transform adds the line exactly once or
+managed file(s) rather than patching in place: `AptSourcesFile` reads each
+target file's current text, one pure transform adds the line exactly once or
 deletes every line the anchored, escaped pattern matches, and when the
-result differs from what is there the request yields two commands at
+result differs from what is there the request yields two commands per file at
 different privilege levels, the `apt.key` pattern:
 `AptRepoUploadCommand` spools the new text to a `/tmp` path named after the
 managed file over scp as the login user, then `AptRepoInstallCommand` runs
@@ -603,8 +613,12 @@ The spool name is derived from the destination rather than a fixed
 constant, because `apt.repo` edits several distinct files and two
 repository edits in one deploy must not clobber each other's spool. Two
 content-level no-ops round out the baseline's fact-level ones: an add whose line
-the file already carries, and a remove of a repository configured in some
-*other* file — the transforms are fixpoints, so a repeat converges instead
+the file already carries, and a scoped remove of a repository configured in some
+*other* file — now named in the reason (`configured in <other file>, not in
+<path>`) rather than silent. A global remove whose only match is a deb822
+stanza is likewise a named no-op (`configured in <file>, not as a removable
+source line`), because the line transform edits line-based text only. The
+transforms are fixpoints, so a repeat converges instead
 of writing a second copy. Deliberate deviations from the baseline, which
 delegates the edit to `files.line` and so mutates the protected file in
 place with `echo >>` and `sed -i`: reemote has no line operation

@@ -92,7 +92,6 @@ SNAPSHOT_ARGS = {
     ): lambda name: {
         name: {
             "keys": (b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n",) * 5,
-            "legacy_files": (None, "datadog"),
         }
     },
     (

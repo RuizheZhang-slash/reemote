@@ -726,6 +726,7 @@ SOURCES_FACT = [
         "type": "deb",
         "components": ["restricted"],
         "options": {},
+        "filename": "/etc/apt/sources.list",
     },
     {
         "url": "http://archive.ubuntu.com/ubuntu",
@@ -733,6 +734,7 @@ SOURCES_FACT = [
         "type": "deb-src",
         "components": ["main"],
         "options": {"arch": ["amd64", "i386"]},
+        "filename": "/etc/apt/sources.list.d/mongodb.list",
     },
     {
         "url": "https://repo.mongodb.org/apt/ubuntu",
@@ -743,6 +745,7 @@ SOURCES_FACT = [
             "arch": ["amd64", "arm64"],
             "signed-by": "/usr/share/keyrings/mongodb-server-7.0.gpg",
         },
+        "filename": "/etc/apt/sources.list.d/mongodb.list",
     },
 ]
 
@@ -787,6 +790,7 @@ DEB822_FACT = [
             "arch": "amd64",
             "signed-by": "/usr/share/keyrings/debian-archive-keyring.gpg",
         },
+        "filename": "/etc/apt/sources.list.d/test.sources",
     },
     {
         "type": "deb-src",
@@ -797,6 +801,7 @@ DEB822_FACT = [
             "arch": "amd64",
             "signed-by": "/usr/share/keyrings/debian-archive-keyring.gpg",
         },
+        "filename": "/etc/apt/sources.list.d/test.sources",
     },
     {
         "type": "deb",
@@ -804,6 +809,7 @@ DEB822_FACT = [
         "distribution": "stable",
         "components": ["main"],
         "options": {},
+        "filename": "/etc/apt/sources.list.d/test.sources",
     },
 ]
 
@@ -828,10 +834,10 @@ async def test_apt_sources_expands_multi_uris_and_suites():
         "",
     ]
     fact = [
-        {"type": "deb", "url": "http://deb.debian.org/debian", "distribution": "bookworm", "components": ["main", "contrib"], "options": {}},
-        {"type": "deb", "url": "http://deb.debian.org/debian", "distribution": "bookworm-updates", "components": ["main", "contrib"], "options": {}},
-        {"type": "deb", "url": "https://mirror.example.com/debian", "distribution": "bookworm", "components": ["main", "contrib"], "options": {}},
-        {"type": "deb", "url": "https://mirror.example.com/debian", "distribution": "bookworm-updates", "components": ["main", "contrib"], "options": {}},
+        {"type": "deb", "url": "http://deb.debian.org/debian", "distribution": "bookworm", "components": ["main", "contrib"], "options": {}, "filename": "/etc/apt/sources.list.d/multi.sources"},
+        {"type": "deb", "url": "http://deb.debian.org/debian", "distribution": "bookworm-updates", "components": ["main", "contrib"], "options": {}, "filename": "/etc/apt/sources.list.d/multi.sources"},
+        {"type": "deb", "url": "https://mirror.example.com/debian", "distribution": "bookworm", "components": ["main", "contrib"], "options": {}, "filename": "/etc/apt/sources.list.d/multi.sources"},
+        {"type": "deb", "url": "https://mirror.example.com/debian", "distribution": "bookworm-updates", "components": ["main", "contrib"], "options": {}, "filename": "/etc/apt/sources.list.d/multi.sources"},
     ]
     host = CannedShellHost(_sources_stdout(output))
     assert await AptSources.process(host) == fact
@@ -865,6 +871,7 @@ async def test_apt_sources_keeps_inline_gpg_key_whole():
                     "-----BEGIN PGP PUBLIC KEY BLOCK-----\nmQINBFABCDEFGH==\n-----END PGP PUBLIC KEY BLOCK-----"
                 ]
             },
+            "filename": "/etc/apt/sources.list.d/inline-key.sources",
         }
     ]
 
@@ -888,6 +895,7 @@ async def test_apt_sources_keeps_inline_gpg_key_whole():
                     "type": "deb",
                     "components": ["restricted", "pi4"],
                     "options": {},
+                    "filename": "/etc/apt/sources.list",
                 }
             ],
             id="component_with_number",
@@ -907,6 +915,7 @@ async def test_apt_sources_keeps_inline_gpg_key_whole():
                     "options": {
                         "signed-by": "/etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg"
                     },
+                    "filename": "/etc/apt/sources.list.d/nvidia-container-toolkit.list",
                 }
             ],
             id="flat_repo_signed_by",
@@ -928,6 +937,7 @@ async def test_apt_sources_keeps_inline_gpg_key_whole():
                     "distribution": "bookworm",
                     "components": ["main"],
                     "options": {},
+                    "filename": "/etc/apt/sources.list.d/with-comment.sources",
                 }
             ],
             id="deb822_comment_in_stanza",
@@ -978,6 +988,7 @@ async def test_apt_sources_keeps_inline_gpg_key_whole():
                             "/usr/share/keyrings/key2.gpg",
                         ]
                     },
+                    "filename": "/etc/apt/sources.list.d/multipath.sources",
                 }
             ],
             id="deb822_signed_by_multiline_paths",
@@ -999,6 +1010,7 @@ async def test_apt_sources_keeps_inline_gpg_key_whole():
                     "distribution": "stable",
                     "components": ["main"],
                     "options": {"trusted": "yes"},
+                    "filename": "/etc/apt/sources.list.d/trusted.sources",
                 }
             ],
             id="deb822_trusted",
@@ -1033,6 +1045,7 @@ async def test_apt_sources_entries_are_plain_json_printable_dicts():
             "distribution": "stable",
             "components": ["main"],
             "options": {"arch": ["amd64"], "signed-by": ["/usr/share/keyrings/example.gpg"]},
+            "filename": "/etc/apt/sources.list.d/example.list",
         }
     ]
     assert isinstance(sources[0], dict)
@@ -1055,6 +1068,31 @@ async def test_apt_sources_ignores_lines_before_the_first_marker():
     )
     host = CannedShellHost(stdout)
     assert await AptSources.process(host) == _list_valued(SOURCES_FACT)
+
+
+async def test_apt_sources_attaches_the_filename_provenance():
+    """issue #15: every entry carries the file it was read from -- the
+    ``#reemote-aptsource`` marker's path -- so a caller can tell where a
+    repository is configured. Legacy lines and deb822 stanzas alike attach
+    it; presence comparisons ignore it (``_same_repository``)."""
+    stdout = _sources_stdout(
+        [
+            "##UPSTREAM_FILE /etc/apt/sources.list",
+            "deb http://archive.ubuntu.com/ubuntu noble main",
+            "##UPSTREAM_FILE /etc/apt/sources.list.d/vendor.sources",
+            "Types: deb",
+            "URIs: https://example.com/apt",
+            "Suites: stable",
+            "Components: main",
+            "",
+        ]
+    )
+    host = CannedShellHost(stdout)
+    sources = await AptSources.process(host)
+    assert [entry["filename"] for entry in sources] == [
+        "/etc/apt/sources.list",
+        "/etc/apt/sources.list.d/vendor.sources",
+    ]
 
 
 # --- SimulatedHost seam -------------------------------------------------------
@@ -4470,13 +4508,15 @@ PPA_SRC = "ppa:bitcoin/bitcoin"
 PPA_URL = "http://ppa.launchpad.net/bitcoin/bitcoin/ubuntu"
 PPA_ADD_SHELL = "apt-add-repository -y ppa:bitcoin/bitcoin"
 PPA_REMOVE_SHELL = "apt-add-repository -y --remove ppa:bitcoin/bitcoin"
-# The AptSource the simulated add appends (codename from the lsb_release seam).
+# The AptSource the simulated add appends (codename from the lsb_release seam,
+# filename the .list file apt-add-repository would write).
 PPA_SOURCE = {
     "type": "deb",
     "url": PPA_URL,
     "distribution": "noble",
     "components": ["main"],
     "options": {},
+    "filename": "/etc/apt/sources.list.d/bitcoin-ubuntu-bitcoin-noble.list",
 }
 
 
@@ -4600,7 +4640,13 @@ async def test_apt_ppa_seam_default_codename():
     is the empty string (the simulation models no release detection)."""
     host = SimulatedHost(name="h")
     await send_command(host, AptPpaCommand(src=PPA_SRC))
-    assert host.apt_sources == [{**PPA_SOURCE, "distribution": ""}]
+    assert host.apt_sources == [
+        {
+            **PPA_SOURCE,
+            "distribution": "",
+            "filename": "/etc/apt/sources.list.d/bitcoin-ubuntu-bitcoin-.list",
+        }
+    ]
 
 
 async def test_apt_ppa_end_to_end_over_run():
@@ -4694,6 +4740,7 @@ REPO_SOURCE = {
     "distribution": "hardy",
     "components": ["partner"],
     "options": {},
+    "filename": "/etc/apt/sources.list",
 }
 # A second repository, so the transforms' keep-the-other-lines semantics and
 # the content refresh of the ``apt_sources`` seam stay visible.
@@ -4704,6 +4751,7 @@ OTHER_SOURCE = {
     "distribution": "noble",
     "components": ["main"],
     "options": {},
+    "filename": "/etc/apt/sources.list",
 }
 SOURCES_LIST = "/etc/apt/sources.list"
 LISTS_PATH = "/etc/apt/sources.list.d/somefile.list"
@@ -4936,9 +4984,10 @@ async def test_apt_repo_add_of_a_line_the_file_lists_is_a_content_noop():
 
 
 async def test_apt_repo_removal_from_a_file_that_never_listed_it_is_a_noop():
-    """The other content-level no-op: the repository is configured -- so the
-    fact says a change is due -- but in some *other* file, so this file's
-    text has nothing to delete and the baseline's no-op sed is skipped."""
+    """A filename-scoped removal aimed at a file that does not hold the line
+    is a no-op that *names where the repository is configured* (issue #15):
+    the fact says a change is due, but this file's text has nothing to
+    delete, so the reason points at the file that does hold it."""
     host = SimulatedHost(
         name="h",
         apt_sources=[dict(REPO_SOURCE)],
@@ -4952,7 +5001,9 @@ async def test_apt_repo_removal_from_a_file_that_never_listed_it_is_a_noop():
         )
     ]
     assert not ctx.changed
-    assert ctx.reason == f'apt repo "{REPO_SRC}" is not configured in {LISTS_PATH}'
+    assert ctx.reason == (
+        f'apt repo "{REPO_SRC}" is configured in {SOURCES_LIST}, not in {LISTS_PATH}'
+    )
     assert commands == []
 
 
@@ -4996,9 +5047,9 @@ async def test_apt_repo_simulated_seam_spool_then_install():
 
 
 async def test_apt_repo_simulated_seam_install_replaces_previous_entries():
-    """The seam refresh is content-based, not append-only: the entries the
-    previous file text parsed into go, the new text's entries are kept once,
-    so a repeat install never duplicates a sources entry."""
+    """The seam refresh is provenance-based, not append-only: every entry
+    whose filename is the installed file goes, the new text's entries are
+    kept once, so a repeat install never duplicates a sources entry."""
     host = SimulatedHost(
         name="h",
         apt_sources=[dict(REPO_SOURCE)],
@@ -5180,6 +5231,147 @@ async def test_apt_repo_add_then_remove_in_one_deploy():
     assert host.apt_sources == []
 
 
+# --- apt.repo global removal (issue #15: filename=None consults provenance) ----
+
+
+async def test_apt_repo_global_removal_finds_the_line_in_a_list_d_file():
+    """issue #15 acceptance: a legacy line in sources.list.d/whatever.list is
+    removed by present=False with *no* filename -- the provenance the fact
+    now carries names the file, so the removal edits it instead of no-opsing
+    on the default sources.list."""
+    whatever = "/etc/apt/sources.list.d/whatever.list"
+    host = SimulatedHost(
+        name="h",
+        apt_sources=[
+            {**OTHER_SOURCE, "filename": whatever},
+            {**REPO_SOURCE, "filename": whatever},
+        ],
+        remote_files={whatever: f"{OTHER_SRC}\n{REPO_SRC}\n".encode()},
+    )
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.repo(ctx, src=REPO_SRC, present=False)]
+    assert ctx.changed
+    assert ctx.reason == f'apt repo "{REPO_SRC}" present, will be removed from {whatever}'
+    spool = _repo_spool_path(whatever)
+    assert commands == [
+        AptRepoUploadCommand(content=f"{OTHER_SRC}\n", dest=spool),
+        AptRepoInstallCommand(spool=spool, dest=whatever),
+    ]
+
+
+async def test_apt_repo_global_removal_second_pass_is_a_noop():
+    """issue #15 acceptance: after the removal installs the edited file the
+    provenance entry is gone, so a second present=False pass reads the
+    repository as absent and no-ops."""
+    whatever = "/etc/apt/sources.list.d/whatever.list"
+    host = SimulatedHost(
+        name="h",
+        apt_sources=[{**REPO_SOURCE, "filename": whatever}],
+        remote_files={whatever: f"{REPO_SRC}\n".encode()},
+    )
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.repo(ctx, src=REPO_SRC, present=False)]
+    assert ctx.changed
+    for command in commands:
+        await send_command(host, command)
+    assert host.remote_files[whatever] == b""
+    assert host.apt_sources == []
+    ctx2 = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands2 = [c async for c in apt.repo(ctx2, src=REPO_SRC, present=False)]
+    assert not ctx2.changed
+    assert ctx2.reason == f'apt repo "{REPO_SRC}" does not exist'
+    assert commands2 == []
+
+
+async def test_apt_repo_global_removal_leaves_a_modern_signed_by_line():
+    """issue #15 acceptance: a modern signed-by line for the same URL is a
+    different repository identity, and its raw text does not match the legacy
+    line's anchored pattern, so a global removal of the legacy line keeps it."""
+    whatever = "/etc/apt/sources.list.d/whatever.list"
+    modern_src = (
+        "deb [signed-by=/usr/share/keyrings/vendor.gpg] "
+        "http://archive.canonical.com/ubuntu hardy partner"
+    )
+    host = SimulatedHost(
+        name="h",
+        apt_sources=[
+            {**REPO_SOURCE, "filename": whatever},
+            {
+                **REPO_SOURCE,
+                "options": {"signed-by": ["/usr/share/keyrings/vendor.gpg"]},
+                "filename": whatever,
+            },
+        ],
+        remote_files={whatever: f"{modern_src}\n{REPO_SRC}\n".encode()},
+    )
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.repo(ctx, src=REPO_SRC, present=False)]
+    assert ctx.changed
+    spool = _repo_spool_path(whatever)
+    assert commands == [
+        AptRepoUploadCommand(content=f"{modern_src}\n", dest=spool),
+        AptRepoInstallCommand(spool=spool, dest=whatever),
+    ]
+
+
+async def test_apt_repo_global_removal_edits_every_file_holding_the_line():
+    """issue #15: the same legacy line in several files is removed from each
+    -- one upload+install pair per file, in fact order -- not just the default
+    sources.list."""
+    whatever = "/etc/apt/sources.list.d/whatever.list"
+    host = SimulatedHost(
+        name="h",
+        apt_sources=[
+            {**REPO_SOURCE, "filename": SOURCES_LIST},
+            {**OTHER_SOURCE, "filename": whatever},
+            {**REPO_SOURCE, "filename": whatever},
+        ],
+        remote_files={
+            SOURCES_LIST: f"{REPO_SRC}\n".encode(),
+            whatever: f"{OTHER_SRC}\n{REPO_SRC}\n".encode(),
+        },
+    )
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.repo(ctx, src=REPO_SRC, present=False)]
+    assert ctx.changed
+    assert ctx.reason == (
+        f'apt repo "{REPO_SRC}" present, will be removed from {SOURCES_LIST}, {whatever}'
+    )
+    whatever_spool = _repo_spool_path(whatever)
+    assert commands == [
+        AptRepoUploadCommand(content="", dest=REPO_SPOOL),
+        AptRepoInstallCommand(spool=REPO_SPOOL, dest=SOURCES_LIST),
+        AptRepoUploadCommand(content=f"{OTHER_SRC}\n", dest=whatever_spool),
+        AptRepoInstallCommand(spool=whatever_spool, dest=whatever),
+    ]
+
+
+async def test_apt_repo_global_removal_of_a_deb822_only_match_is_a_named_noop():
+    """issue #15 (line-based files only): a matching repository that lives
+    solely in a deb822 .sources stanza cannot be rewritten by the line
+    transform, so a filename=None removal no-ops and names the file."""
+    vendor = "/etc/apt/sources.list.d/vendor.sources"
+    host = SimulatedHost(
+        name="h",
+        apt_sources=[{**REPO_SOURCE, "filename": vendor}],
+        remote_files={
+            vendor: (
+                b"Types: deb\n"
+                b"URIs: http://archive.canonical.com/ubuntu\n"
+                b"Suites: hardy\n"
+                b"Components: partner\n"
+            )
+        },
+    )
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.repo(ctx, src=REPO_SRC, present=False)]
+    assert not ctx.changed
+    assert ctx.reason == (
+        f'apt repo "{REPO_SRC}" is configured in {vendor}, not as a removable source line'
+    )
+    assert commands == []
+
+
 # --- apt.sources_file operation (baseline parity) -------------------------------
 
 # The baseline's create.json kwargs: the Docker deb822 repository from its docstring
@@ -5209,6 +5401,7 @@ DOCKER_SOURCE = {
     "distribution": "bookworm",
     "components": ["stable"],
     "options": {"arch": ["amd64"], "signed-by": ["/etc/apt/keyrings/docker.gpg"]},
+    "filename": DOCKER_DEST,
 }
 # The spool now lives inside a sha1-derived /tmp directory keyed on the dest;
 # the install rm -rf's the whole directory rather than the bare file.
