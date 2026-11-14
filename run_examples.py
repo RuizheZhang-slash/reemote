@@ -14,6 +14,12 @@ combined stdout/stderr of every run -- framed by a header naming the
 script and its exit status -- to ``examples.log`` in the project root,
 overwriting any previous log.
 
+Pass ``--path <dir>`` to scope the sweep to the directory tree under
+``<dir>`` instead, e.g. ``--path examples/modules/lxd`` for every lxd
+example. An explicit path runs *every* script beneath it, including the
+directories the full sweep excludes; the log and summary are written the
+same way.
+
 Most of these examples connect to real hosts and apply changes over SSH
 (or, for the Docker connector demo, a Docker daemon), exactly as when run
 by hand -- including the state-mutating operation examples under
@@ -29,8 +35,13 @@ exits non-zero if any example failed.
 Run it with::
 
     uv run python run_examples.py
+
+or, for one subtree only::
+
+    uv run python run_examples.py --path examples/modules/lxd
 """
 
+import argparse
 import subprocess
 import sys
 import time
@@ -50,6 +61,14 @@ SEPARATOR = "=" * 78
 def is_excluded(script: Path) -> bool:
     """Whether the example script lives under one of the excluded dirs."""
     return any(directory in script.parents for directory in EXCLUDED_DIRS)
+
+
+def display_name(path: Path) -> str:
+    """The path relative to the project root, or absolute if outside it."""
+    try:
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def run_example(script: Path) -> tuple[int, float, str]:
@@ -87,14 +106,41 @@ def failure_reason(output: str) -> str:
 
 
 def main() -> int:
-    scripts = sorted(
-        path
-        for directory in EXAMPLES_DIRS
-        for path in directory.rglob("*.py")
-        if not is_excluded(path)
+    parser = argparse.ArgumentParser(
+        description="Run the documented examples and log the output to examples.log.",
     )
+    parser.add_argument(
+        "--path",
+        type=Path,
+        metavar="DIR",
+        help=(
+            "run only the examples in the directory tree under DIR "
+            "(e.g. examples/modules/lxd); an explicit path includes the "
+            "directories the full sweep excludes"
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.path is None:
+        directories = EXAMPLES_DIRS
+        scripts = sorted(
+            path
+            for directory in directories
+            for path in directory.rglob("*.py")
+            if not is_excluded(path)
+        )
+    else:
+        directory = args.path.resolve()
+        if not directory.is_dir():
+            print(
+                f"ERROR: --path {args.path} is not an existing directory",
+                file=sys.stderr,
+            )
+            return 1
+        directories = (directory,)
+        scripts = sorted(directory.rglob("*.py"))
     if not scripts:
-        dirs = ", ".join(str(directory) for directory in EXAMPLES_DIRS)
+        dirs = ", ".join(str(directory) for directory in directories)
         print(f"ERROR: no example scripts found in {dirs}", file=sys.stderr)
         return 1
 
@@ -103,13 +149,13 @@ def main() -> int:
         log.write(f"{SEPARATOR}\n")
         log.write(f"Examples run at {datetime.now().isoformat()}\n")
         log.write(f"Interpreter: {sys.executable}\n")
-        dirs = ", ".join(str(d.relative_to(PROJECT_ROOT)) for d in EXAMPLES_DIRS)
+        dirs = ", ".join(display_name(d) for d in directories)
         log.write(f"Examples:    {len(scripts)} scripts from {dirs}\n")
         log.write(f"{SEPARATOR}\n")
 
         for script in scripts:
-            relative = script.relative_to(PROJECT_ROOT)
-            print(f"Running {relative} ...", flush=True)
+            name = display_name(script)
+            print(f"Running {name} ...", flush=True)
             try:
                 returncode, elapsed, output = run_example(script)
             except OSError as exc:
@@ -121,11 +167,11 @@ def main() -> int:
             print(f"  {status} in {elapsed:.1f}s", flush=True)
             if returncode != 0:
                 reason = failure_reason(output)
-                print(f"  {relative}: {reason}", file=sys.stderr, flush=True)
-                failures.append((str(relative), reason))
+                print(f"  {name}: {reason}", file=sys.stderr, flush=True)
+                failures.append((name, reason))
 
             log.write(f"\n{SEPARATOR}\n")
-            log.write(f"== {relative} -- {status}, {elapsed:.1f}s\n")
+            log.write(f"== {name} -- {status}, {elapsed:.1f}s\n")
             log.write(f"{SEPARATOR}\n")
             log.write(output)
             if output and not output.endswith("\n"):
