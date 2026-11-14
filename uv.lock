@@ -899,6 +899,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "jinja2" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pyyaml" },
@@ -919,6 +920,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "jinja2", specifier = ">=3.1.6" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "pyyaml", specifier = ">=6.0.2" },

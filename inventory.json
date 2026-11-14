@@ -2,7 +2,7 @@
   {
     "host": "alpine",
     "connection": {
-      "address": "192.168.0.197",
+      "address": "192.168.0.241",
       "username": "alpine",
       "key_path": "~/.ssh/id_ed25519"
     },
@@ -12,9 +12,9 @@
   {
     "host": "web1",
     "connection": {
-      "address": "192.168.0.208",
-      "username": "admin",
-      "key_path": "/home/kim/.ssh/id_ed25519"
+      "address": "192.168.0.159",
+      "username": "supervisor",
+      "key_path": "~/.ssh/id_ed25519"
     },
     "group": "centos",
     "tags": ["ubuntu_host", "web","apt_package_manager"]
@@ -22,9 +22,9 @@
   {
     "host": "web2",
     "connection": {
-      "address": "192.168.0.222",
-      "username": "admin",
-      "key_path": "/home/kim/.ssh/id_ed25519"
+      "address": "192.168.0.135",
+      "username": "supervisor",
+      "key_path": "~/.ssh/id_ed25519"
     },
     "group": "centos",
     "tags": ["ubuntu_host", "web","apt_package_manager"]
@@ -32,8 +32,8 @@
   {
     "host": "ubuntu",
     "connection": {
-      "address": "192.168.0.221",
-      "username": "kjarvis",
+      "address": "192.168.0.181",
+      "username": "supervisor",
       "key_path": "~/.ssh/id_ed25519"
     },
     "group": "ubuntu",

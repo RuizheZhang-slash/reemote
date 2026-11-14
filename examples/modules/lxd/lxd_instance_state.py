@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Kim Jarvis.
 # SPDX-License-Identifier: EPL-2.0
 
-"""Example: stop an LXD instance on real CentOS hosts.
+"""Example: stop an LXD instance on real Ubuntu hosts.
 
 This is a *usage* example, not part of the library. It drives reemote's
 two-phase execution model end to end over a **real SSH transport**
@@ -35,20 +35,20 @@ already-stopped instance both plan as no-ops.
 
 **Host prerequisite.** This example needs the ``lxc`` CLI and a running,
 initialized LXD daemon (login user in the ``lxd`` group for fact reads;
-operations ride ``sudo=True``). The demo CentOS hosts have neither: LXD is
-snap-only on EL9 and their ``staff_t``-confined sudo cannot create ``/snap``
-or reach ``/run/snapd.socket``, so it cannot be installed. Compile-checked
-and exercised by the offline harness, not run against shared hosts; point
-``INVENTORY_PATH`` at LXD-enabled machines (or relax the demo hosts) to run live.
+operations ride ``sudo=True``). The demo Ubuntu host has LXD snap-installed
+and the login user in the ``lxd`` group, but its daemon is not initialized
+(no storage pool), so run ``sudo lxd init`` there before creating anything.
+Compile-checked and exercised by the offline harness; point
+``INVENTORY_PATH`` at LXD-enabled machines to run live.
 
-Every request carries ``when=is_centos``, the declarative eligibility
+Every request carries ``when=is_ubuntu``, the declarative eligibility
 guard: the predicate reads only **static** inventory data --
 ``host.group``, set by the ``"group"`` key of the inventory entry -- and
 is a stable module-level function, so the prepare and apply phases reach
 the same skip decision. The driver skips a rejected request without
-materializing it, so on hosts outside the ``"centos"`` group neither the
+materializing it, so on hosts outside the ``"ubuntu"`` group neither the
 commands nor the facts behind them run, and plan and log render the step
-as ``[skipped: when guard is_centos]`` in its lockstep slot. The path is
+as ``[skipped: when guard is_ubuntu]`` in its lockstep slot. The path is
 resolved from ``__file__``, so the example works from any working
 directory; point ``INVENTORY_PATH`` at your own file to target your
 machines.
@@ -101,15 +101,15 @@ def load_inventory(path: Path) -> list[dict[str, Any]]:
     return inventory
 
 
-def is_centos(host: Host) -> bool:
-    """``when`` guard: the host belongs to the inventory group ``"centos"``.
+def is_ubuntu(host: Host) -> bool:
+    """``when`` guard: the host belongs to the inventory group ``"ubuntu"``.
 
     Reads only static inventory data (``host.group``, set by the ``"group"``
     key of the inventory entry), never a mutable fact, and stays a stable
     module-level function -- the two rules every ``when`` predicate follows
     so both deploy phases reach the same eligibility decision.
     """
-    return host.group == "centos"
+    return host.group == "ubuntu"
 
 
 def deploy(host: Host) -> Generator[OperationRequest]:
@@ -127,7 +127,7 @@ def deploy(host: Host) -> Generator[OperationRequest]:
         instance="web1",
         state="stopped",
         sudo=True,
-        when=is_centos,
+        when=is_ubuntu,
     )
     yield op(
         lxd.instance_state,
@@ -135,7 +135,7 @@ def deploy(host: Host) -> Generator[OperationRequest]:
         instance="web1",
         state="stopped",
         sudo=True,
-        when=is_centos,
+        when=is_ubuntu,
     )
 
 

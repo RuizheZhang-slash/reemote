@@ -64,6 +64,11 @@ dev = [
     # has to be importable in the test environment. It is deliberately not a
     # runtime dependency of the library itself.
     "pyyaml>=6.0.2",
+    # examples/roles/ansible-role-apache renders the role's vhosts.conf.j2
+    # with Jinja2; the suite exercises that example offline, so the renderer
+    # has to be importable in the test environment. It is deliberately not a
+    # runtime dependency of the library itself.
+    "jinja2>=3.1.6",
 ]
 docs = [
     "mkdocs-material>=9.8.0",
