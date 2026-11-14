@@ -2213,7 +2213,12 @@ class AptKeyInstallCommand(Command):
 
 
 async def key(
-    ctx: OpContext, src: IO[Any], dest: str, **kwargs: Any
+    ctx: OpContext,
+    src: IO[Any],
+    dest: str,
+    update_cache: bool = False,
+    cache_valid_time: int = 0,
+    **kwargs: Any,
 ) -> AsyncGenerator[Command]:
     """Install a GPG keyring file for APT.
 
@@ -2227,6 +2232,18 @@ async def key(
             a relative name is resolved under ``/etc/apt/keyrings/`` so a
             sources entry can reference it via ``signed-by=`` (the modern,
             non-deprecated replacement for ``apt-key add``).
+        update_cache (bool, optional): Refresh the package index with
+            ``apt-get update`` after the keyring is installed -- Ansible's
+            ``apt_repository`` ``update_cache: true`` spelling (issue #14).
+            ``apt.key`` is non-idempotent (it always installs), so the
+            ``AptUpdateCommand`` always follows the install when this is set;
+            it is yielded *after* the install, never before. Defaults to False.
+        cache_valid_time (int, optional): Accepted for Ansible spelling
+            parity but inert here: installing a key always forces the
+            refresh, because a fresh ``AptUpdateStamp`` predates the change
+            and gating on it would skip the refresh exactly when it is
+            needed. The stamp is never consulted (unlike ``apt.update`` and
+            ``apt.packages``). Defaults to 0.
         **kwargs: Additional keyword arguments.
 
     Yields:
@@ -2276,6 +2293,13 @@ async def key(
     # dropped: keys arrive as streams from the controller, and removal is
     # expressible with the ``files`` primitives. ``**kwargs`` absorbs the baseline's
     # global arguments (``op()`` already strips ``name``/``sudo``/``su``).
+    #
+    # ``update_cache=True`` appends one ``AptUpdateCommand`` after the install
+    # (issue #14, Ansible's ``apt_repository`` ``update_cache: true``); the key
+    # install is non-idempotent, so it always refreshes. ``cache_valid_time`` is
+    # accepted for parity but never read: the install already forces the refresh,
+    # and a fresh ``AptUpdateStamp`` predates it, so gating on freshness would skip
+    # the refresh exactly when needed -- the trap the issue names.
     if isinstance(src, str):
         # ValueError (not TypeError) keeps apt.key consistent with apt.deb and
         # dnf.key, which also reject an unusable string ``src`` with
@@ -2295,6 +2319,9 @@ async def key(
     spool = _key_spool_path(dest)
     yield AptKeyUploadCommand(src=src, dest=spool)
     yield AptKeyInstallCommand(spool=spool, dest=dest)
+    if update_cache:
+        ctx.reason += "; apt update"
+        yield AptUpdateCommand()
 
 
 # --- apt.mark ------------------------------------------------------------------
@@ -2964,6 +2991,8 @@ async def ppa(
     ctx: OpContext,
     src: str,
     present: bool = True,
+    update_cache: bool = False,
+    cache_valid_time: int = 0,
     **kwargs: Any,
 ) -> AsyncGenerator[Command]:
     """Add/remove an Ubuntu PPA repository.
@@ -2973,6 +3002,18 @@ async def ppa(
         src (str): The PPA name, in full ``ppa:user/repo`` format.
         present (bool, optional): Whether the repository should exist.
             Defaults to True.
+        update_cache (bool, optional): Refresh the package index with
+            ``apt-get update`` after the PPA is added or removed -- Ansible's
+            ``apt_repository`` ``update_cache: true`` spelling (issue #14).
+            The ``AptUpdateCommand`` is yielded only on a real change and
+            *after* the ``apt-add-repository`` command, so a no-op yields
+            nothing. Defaults to False.
+        cache_valid_time (int, optional): Accepted for Ansible spelling
+            parity but inert here: a sources change always forces the
+            refresh, because a fresh ``AptUpdateStamp`` predates the change
+            and gating on it would skip the refresh exactly when it is
+            needed. The stamp is never consulted (unlike ``apt.update`` and
+            ``apt.packages``). Defaults to 0.
         **kwargs: Additional keyword arguments.
 
     Yields:
@@ -3024,6 +3065,14 @@ async def ppa(
     # transform can reproduce. The spool family is for whole-content edits of
     # a protected file (``apt.repo`` is that shape here); a tool-owned
     # mutation stays in place, like ``git.config``.
+    #
+    # ``update_cache=True`` appends one ``AptUpdateCommand`` after the
+    # add/remove, on the real-change path only (issue #14, Ansible's
+    # ``apt_repository`` ``update_cache: true``); a no-op yields nothing.
+    # ``cache_valid_time`` is accepted for parity but never read: the change
+    # gate already forces the refresh, and a fresh ``AptUpdateStamp`` predates
+    # the change, so gating on it would skip the refresh exactly when needed --
+    # the trap the issue names.
     sources = await ctx.facts.get(AptSources)
     owner_name = _ppa_owner_name(src)
     if owner_name is not None:
@@ -3041,6 +3090,9 @@ async def ppa(
     else:
         ctx.reason = f"ppa {src} will be removed"
     yield AptPpaCommand(src=src, present=present)
+    if update_cache:
+        ctx.reason += "; apt update"
+        yield AptUpdateCommand()
 
 
 # --- apt.repo ------------------------------------------------------------------
@@ -3201,6 +3253,8 @@ async def repo(
     src: str,
     present: bool = True,
     filename: str | None = None,
+    update_cache: bool = False,
+    cache_valid_time: int = 0,
     **kwargs: Any,
 ) -> AsyncGenerator[Command]:
     """Add/remove an apt repository line.
@@ -3213,6 +3267,18 @@ async def repo(
         filename (str | None, optional): Base name under
             ``/etc/apt/sources.list.d/`` (the ``.list`` extension is appended);
             by default ``/etc/apt/sources.list`` is managed. Defaults to None.
+        update_cache (bool, optional): Refresh the package index with
+            ``apt-get update`` after the sources file changes -- Ansible's
+            ``apt_repository`` ``update_cache: true`` spelling (issue #14).
+            The ``AptUpdateCommand`` is yielded only on a real change and
+            *after* the install command, so a no-op yields nothing and the
+            refresh never precedes the write it depends on. Defaults to False.
+        cache_valid_time (int, optional): Accepted for Ansible spelling
+            parity but inert here: a sources change always forces the
+            refresh, because a fresh ``AptUpdateStamp`` predates the change
+            and gating on it would skip the refresh exactly when it is
+            needed. The stamp is never consulted (unlike ``apt.update`` and
+            ``apt.packages``). Defaults to 0.
         **kwargs: Additional keyword arguments.
 
     Yields:
@@ -3263,6 +3329,17 @@ async def repo(
     # and a remove of a repository configured in some *other* sources file.
     # ``**kwargs`` absorbs any further global arguments (``op()`` already
     # strips ``name``/``sudo``/``su``).
+    #
+    # ``update_cache=True`` appends one ``AptUpdateCommand`` after the install,
+    # on the real-change path only (issue #14, Ansible's ``apt_repository``
+    # ``update_cache: true``) -- the ``apt.packages`` ``update=True`` prefix in
+    # reverse position, since the refresh must follow the write it depends on.
+    # A no-op yields nothing, so a converged deploy never refreshes.
+    # ``cache_valid_time`` is accepted for parity but never read: the change gate
+    # above already forces the refresh, and a fresh ``AptUpdateStamp`` predates
+    # the change, so gating on it would skip the refresh exactly when needed --
+    # the trap the issue names. ``dnf.packages(update_cache=…)`` is the
+    # cross-namespace precedent for the spelling.
     path = f"/etc/apt/sources.list.d/{filename}.list" if filename else "/etc/apt/sources.list"
     sources = await ctx.facts.get(AptSources)
     parsed = AptSources._parse_list_line(src)
@@ -3296,6 +3373,9 @@ async def repo(
     )
     yield AptRepoUploadCommand(content=new, dest=spool)
     yield AptRepoInstallCommand(spool=spool, dest=path)
+    if update_cache:
+        ctx.reason += "; apt update"
+        yield AptUpdateCommand()
 
 
 # --- apt.sources_file ----------------------------------------------------------
@@ -3430,6 +3510,8 @@ async def sources_file(
     architectures: str | list[str] | tuple[str, ...] | None = None,
     signed_by: str | None = None,
     present: bool = True,
+    update_cache: bool = False,
+    cache_valid_time: int = 0,
     **kwargs: Any,
 ) -> AsyncGenerator[Command]:
     """Manage a deb822 ``.sources`` file.
@@ -3456,6 +3538,18 @@ async def sources_file(
             used for signature verification. Defaults to None.
         present (bool, optional): Whether the sources file should exist.
             Defaults to True.
+        update_cache (bool, optional): Refresh the package index with
+            ``apt-get update`` after the sources file is written or removed --
+            Ansible's ``apt_repository`` ``update_cache: true`` spelling
+            (issue #14). The ``AptUpdateCommand`` is yielded only on a real
+            change and *after* the install or removal, so a no-op yields
+            nothing. Defaults to False.
+        cache_valid_time (int, optional): Accepted for Ansible spelling
+            parity but inert here: a sources change always forces the
+            refresh, because a fresh ``AptUpdateStamp`` predates the change
+            and gating on it would skip the refresh exactly when it is
+            needed. The stamp is never consulted (unlike ``apt.update`` and
+            ``apt.packages``). Defaults to 0.
         **kwargs: Additional keyword arguments.
 
     Yields:
@@ -3503,6 +3597,14 @@ async def sources_file(
     # operations -- the ``apt.key`` pattern), with the ``0644`` mode kept as
     # The baseline hard-codes it. ``**kwargs`` absorbs any further global arguments
     # (``op()`` already strips ``name``/``sudo``/``su``).
+    #
+    # ``update_cache=True`` appends one ``AptUpdateCommand`` after the write or
+    # the removal, on the real-change path only (issue #14, Ansible's
+    # ``apt_repository`` ``update_cache: true``); a no-op yields nothing.
+    # ``cache_valid_time`` is accepted for parity but never read: the change gate
+    # already forces the refresh, and a fresh ``AptUpdateStamp`` predates the
+    # change, so gating on it would skip the refresh exactly when needed -- the
+    # trap the issue names.
     dest = f"/etc/apt/sources.list.d/{filename}.sources"
 
     # Removal path -- idempotent on the file's existence (DnfRepoFile pattern).
@@ -3514,6 +3616,9 @@ async def sources_file(
             ctx.changed = True
             ctx.reason = f'apt sources file "{dest}" will be removed'
             yield AptSourcesFileRemoveCommand(path=dest)
+            if update_cache:
+                ctx.reason += "; apt update"
+                yield AptUpdateCommand()
         return
 
     types_list = _as_list(types) or ["deb"]
@@ -3569,6 +3674,9 @@ async def sources_file(
     spool = _sources_spool_path(dest)
     yield AptSourcesFileUploadCommand(content=content, dest=spool)
     yield AptSourcesFileInstallCommand(spool=spool, dest=dest)
+    if update_cache:
+        ctx.reason += "; apt update"
+        yield AptUpdateCommand()
 
 
 __all__ = [

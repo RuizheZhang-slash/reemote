@@ -40,23 +40,25 @@ it. The barriers below are therefore load-bearing, not stylistic:
 Implementation gaps
 -------------------
 
-Five genuine library gaps were proven while mapping the role. Three are now
+Five genuine library gaps were proven while mapping the role. Four are now
 **closed**: GAP-1 (#11, additive multi-key import into a non-default
 keyring) -- ``gpg.import_key`` gained ``dest=``, so the five signing keys
 import additively into the shared keyring, each fingerprint-pinned; GAP-2
 (#12, unprivileged read-back of ``0640`` service-owned files) --
 ``FileContents`` now re-reads a present-but-unreadable file elevated, so
 ``files.install`` converges on service-owned configs and the login-user
-group-membership workaround is gone; and GAP-3 (#13, non-idempotent
+group-membership workaround is gone; GAP-3 (#13, non-idempotent
 ``latest``) -- ``apt.packages(latest=True)`` now upgrades only packages
 with a pending upgrade, so the agent deploy passes ``latest=True``
-directly and its ``AptUpgradable`` gather barrier is gone. The two
-remaining gaps are worked around here, marked ``GAP-n`` at the point of
-use, and tracked as GitHub issues; the workarounds carry a documented
-deviation. They are both bridgeable, so the migration completes -- a
-second pass will replace them once the library extensions land:
+directly and its ``AptUpgradable`` gather barrier is gone; and GAP-4
+(#14, ``apt.repo`` had no ``update_cache``) -- the repository operations
+gained ``update_cache``, so each ``apt.repo`` request refreshes the index
+after a real sources change and the snapshot-gated ``apt.update`` barrier
+is gone. The one remaining gap is worked around here, marked ``GAP-n`` at
+the point of use, and tracked as a GitHub issue; the workaround carries a
+documented deviation. It is bridgeable, so the migration completes -- a
+second pass will replace it once the library extension lands:
 
-* GAP-4 (#14) -- ``apt.repo`` has no ``update_cache``
 * GAP-5 (#15) -- ``apt.repo`` removal is file-scoped, no source provenance
 
 See ``ansible-datadog.md`` for the full gap register, the coverage table
@@ -739,9 +741,11 @@ def build_repository(
 ) -> Callable[[Host], Generator[OperationRequest]]:
     """``pkg-debian.yml``: the keyring, the legacy sweep and the agent repo.
 
-    GAP-4/GAP-5 (#14/#15: ``apt.repo`` has no ``update_cache`` and no source
-    provenance) are worked around here; see the comments at each site. The
-    signing keys import additively into the shared keyring with
+    GAP-5 (#15: ``apt.repo`` removal is file-scoped, no source provenance)
+    is worked around here; see the comment at that site. Each ``apt.repo``
+    request carries ``update_cache=True`` (GAP-4/#14, now closed), so a real
+    sources change refreshes the index without a separate gated request.
+    The signing keys import additively into the shared keyring with
     ``gpg.import_key(dest=...)`` (GAP-1/#11, now closed).
 
     The per-host ``io.BytesIO`` objects are built ONCE, in the factory body
@@ -818,6 +822,7 @@ def build_repository(
                     src=line,
                     present=False,
                     filename=stem,
+                    update_cache=True,
                     sudo=True,
                     when=is_ubuntu,
                 )
@@ -832,6 +837,7 @@ def build_repository(
                 src=AGENT_REPOS[major],
                 present=major == settings["major"],
                 filename=f"ansible_datadog_{major}",
+                update_cache=True,
                 sudo=True,
                 when=is_ubuntu,
             )
@@ -847,20 +853,6 @@ def build_repository(
             sudo=True,
             when=is_ubuntu,
         )
-
-        # GAP-4 (#14): apt.repo has no `update_cache` parameter, so the role's
-        # `update_cache: true` on every apt_repository task cannot ride the
-        # request. A *stateless* apt.update() is gated on a snapshot boolean
-        # instead: it fires only when this deploy will actually change a
-        # sources file. Gating it on cache_valid_time would be wrong -- the
-        # index may be fresh and still not know about the repo just added.
-        if plan["needs_update"]:
-            yield op(
-                apt.update,
-                name="Refresh the apt cache after repository changes",
-                sudo=True,
-                when=is_ubuntu,
-            )
 
     return repository
 
@@ -1265,31 +1257,21 @@ def pre_cleanup_snapshot(
 
 def repository_snapshot(
     keys: tuple[bytes, ...],
-    sources: dict[str, Any],
     hits: dict[str, Any],
-    repo_files: dict[str, Any],
     settings: dict[str, Any],
 ) -> dict[str, Any]:
-    """Freeze the signing-key bodies and the three apt reads the repository deploy needs.
+    """Freeze the signing-key bodies and the legacy-repo provenance the deploy needs.
 
-    ``needs_update`` is the GAP-4 (#14) workaround's gate: true when this
-    deploy will change a sources file (a legacy line to drop, the desired repo
-    missing, or a leftover custom repo file to remove). It is computed from
-    pre-state, so both phases agree, and it is deliberately *not* a
-    cache-freshness test -- a fresh index still does not know about a repo
-    that was just added.
+    Each ``apt.repo`` request now carries ``update_cache=True`` (GAP-4/#14,
+    closed), so the index refresh rides the operation that changes a sources
+    file. The former ``needs_update`` boolean -- and the ``sources``/``repo_files``
+    reads that fed it -- are gone: there is no separate gated ``apt.update``.
     """
     snapshot: dict[str, Any] = {}
-    for name, config in settings.items():
-        configured = sources.get(name, ())
+    for name in settings:
         snapshot[name] = {
             "keys": keys,
             "legacy_files": legacy_repo_targets(tuple(hits.get(name, ()))),
-            "needs_update": (
-                any(is_legacy_datadog_source(source) for source in configured)
-                or repo_entry(config["major"]) not in configured
-                or CUSTOM_REPO_FILE in repo_files.get(name, ())
-            ),
         }
     return snapshot
 
@@ -1463,9 +1445,6 @@ async def main() -> None:
             hits = await gather_fact(
                 targets, FindInFiles, "/etc/apt", LEGACY_REPO_PATTERN
             )
-            repo_files = await gather_fact(
-                targets, FindFiles, SOURCES_LIST_D, fname="*.list", maxdepth=1
-            )
             units_before = await gather_fact(targets, SystemdUnitFiles)
         finally:
             for host in hosts:
@@ -1490,7 +1469,7 @@ async def main() -> None:
             await execute(inventory, deploy_bootstrap, "Deploy 2: apt bootstrap packages")
         )
         repository = build_repository(
-            repository_snapshot(keys, sources, hits, repo_files, settings)
+            repository_snapshot(keys, hits, settings)
         )
         reports.append(
             await execute(inventory, repository, "Deploy 3: signing keys and apt repo")

@@ -103,7 +103,7 @@ That completeness is what makes translation near-mechanical:
 | `apt` / `package` | `apt.packages` / `dnf.packages` / `apk.packages` |
 | `apt_key` | `apt.key` |
 | `apt_repository` | `apt.repo`, `apt.sources_file`, `apt.ppa` |
-| `apt` with `update_cache` | `apt.update` |
+| `apt` / `apt_repository` with `update_cache` | `apt.update`, `apt.packages(update=True)`, `apt.repo(update_cache=True)` |
 | hold / `apt_mark` | `apt.mark` |
 | `copy` (inline content) / `template` | `files.install` (pre-rendered content) |
 | `lineinfile` / `blockinfile` | `files.edit` / `files.transform` |

@@ -454,6 +454,14 @@ the baseline's `keyserver`/`keyid` fetch and its `present=False` removal are
 deliberately dropped: keys arrive as streams from the controller, and
 removal is expressible with the `files` primitives. `dest` is required
 because an anonymous stream provides no name to derive one from.
+`update_cache=True` appends an `apt-get update` (`AptUpdateCommand`) after
+the install — Ansible's `apt_repository` `update_cache: true` spelling
+(issue #14); since the key install is non-idempotent it always refreshes.
+`cache_valid_time` is accepted for the same spelling parity but is inert
+here: a key install always forces the refresh, because a fresh
+`AptUpdateStamp` predates the change and gating on it would skip the
+refresh exactly when it is needed, so the stamp is never consulted (unlike
+`apt.update` and `apt.packages`).
 
 `apt.mark` holds packages back from upgrades, or releases held ones — a
 reemote original: the baseline ships no operation managing package hold
@@ -562,6 +570,14 @@ the PPA's Launchpad signing key, adds the deb-src entry and resolves the
 distro codename, none of which a hand-rolled content transform can
 reproduce. To manage the PPA's source *line* through the spool family
 instead, `apt.repo` (plus `apt.key` for the signing key) is that shape.
+`update_cache=True` appends an `apt-get update` (`AptUpdateCommand`) after
+the add or remove, and only on a real change — Ansible's `apt_repository`
+`update_cache: true` spelling (issue #14), so a converged PPA is a no-op
+and never refreshes. `cache_valid_time` is accepted for spelling parity
+but is inert: a sources change always forces the refresh, because a fresh
+`AptUpdateStamp` predates the change and gating on it would skip the
+refresh exactly when it is needed, so the stamp is never consulted (unlike
+`apt.update` and `apt.packages`).
 
 `apt.repo` adds or removes one apt repository line (the baseline's `apt.repo`
 parity). `src` is the full source string (`deb http://X hardy main`),
@@ -599,6 +615,20 @@ backup (its timestamp would differ between the prepare and apply phases,
 breaking the determinism guard) and keeps the file's other lines, comments
 and blank lines exactly as they were, because the transform is line-based
 over the real content.
+`update_cache=True` appends an `apt-get update` (`AptUpdateCommand`)
+*after* the install command, and only when the file actually changed —
+Ansible's `apt_repository` `update_cache: true` spelling (issue #14). The
+order matters: refreshing before the write is useless, so the update
+follows the install, and a no-op (a repository already configured, or a
+remove of one that is not there) yields nothing at all. This is the
+`apt.packages` `update=True` prefix in reverse position, and
+`dnf.packages(update_cache=…)` is the cross-namespace precedent for the
+spelling. `cache_valid_time` is accepted for the same Ansible parity but is
+inert here: a repo change always forces the refresh, because a fresh
+`AptUpdateStamp` predates the change and gating on freshness would skip
+the refresh exactly when it is needed (the trap the issue names), so the
+stamp is never consulted — unlike `apt.update` and `apt.packages`, whose
+`cache_valid_time` does gate a stateless refresh.
 
 `apt.sources_file` manages a deb822 `.sources` file under
 `/etc/apt/sources.list.d/` (the baseline's `apt.sources_file` parity).
@@ -627,6 +657,14 @@ when it is already absent. The baseline checks its `files.File` fact for the
 same gate; reemote's apt namespace never imports another module's
 facts, so the in-namespace `AptSourcesFile` content fact provides the
 existence answer — the same pattern `dnf.repo` uses with `DnfRepoFile`.
+`update_cache=True` appends an `apt-get update` (`AptUpdateCommand`) after
+the write *or* the removal, and only on a real change — Ansible's
+`apt_repository` `update_cache: true` spelling (issue #14); a no-op yields
+nothing. `cache_valid_time` is accepted for spelling parity but is inert:
+a sources change always forces the refresh, because a fresh
+`AptUpdateStamp` predates the change and gating on it would skip the
+refresh exactly when it is needed, so the stamp is never consulted (unlike
+`apt.update` and `apt.packages`).
 
 `apt.update` refreshes the package lists (the baseline's `apt.update` parity)
 — the standalone form of `apt.packages`' `update=True` prefix. By

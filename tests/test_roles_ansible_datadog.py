@@ -17,7 +17,8 @@ queue no restart handler. That is what proves the GAP workarounds converge
 rather than churn -- in particular the additive per-key import (GAP-1, now
 closed), the elevated read-back of ``0640`` service-owned configs (GAP-2,
 now closed), the fact-gated ``latest`` (GAP-3, now closed -- the operation
-reads ``AptUpgradable`` itself), the snapshot-gated ``apt.update`` (GAP-4)
+reads ``AptUpgradable`` itself), the per-request ``update_cache`` refresh
+(GAP-4, now closed -- each ``apt.repo`` refreshes the index on a real change)
 and the per-file legacy repo fan-out (GAP-5).
 
 Two simulation limits are bridged explicitly between the passes, each
@@ -42,7 +43,6 @@ import pytest
 
 from reemote import (
     AptPackages,
-    AptSources,
     FindFiles,
     FindInFiles,
     SystemdServiceState,
@@ -148,14 +148,8 @@ def refresh_search_seams(host: SimulatedHost) -> None:
     ``command`` helpers rather than spelled out. The ERE the migration greps
     for is plain enough that Python's ``re`` answers it identically.
     """
-    sources_list_d = Path(datadog.SOURCES_LIST_D)
     conf_d = Path(datadog.CONF_D)
     host.find_results = {
-        FindFiles.command(datadog.SOURCES_LIST_D, fname="*.list", maxdepth=1): sorted(
-            path
-            for path in host.remote_files
-            if Path(path).parent == sources_list_d and path.endswith(".list")
-        ),
         FindFiles.command(datadog.CONF_D, fname="conf.yaml*", maxdepth=2): sorted(
             path
             for path in host.remote_files
@@ -295,11 +289,7 @@ async def migrate(
         return report
 
     installed = await gather_fact(targets, AptPackages)
-    sources = await gather_fact(targets, AptSources)
     hits = await gather_fact(targets, FindInFiles, "/etc/apt", datadog.LEGACY_REPO_PATTERN)
-    repo_files = await gather_fact(
-        targets, FindFiles, datadog.SOURCES_LIST_D, fname="*.list", maxdepth=1
-    )
     units_before = await gather_fact(targets, SystemdUnitFiles)
 
     await execute(
@@ -310,7 +300,7 @@ async def migrate(
     await execute(datadog.deploy_bootstrap)
     await execute(
         datadog.build_repository(
-            datadog.repository_snapshot(KEYS, sources, hits, repo_files, settings)
+            datadog.repository_snapshot(KEYS, hits, settings)
         )
     )
 
@@ -533,16 +523,8 @@ async def test_dry_preview_matches_the_apply_for_every_deploy(rig):
         datadog.build_repository(
             datadog.repository_snapshot(
                 KEYS,
-                await gather_fact([untouched], AptSources),
                 await gather_fact(
                     [untouched], FindInFiles, "/etc/apt", datadog.LEGACY_REPO_PATTERN
-                ),
-                await gather_fact(
-                    [untouched],
-                    FindFiles,
-                    datadog.SOURCES_LIST_D,
-                    fname="*.list",
-                    maxdepth=1,
                 ),
                 {"ubuntu": datadog.role_settings(untouched)},
             )

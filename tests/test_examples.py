@@ -93,7 +93,6 @@ SNAPSHOT_ARGS = {
         name: {
             "keys": (b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n",) * 5,
             "legacy_files": (None, "datadog"),
-            "needs_update": True,
         }
     },
     (

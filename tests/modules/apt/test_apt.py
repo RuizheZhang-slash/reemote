@@ -74,9 +74,16 @@ multi-value expansion idempotence, the
 SimulatedHost spool/install/remove mutations and end-to-end / dry-run /
 repeat-noop / determinism runs.
 
+The ``update_cache`` / ``cache_valid_time`` parameters added to ``apt.repo``,
+``apt.ppa``, ``apt.key`` and ``apt.sources_file`` (issue #14) are covered in a
+dedicated section: the post-write ``apt-get update`` on a real change, the
+no-op that yields nothing, the default-off behaviour, and the inert
+``cache_valid_time`` (a fresh stamp never suppresses a forced refresh).
+
 ``asyncio_mode = "auto"`` lets the async tests below run without decorators.
 """
 
+import inspect
 import io
 import json
 import shlex
@@ -5766,3 +5773,334 @@ async def test_apt_sources_file_fresh_containers_per_phase_stay_deterministic():
     (entry,) = report.log
     assert entry.changed
     assert DOCKER_DEST in host.remote_files
+
+
+# --- update_cache on the repository operations (issue #14) ---------------------
+
+# Ansible's ``apt_repository`` ``update_cache: true`` spelling, added to
+# ``apt.repo``, ``apt.ppa``, ``apt.key`` and ``apt.sources_file``. The refresh
+# (one ``AptUpdateCommand``) is appended *after* the write, and only on a real
+# change; ``cache_valid_time`` is accepted for parity but inert, because a
+# sources change always forces the refresh (a fresh ``AptUpdateStamp`` predates
+# the change, so gating on it would skip the refresh exactly when needed).
+
+
+def test_repository_operations_expose_update_cache_as_named_parameters():
+    """issue #14: ``update_cache`` and ``cache_valid_time`` are first-class
+    named parameters on all four repository operations, no longer swallowed by
+    ``**kwargs`` -- so the Ansible spelling has an effect instead of being
+    silently absorbed."""
+    for operation in (apt.repo, apt.ppa, apt.key, apt.sources_file):
+        params = inspect.signature(operation).parameters
+        assert "update_cache" in params, operation.__name__
+        assert params["update_cache"].default is False, operation.__name__
+        assert "cache_valid_time" in params, operation.__name__
+        assert params["cache_valid_time"].default == 0, operation.__name__
+
+
+async def test_apt_repo_update_cache_appends_update_after_install():
+    """issue #14 acceptance: a real add with ``update_cache=True`` yields the
+    spool transfer, the install, then ``apt-get update`` -- in that order, the
+    refresh following the write it depends on."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.repo(ctx, src=REPO_SRC, update_cache=True)]
+    assert ctx.changed
+    assert ctx.reason == (
+        f'apt repo "{REPO_SRC}" missing, will be added to {SOURCES_LIST}; apt update'
+    )
+    assert commands == [
+        AptRepoUploadCommand(content=f"{REPO_SRC}\n", dest=REPO_SPOOL),
+        AptRepoInstallCommand(spool=REPO_SPOOL, dest=SOURCES_LIST),
+        AptUpdateCommand(),
+    ]
+
+
+async def test_apt_repo_update_cache_remove_appends_update():
+    """A real removal with ``update_cache=True`` refreshes after the install
+    too, so the index stops referencing the deleted repository."""
+    host = SimulatedHost(
+        name="h",
+        apt_sources=[dict(REPO_SOURCE)],
+        remote_files={SOURCES_LIST: f"{OTHER_SRC}\n{REPO_SRC}\n".encode()},
+    )
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c async for c in apt.repo(ctx, src=REPO_SRC, present=False, update_cache=True)
+    ]
+    assert ctx.changed
+    assert ctx.reason == (
+        f'apt repo "{REPO_SRC}" present, will be removed from {SOURCES_LIST}; apt update'
+    )
+    assert commands == [
+        AptRepoUploadCommand(content=f"{OTHER_SRC}\n", dest=REPO_SPOOL),
+        AptRepoInstallCommand(spool=REPO_SPOOL, dest=SOURCES_LIST),
+        AptUpdateCommand(),
+    ]
+
+
+async def test_apt_repo_update_cache_noop_yields_nothing():
+    """A configured repo is a no-op even with ``update_cache=True``: no write,
+    no refresh -- a converged deploy never runs ``apt-get update``."""
+    host = SimulatedHost(name="h", apt_sources=[dict(REPO_SOURCE)])
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.repo(ctx, src=REPO_SRC, update_cache=True)]
+    assert not ctx.changed
+    assert ctx.reason == f'apt repo "{REPO_SRC}" exists'
+    assert commands == []
+
+
+async def test_apt_repo_update_cache_default_off_keeps_prior_behaviour():
+    """``update_cache`` defaults to False: a real add yields only the spool
+    pair, exactly as before issue #14."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.repo(ctx, src=REPO_SRC)]
+    assert commands == [
+        AptRepoUploadCommand(content=f"{REPO_SRC}\n", dest=REPO_SPOOL),
+        AptRepoInstallCommand(spool=REPO_SPOOL, dest=SOURCES_LIST),
+    ]
+
+
+async def test_apt_repo_cache_valid_time_never_suppresses_a_forced_refresh():
+    """The issue's trap: a fresh ``AptUpdateStamp`` must NOT gate the refresh a
+    real repo change forces. ``cache_valid_time`` is accepted for Ansible
+    parity but inert -- the update still yields despite the fresh stamp."""
+    fresh = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=30)
+    host = SimulatedHost(name="h", apt_update_stamp=fresh)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in apt.repo(
+            ctx, src=REPO_SRC, update_cache=True, cache_valid_time=3600
+        )
+    ]
+    assert ctx.changed
+    assert commands == [
+        AptRepoUploadCommand(content=f"{REPO_SRC}\n", dest=REPO_SPOOL),
+        AptRepoInstallCommand(spool=REPO_SPOOL, dest=SOURCES_LIST),
+        AptUpdateCommand(),
+    ]
+
+
+async def test_apt_repo_update_cache_with_filename():
+    """A filename-scoped add with ``update_cache=True`` refreshes after
+    installing the ``.list`` file (its own spool)."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in apt.repo(
+            ctx, src=REPO_SRC, filename="somefile", update_cache=True
+        )
+    ]
+    assert commands == [
+        AptRepoUploadCommand(content=f"{REPO_SRC}\n", dest=LISTS_SPOOL),
+        AptRepoInstallCommand(spool=LISTS_SPOOL, dest=LISTS_PATH),
+        AptUpdateCommand(),
+    ]
+
+
+async def test_apt_repo_update_cache_end_to_end_then_noop():
+    """Through run(): the apply spools, installs and refreshes (``sudo apt-get
+    update`` last), the stamp is touched; a second run is a converged no-op
+    that queues no refresh -- the change contract handler notification relies
+    on."""
+
+    def repo_deploy(host):
+        yield op(
+            apt.repo,
+            name="Add the partner repo",
+            src=REPO_SRC,
+            update_cache=True,
+            sudo=True,
+        )
+
+    host = SimulatedHost(name="h")
+
+    def factory(entry):
+        return host
+
+    plans, report, _hosts = await run(
+        [{"host": "h", "connection": {}}], repo_deploy, host_factory=factory
+    )
+    assert plans["h"][0].changed
+    (entry,) = report.log
+    assert entry.changed
+    assert entry.commands == (
+        AptRepoUploadCommand(content=f"{REPO_SRC}\n", dest=REPO_SPOOL),
+        AptRepoInstallCommand(spool=REPO_SPOOL, dest=SOURCES_LIST),
+        AptUpdateCommand(),
+    )
+    assert host.apt_sources == [REPO_SOURCE]
+    assert host.apt_update_stamp is not None
+    log = format_log(report)
+    assert f"    $ scp <apt sources> -> {REPO_SPOOL}" in log
+    assert "    $ sudo apt-get update" in log
+
+    # Idempotent: the fresh fact read sees the installed entry -> no change,
+    # and update_cache rides the change, so no refresh is queued either.
+    plans2, report2, _hosts2 = await run(
+        [{"host": "h", "connection": {}}], repo_deploy, host_factory=factory
+    )
+    assert not plans2["h"][0].changed
+    (entry2,) = report2.log
+    assert not entry2.changed
+    assert entry2.commands == ()
+    assert entry2.reason == f'apt repo "{REPO_SRC}" exists'
+
+
+async def test_apt_ppa_update_cache_appends_update_after_add():
+    """issue #14: a real PPA add with ``update_cache=True`` yields the
+    ``apt-add-repository`` command then ``apt-get update``."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.ppa(ctx, src=PPA_SRC, update_cache=True)]
+    assert ctx.changed
+    assert ctx.reason == f"ppa {PPA_SRC} will be added; apt update"
+    assert commands == [AptPpaCommand(src=PPA_SRC), AptUpdateCommand()]
+
+
+async def test_apt_ppa_update_cache_remove_appends_update():
+    """A real PPA removal with ``update_cache=True`` refreshes after the
+    ``--remove`` command."""
+    host = SimulatedHost(name="h", apt_sources=[dict(PPA_SOURCE)])
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c async for c in apt.ppa(ctx, src=PPA_SRC, present=False, update_cache=True)
+    ]
+    assert ctx.changed
+    assert ctx.reason == f"ppa {PPA_SRC} will be removed; apt update"
+    assert commands == [AptPpaCommand(src=PPA_SRC, present=False), AptUpdateCommand()]
+
+
+async def test_apt_ppa_update_cache_noop_yields_nothing():
+    """A configured PPA is a no-op even with ``update_cache=True``."""
+    host = SimulatedHost(name="h", apt_sources=[dict(PPA_SOURCE)])
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.ppa(ctx, src=PPA_SRC, update_cache=True)]
+    assert not ctx.changed
+    assert ctx.reason == f"ppa {PPA_SRC} exists"
+    assert commands == []
+
+
+async def test_apt_ppa_cache_valid_time_never_suppresses_a_forced_refresh():
+    """A fresh stamp does not gate the refresh a real PPA change forces."""
+    fresh = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=30)
+    host = SimulatedHost(name="h", apt_update_stamp=fresh)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in apt.ppa(
+            ctx, src=PPA_SRC, update_cache=True, cache_valid_time=3600
+        )
+    ]
+    assert commands == [AptPpaCommand(src=PPA_SRC), AptUpdateCommand()]
+
+
+async def test_apt_key_update_cache_appends_update_after_install():
+    """issue #14: ``apt.key`` is non-idempotent, so ``update_cache=True``
+    always appends ``apt-get update`` after the install pair."""
+    host = SimulatedHost(name="h")
+    stream = io.BytesIO(GPG_KEY_BYTES)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c async for c in apt.key(ctx, src=stream, dest="docker.gpg", update_cache=True)
+    ]
+    assert ctx.changed
+    assert ctx.reason == f"install GPG key from <stream> to {KEYRING_DEST}; apt update"
+    assert commands == [
+        AptKeyUploadCommand(src=stream, dest=KEY_SPOOL),
+        AptKeyInstallCommand(spool=KEY_SPOOL, dest=KEYRING_DEST),
+        AptUpdateCommand(),
+    ]
+
+
+async def test_apt_key_cache_valid_time_never_suppresses_a_forced_refresh():
+    """A fresh stamp does not gate the refresh a key install forces."""
+    fresh = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=30)
+    host = SimulatedHost(name="h", apt_update_stamp=fresh)
+    stream = io.BytesIO(GPG_KEY_BYTES)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in apt.key(
+            ctx, src=stream, dest="docker.gpg", update_cache=True, cache_valid_time=3600
+        )
+    ]
+    assert commands == [
+        AptKeyUploadCommand(src=stream, dest=KEY_SPOOL),
+        AptKeyInstallCommand(spool=KEY_SPOOL, dest=KEYRING_DEST),
+        AptUpdateCommand(),
+    ]
+
+
+async def test_apt_sources_file_update_cache_appends_update_after_write():
+    """issue #14: a real deb822 write with ``update_cache=True`` yields the
+    spool pair then ``apt-get update``."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c async for c in apt.sources_file(ctx, **DOCKER_KWARGS, update_cache=True)
+    ]
+    assert ctx.changed
+    assert ctx.reason == (
+        f'apt sources file "{DOCKER_DEST}" missing or outdated, will be written; apt update'
+    )
+    assert commands == [
+        AptSourcesFileUploadCommand(content=DOCKER_CONTENT, dest=SOURCES_SPOOL),
+        AptSourcesFileInstallCommand(spool=SOURCES_SPOOL, dest=DOCKER_DEST),
+        AptUpdateCommand(),
+    ]
+
+
+async def test_apt_sources_file_update_cache_remove_appends_update():
+    """A real deb822 removal with ``update_cache=True`` refreshes after the
+    ``rm -f``."""
+    host = SimulatedHost(name="h")
+    host.remote_files[DOCKER_DEST] = DOCKER_CONTENT.encode()
+    host.existing_files.add(DOCKER_DEST)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in apt.sources_file(
+            ctx, filename="docker", present=False, update_cache=True
+        )
+    ]
+    assert ctx.changed
+    assert ctx.reason == f'apt sources file "{DOCKER_DEST}" will be removed; apt update'
+    assert commands == [
+        AptSourcesFileRemoveCommand(path=DOCKER_DEST),
+        AptUpdateCommand(),
+    ]
+
+
+async def test_apt_sources_file_update_cache_noop_yields_nothing():
+    """An already-configured deb822 file is a no-op even with
+    ``update_cache=True``."""
+    host = SimulatedHost(name="h", apt_sources=[dict(DOCKER_SOURCE)])
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c async for c in apt.sources_file(ctx, **DOCKER_KWARGS, update_cache=True)
+    ]
+    assert not ctx.changed
+    assert ctx.reason == f'apt sources file "{DOCKER_DEST}" is already configured'
+    assert commands == []
+
+
+async def test_apt_sources_file_cache_valid_time_never_suppresses_a_forced_refresh():
+    """A fresh stamp does not gate the refresh a real deb822 write forces."""
+    fresh = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=30)
+    host = SimulatedHost(name="h", apt_update_stamp=fresh)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in apt.sources_file(
+            ctx, **DOCKER_KWARGS, update_cache=True, cache_valid_time=3600
+        )
+    ]
+    assert commands == [
+        AptSourcesFileUploadCommand(content=DOCKER_CONTENT, dest=SOURCES_SPOOL),
+        AptSourcesFileInstallCommand(spool=SOURCES_SPOOL, dest=DOCKER_DEST),
+        AptUpdateCommand(),
+    ]

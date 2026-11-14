@@ -63,6 +63,19 @@ demo Ubuntu host, so leaving it configured makes every later ``apt-get
 update`` (the ``apt_update.py`` example) stall on connection timeouts and
 emit a warning. The add-then-remove cycle keeps the sweep clean and fast.
 
+The remove request carries ``update_cache=True`` (issue #14): after the line
+is deleted, ``apt.repo`` appends an ``apt-get update`` so the index stops
+referencing the repository -- Ansible's ``apt_repository`` ``update_cache:
+true`` spelling. The refresh is yielded only on a real change and *after*
+the install, so the no-op re-add never triggers it. It is deliberately on
+the *remove*, not the add: the partner archive is unreachable from the demo
+host, so refreshing while it is still configured (an add with
+``update_cache=True``) would stall on connection timeouts, whereas
+refreshing after it is gone contacts only the reachable archives.
+``cache_valid_time`` is accepted for the same Ansible parity but is inert
+here -- a sources change always forces the refresh, since a fresh
+``AptUpdateStamp`` predates the change.
+
 Writing the apt sources needs root -- the files are root-owned -- so the
 requests are flagged ``sudo=True`` and the driver elevates the install
 command over SSH; the spool copy always rides scp as the login user,
@@ -158,10 +171,15 @@ def deploy(host: Host) -> Generator[OperationRequest]:
     The first request installs the line; the second carries the same
     arguments and is a guaranteed no-op in the apply phase, because the
     first install is already visible through the fresh per-step fact cache.
-    The third removes the line again (``present=False``), leaving the host's
-    sources as found so the shared-host example sweep is not polluted -- the
-    partner archive is unreachable from the demo host, so a lingering entry
-    would stall the later ``apt_update.py`` step on connection timeouts.
+    The third removes the line again (``present=False``) with
+    ``update_cache=True``, so an ``apt-get update`` follows the removal and
+    the index stops referencing the repository (issue #14). It leaves the
+    host's sources as found so the shared-host example sweep is not polluted
+    -- the partner archive is unreachable from the demo host, so a lingering
+    entry would stall the later ``apt_update.py`` step on connection
+    timeouts. The refresh rides the remove rather than the add for the same
+    reason: updating while the unreachable archive is still configured would
+    stall, whereas updating after it is gone contacts only reachable archives.
 
     Writing the root-owned apt sources needs root, so all three requests are
     flagged ``sudo=True`` and the driver elevates their install command over
@@ -185,6 +203,7 @@ def deploy(host: Host) -> Generator[OperationRequest]:
         apt.repo,
         name="Remove the partner repo",
         present=False,
+        update_cache=True,
         sudo=True,
         when=is_ubuntu,
         **PARTNER_REPO,
