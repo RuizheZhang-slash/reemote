@@ -3683,7 +3683,11 @@ class SimulatedHost(Host):
         file name, so its side of the state goes too -- the ``same_files``
         pairs naming the path, its existence marker and its ``file_stats``
         row: the ``rm -f`` drops one name of the inode, never the inode.
+        Any content bytes seeded at the link path go as well (the
+        ``remote_files`` store ``FileContents`` reads), mirroring
+        ``remove_tree``'s store order.
         """
+        self.remote_files.pop(path, None)
         self.links.pop(path, None)
         self.link_stats.pop(path, None)
         self.same_files = {pair for pair in self.same_files if path not in pair}
@@ -3703,10 +3707,13 @@ class SimulatedHost(Host):
         )
 
     def remove_file(self, src: str) -> None:
-        """Record a simulated ``rm -f``: the existence marker and any
-        ``file_stats`` row go, so neither the ``File`` fact nor the
-        ``FileExists`` probe answers for the path afterwards.
+        """Record a simulated ``rm -f``: the content bytes, the existence
+        marker and any ``file_stats`` row go, so neither the ``File`` fact
+        nor the ``FileExists`` probe answers for the path afterwards, and
+        the ``FileContents``/``RemoteFileSha1`` read-backs stop answering
+        its bytes -- the same store order ``remove_tree`` keeps.
         """
+        self.remote_files.pop(src, None)
         self.existing_files.discard(src)
         self.file_stats.pop(src, None)
 

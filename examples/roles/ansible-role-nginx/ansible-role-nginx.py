@@ -61,12 +61,14 @@ reload handler factory, ``apt.ppa`` idempotence, ``default_release`` and
 ``cache_valid_time`` all landed in the library before this migration). One
 gap was identified in the *test framework*, not the library runtime: GAP-1
 (#18, https://github.com/kimjarvis/reemote/issues/18) --
-``SimulatedHost.remove_file`` clears the stat seams but leaves the
-``remote_files`` bytes, so ``FileContents`` answers stale content after a
-simulated ``files.file(present=False)``. Real hosts are unaffected; the
-workaround (asserting removals against ``file_stats``/``existing_files``)
-lives in ``tests/test_roles_ansible_role_nginx.py``, tagged for the second
-pass. The deliberate deviations are recorded at the point of use and in
+``SimulatedHost.remove_file`` cleared the stat seams but left the
+``remote_files`` bytes, so ``FileContents`` answered stale content after a
+simulated ``files.file(present=False)``. Real hosts were unaffected; the
+fix has landed (``remove_file``/``remove_link`` now pop ``remote_files``
+too, mirroring ``remove_tree``) and the second pass is done: the removal
+assertions in ``tests/test_roles_ansible_role_nginx.py`` read
+``remote_files`` directly. The deliberate deviations are recorded at the
+point of use and in
 ``ansible-role-nginx.md``; the load-bearing one is ``files.file(present=False,
 force=True)`` for the role's ``file: state=absent`` tasks -- reemote's ``File``
 fact reads a symlink as "exists and is not a file", so the default

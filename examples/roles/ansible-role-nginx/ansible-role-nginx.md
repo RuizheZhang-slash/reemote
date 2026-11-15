@@ -25,9 +25,9 @@ to a covered operation.
 
 The migration is complete: every task on the Ubuntu path maps to a covered
 operation or a documented recipe — **zero library-runtime gaps**. One
-genuine implementation gap was proven in the *test framework*
-(`SimulatedHost`), feature-only and workaroundable (§6,
-[#18](https://github.com/kimjarvis/reemote/issues/18)) — nothing blocks the
+genuine gap was proven in the *test framework* (`SimulatedHost`),
+feature-only and workaroundable — since closed (§6,
+[#18](https://github.com/kimjarvis/reemote/issues/18)); nothing blocked the
 migration and no feature was dropped.
 
 ## 1. Prerequisites
@@ -317,26 +317,27 @@ hook, reload handler factory, `apt.ppa` idempotence, `default_release`,
 One genuine gap was proven in the test framework (absence protocol: the
 mutator's full body read against the fact's seam read, corroborated by the
 `remove_tree` counterpart), tracked as
-**[GAP-1 (#18)](https://github.com/kimjarvis/reemote/issues/18)** — open:
+**[GAP-1 (#18)](https://github.com/kimjarvis/reemote/issues/18)** — closed:
 
-### GAP-1 (#18) — `SimulatedHost.remove_file` leaves `remote_files`
+### GAP-1 (#18) — `SimulatedHost.remove_file` leaves `remote_files` (closed)
 
 - **What**: the simulated `rm -f` (`tests/simulated_host.py`,
-  `remove_file`) clears `existing_files` and `file_stats` but not
+  `remove_file`) cleared `existing_files` and `file_stats` but not
   `remote_files`, while `FileContents` reads its seam straight from
   `remote_files` (`src/reemote/modules/files/files.py`). After a simulated
-  `files.file(present=False)` the fact still answers the removed file's
-  bytes; a real `rm -f` removes the content. `remove_link` shares the
+  `files.file(present=False)` the fact still answered the removed file's
+  bytes; a real `rm -f` removes the content. `remove_link` shared the
   trait; `remove_tree` already models the removal correctly.
 - **Class**: genuine *test-framework* gap (real hosts are correct).
   **Rank**: feature-only — it affects offline assertions and any
   multi-operation sequence that re-creates a removed path with identical
   content, never the migration itself.
-- **Workaround**: `tests/test_roles_ansible_role_nginx.py` asserts the
-  removals against `file_stats`/`existing_files` instead of `remote_files`,
-  tagged `GAP-1 (#18)` for the second pass (§10).
-- **Proposed fix** (in the ticket): pop `remote_files` in `remove_file`
-  and `remove_link`, mirroring `remove_tree`.
+- **Fix (landed)**: `remove_file` and `remove_link` now pop `remote_files`
+  too, mirroring `remove_tree`'s store order;
+  `tests/test_simulated_host.py` proves the content read-backs stop
+  answering and a follow-up install of the removed bytes is not skipped.
+  The workaround is retired: the removal assertions read `remote_files`
+  directly (§10).
 
 ## 7. Deliberate deviations from Ansible semantics
 
@@ -429,8 +430,8 @@ install records package names only, so the package's own files
 (`nginx.conf`, the default-vhost **symlink**, the legacy and retired
 vhosts, the `/etc/nginx` tree) are seeded as its post-install state; the
 Cpus gather reads the `cpus` attribute seam; the PPA codename comes from
-the `lsb_release` seam. The removal assertions carry the GAP-1 (#18)
-workaround (§6).
+the `lsb_release` seam. The removal assertions read `remote_files`
+directly (GAP-1 (#18) closed, §6).
 
 ## 9. Scoped out
 
@@ -445,15 +446,16 @@ workaround (§6).
 
 ## 10. Second pass
 
-Pending [GAP-1 (#18)](https://github.com/kimjarvis/reemote/issues/18).
-When the `SimulatedHost` fix lands:
+Done — [GAP-1 (#18)](https://github.com/kimjarvis/reemote/issues/18) is
+closed. The `SimulatedHost` fix landed (`remove_file`/`remove_link` pop
+`remote_files`, mirroring `remove_tree`):
 
 1. the `GAP-1 (#18)` workaround comments in
    `tests/test_roles_ansible_role_nginx.py` are dropped and the removal
    assertions read `remote_files` directly;
 2. the `GAP-1` paragraph in the program's module docstring and §6 of this
    document are marked closed;
-3. the gates are re-run: `uv run pytest tests/ -q`, `uv run ruff check .`,
+3. the gates were re-run: `uv run pytest tests/ -q`, `uv run ruff check .`,
    and the two-pass no-op proof.
 
-No program behaviour will change — the gap is test-framework-only.
+No program behaviour changed — the gap was test-framework-only.

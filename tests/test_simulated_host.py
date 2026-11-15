@@ -1,15 +1,16 @@
 # Copyright (c) 2026 Kim Jarvis.
 # SPDX-License-Identifier: EPL-2.0
 
-"""Offline proof of the ``SimulatedHost`` action-transport seam (#16).
+"""Offline proofs of the ``SimulatedHost`` seams.
 
-``SimulatedHost`` used to expose only the fact/command seams, so a
-``gather_action(..., Shell, ...)`` against one reached the real asyncssh
-transport. The class now overrides ``_run_shell``: every shell is recorded
-verbatim in ``ran_shells`` and the answer comes from the ``shell_results``
-map keyed by the exact shell string -- the command-keyed convention of
-``find_results``/``grep_files``. An unseeded command is a hard error
-(``UnseededShellResult``), so a new action read can never silently pass.
+The action-transport seam (#16): ``SimulatedHost`` used to expose only the
+fact/command seams, so a ``gather_action(..., Shell, ...)`` against one
+reached the real asyncssh transport. The class now overrides
+``_run_shell``: every shell is recorded verbatim in ``ran_shells`` and the
+answer comes from the ``shell_results`` map keyed by the exact shell
+string -- the command-keyed convention of ``find_results``/``grep_files``.
+An unseeded command is a hard error (``UnseededShellResult``), so a new
+action read can never silently pass.
 
 Covered: a seeded ``Shell`` gather returns the canned record offline (no
 socket, no asyncssh), an unseeded command raises ``UnseededShellResult``
@@ -18,11 +19,23 @@ across gathers, a passwordless-elevated gather rides the same seam (its
 ``sudo`` rendering is the key), and ``Script`` -- which delegates to
 ``Shell.process`` -- answers from the seam keyed by its rendered
 ``sh -c`` wrapper.
+
+The removal seams (#18): ``remove_file``/``remove_link`` clear the
+``remote_files`` content store alongside the stat stores, mirroring
+``remove_tree``, so a simulated ``rm -f`` stops ``FileContents`` and
+``RemoteFileSha1`` answering for the path -- and a follow-up
+content-idempotent ``files.install`` of the removed bytes is not wrongly
+skipped.
 """
+
+from collections.abc import Generator
 
 import pytest
 
-from reemote import Script, Shell, gather_action
+from reemote import Script, Shell, files, gather_action, gather_fact, op, run
+from reemote.core import OperationRequest
+from reemote.hosts import Host
+from reemote.modules.files.files import FileContents, RemoteFileSha1
 from tests.simulated_host import SimulatedHost, UnseededShellResult
 
 PROBE = "/usr/sbin/apache2 -v"
@@ -127,3 +140,109 @@ async def test_script_rides_the_seam_via_its_rendered_wrapper():
 
     assert results["sim1"]["stdout"] == "ran\n"
     assert host.ran_shells == [wrapper, wrapper]
+
+
+# --- The removal seams clear the content store (#18) -------------------------
+
+INVENTORY = [{"host": "sim1", "connection": {"address": "192.0.2.10"}}]
+REMOVED = "/etc/reemote-removed.conf"
+REMOVED_CONTENT = "# managed by reemote\n"
+
+
+def seed_content(host: SimulatedHost) -> None:
+    """A root-owned regular file at REMOVED: bytes plus both stat seams."""
+    data = REMOVED_CONTENT.encode()
+    host.remote_files[REMOVED] = data
+    host.existing_files.add(REMOVED)
+    host.file_stats[REMOVED] = {
+        "user": "root",
+        "group": "root",
+        "mode": 644,
+        "size": len(data),
+    }
+
+
+async def test_remove_file_clears_the_content_store():
+    """The simulated rm -f takes the remote_files bytes with it (the
+    remove_tree store order): FileContents and RemoteFileSha1 stop
+    answering for the path, as the real test -e guard fails after rm -f."""
+    host = make_host()
+    seed_content(host)
+
+    def deploy(host: Host) -> Generator[OperationRequest]:
+        yield op(
+            files.file, name="Remove config", path=REMOVED, present=False, sudo=True
+        )
+
+    _plans, report, _hosts = await run(
+        INVENTORY, deploy, host_factory=lambda entry: host
+    )
+    assert report is not None
+    assert report.log[0].changed
+    assert REMOVED not in host.remote_files
+    assert REMOVED not in host.existing_files
+    assert REMOVED not in host.file_stats
+
+    contents = await gather_fact([host], FileContents, REMOVED)
+    digests = await gather_fact([host], RemoteFileSha1, REMOVED)
+    assert contents["sim1"] is None
+    assert digests["sim1"] is None
+
+
+async def test_reinstall_of_removed_content_is_not_skipped():
+    """The multi-operation consequence: a files.install whose content equals
+    the removed bytes must still install after the removal -- a stale
+    FileContents read-back would wrongly skip it and leave the path absent.
+    The apply log's per-step FactCache reads the removal's fresh state."""
+    host = make_host()
+    seed_content(host)
+
+    def deploy(host: Host) -> Generator[OperationRequest]:
+        yield op(
+            files.file, name="Remove config", path=REMOVED, present=False, sudo=True
+        )
+        yield op(
+            files.install,
+            name="Re-install config",
+            content=REMOVED_CONTENT,
+            dest=REMOVED,
+            sudo=True,
+        )
+
+    _plans, report, _hosts = await run(
+        INVENTORY, deploy, host_factory=lambda entry: host
+    )
+    assert report is not None
+    entries = {entry.name: entry for entry in report.log}
+    assert entries["Remove config"].changed
+    assert entries["Re-install config"].changed
+    assert host.remote_files[REMOVED] == REMOVED_CONTENT.encode()
+
+
+async def test_remove_link_clears_seeded_content():
+    """A link path can hold seeded bytes too: files.link's rm -f takes them
+    with it, so no content read-back answers for the removed name."""
+    host = make_host()
+    target = "/etc/reemote-target.conf"
+    host.remote_files[REMOVED] = REMOVED_CONTENT.encode()
+    host.links[REMOVED] = target
+    host.link_stats[REMOVED] = {
+        "mode": 777,
+        "user": "root",
+        "group": "root",
+        "link_target": target,
+    }
+
+    def deploy(host: Host) -> Generator[OperationRequest]:
+        yield op(
+            files.link, name="Remove link", path=REMOVED, present=False, sudo=True
+        )
+
+    _plans, report, _hosts = await run(
+        INVENTORY, deploy, host_factory=lambda entry: host
+    )
+    assert report is not None
+    assert report.log[0].changed
+    assert REMOVED not in host.remote_files
+    assert REMOVED not in host.links
+    assert REMOVED not in host.link_stats

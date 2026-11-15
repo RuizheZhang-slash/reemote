@@ -325,15 +325,17 @@ async def test_first_pass_installs_and_configures_nginx(rig):
     assert "try_files $uri $uri/ =404;" in vhost
 
     # The default vhost (symlink), the legacy file and the retired vhost are
-    # gone; the sites-enabled directory survived. GAP-1 (#18): the simulated
-    # rm -f (SimulatedHost.remove_file) clears file_stats/existing_files but
-    # leaves the remote_files bytes, so the removals are asserted against the
-    # stat stores -- FileContents would still answer stale content. Second
-    # pass: assert `not in host.remote_files` directly once #18 lands.
+    # gone -- content bytes included (#18: the simulated rm -f clears
+    # remote_files too, so FileContents stops answering for the removed
+    # paths) -- and the sites-enabled directory survived. The symlink's
+    # target keeps its content: rm -f drops the link, never its target.
     assert DEFAULT_VHOST not in host.links
     assert DEFAULT_VHOST not in host.file_stats
+    assert DEFAULT_VHOST_TARGET in host.remote_files
+    assert LEGACY_VHOSTS not in host.remote_files
     assert LEGACY_VHOSTS not in host.file_stats
     assert LEGACY_VHOSTS not in host.existing_files
+    assert RETIRED_VHOST not in host.remote_files
     assert RETIRED_VHOST not in host.file_stats
     assert RETIRED_VHOST not in host.existing_files
     assert SITES_ENABLED in host.directory_stats
