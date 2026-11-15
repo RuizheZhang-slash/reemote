@@ -3196,6 +3196,11 @@ class SimulatedHost(Host):
         the fresh per-step fact cache sees them. Entries from other files
         are left alone (mirrored by ``install_apt_repo_file``). An absent
         spool path installs nothing.
+
+        The same mutator serves the URL ``signed_by`` form's keyring install
+        (issue #17): ``dest`` is then ``/etc/apt/keyrings/<filename>.asc``
+        holding ASCII-armored key text, which the deb822 parser reads as
+        zero entries -- only the file seams change, exactly as on the host.
         """
         data = self.remote_files.pop(spool, None)
         if data is None:
@@ -3223,6 +3228,10 @@ class SimulatedHost(Host):
         reports them (provenance-based, like the install mutators). An
         absent path is tolerated: ``rm -f`` exits 0 on a missing file and
         the operation always yields the removal.
+
+        Also serves the URL ``signed_by`` form's keyring removals (issue
+        #17): the managed ``/etc/apt/keyrings/<filename>.asc``/``.gpg``
+        paths clear through the same seams.
         """
         self.remote_files.pop(path, None)
         self.apt_sources[:] = [s for s in self.apt_sources if s.get("filename") != path]

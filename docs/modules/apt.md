@@ -649,7 +649,10 @@ stamp is never consulted — unlike `apt.update` and `apt.packages`, whose
 `filename` is the base name (the `.sources` extension is appended), and
 `types`, `uris`, `suites`, `components` and `architectures` each accept a
 list, a tuple or a space-separated string; `signed_by` names the keyring
-file for signature verification (the natural pairing with `apt.key`).
+for signature verification — either an absolute path to an existing
+keyring file (the natural pairing with `apt.key`) or an `http(s)` URL to
+an ASCII-armored GPG public key (issue #17, Ansible's `deb822_repository`
+`signed_by` URL form).
 `present=True` requires at least one URI and one suite — otherwise
 `ValueError` is raised with the baseline's message (reemote's single
 validation error type) — and is idempotent on `AptSources`: the fields
@@ -665,12 +668,33 @@ request `sudo=True` (or `su=True`); the transfer stays unprivileged
 regardless. This spool-and-install pair is the deliberate replacement for
 the baseline's `files.put` delegation: reemote's transfers are unprivileged
 scp and namespaces never reuse each other's operations.
+With a URL `signed_by`, the key is fetched **control-side** once per phase
+(the apt namespace's own `_fetch_url_bytes` copy — the `files.download`
+seam pattern, keeping the zero-cross-module-import invariant) and
+installed as the repo-named keyring `/etc/apt/keyrings/<filename>.asc`
+through the *same* spool-and-install descriptor pair, mode `0644`, before
+the sources file's own pair; `Signed-By` then references that keyring
+path, never the URL. The key gate is content idempotence through the
+in-namespace `AptSourcesFile` raw-text fact and is independent of the
+repository-identity gate: a configured repository with a missing or
+changed key still installs the key alone, and a matching key with an
+unconfigured repository writes the sources file alone; only both
+converged is a no-op. Only ASCII-armored text is accepted — a binary
+`.gpg` body (or any text without the `-----BEGIN PGP PUBLIC KEY BLOCK-----`
+marker) raises `ValueError` naming the alternative: fetch it control-side,
+install it with `apt.key` and pass `signed_by` the keyring path. There is
+no checksum/refresh semantics: a URL body that changes mid-run simply
+reads as a content difference on the next phase.
 `present=False` is idempotent on `AptSourcesFile`: it yields `rm -f`
 only when the file exists (an empty leftover included) and is a no-op
 when it is already absent. The baseline checks its `files.File` fact for the
 same gate; reemote's apt namespace never imports another module's
 facts, so the in-namespace `AptSourcesFile` content fact provides the
 existence answer — the same pattern `dnf.repo` uses with `DnfRepoFile`.
+With a URL `signed_by`, the removal also deletes the managed
+`/etc/apt/keyrings/<filename>.asc` and `.gpg` files, each gated on
+existence through the same fact and never fetching the URL; a removal
+without a URL leaves keyrings alone.
 `update_cache=True` appends an `apt-get update` (`AptUpdateCommand`) after
 the write *or* the removal, and only on a real change — Ansible's
 `apt_repository` `update_cache: true` spelling (issue #14); a no-op yields
@@ -764,9 +788,13 @@ in one request — yielding the same request twice so the second is a
 guaranteed no-op in the apply phase, then removing it again so the example
 leaves the host's sources as it found them. The `apt_sources_file.py` script
 demonstrates `apt.sources_file`: it writes the Docker repository as a
-modern deb822 `docker.sources` file — unprivileged spool transfer plus
-elevated install in one request — yielding the same request twice so the
-second is a guaranteed no-op in the apply phase. The `apt_update.py`
+modern deb822 `docker.sources` file with the Docker key URL as `signed_by`
+(issue #17) — the armored key is fetched control-side and installed as
+`/etc/apt/keyrings/docker.asc`, then the sources file follows, each an
+unprivileged spool transfer plus elevated install — yielding the same
+request twice so the second is a guaranteed no-op in the apply phase, then
+removing the file and the managed keyring again so the example leaves the
+host's sources as it found them. The `apt_update.py`
 script demonstrates `apt.update`: it refreshes the package lists under
 `sudo` — a single request, since the operation is non-idempotent by
 default and has no state for a second request to converge on (a

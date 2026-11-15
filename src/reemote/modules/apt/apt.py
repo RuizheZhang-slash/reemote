@@ -97,10 +97,12 @@
 # touch the host directly.
 # """
 
+import asyncio
 import hashlib
 import io
 import re
 import shlex
+import urllib.request
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -3475,12 +3477,13 @@ async def repo(
 def _sources_spool_path(dest: str) -> str:
     """The deterministic ``/tmp`` spool *file* path ``apt.sources_file`` writes to.
 
-    Derived from the managed ``.sources`` file's sha1 so two sources files
-    written in one deploy never clobber each other's spool, while the same
-    ``dest`` always yields the same name in both phases -- the request
-    sequence stays deterministic. The generated deb822 text is spooled to a
-    fixed ``sources`` file inside that directory rather than at the top level
-    of ``/tmp``, and the elevated install ``rm -rf``s the whole directory
+    Derived from the managed file's sha1 -- the ``.sources`` file, or the
+    repo-named keyring the URL ``signed_by`` form installs (issue #17) -- so
+    two files written in one deploy never clobber each other's spool, while
+    the same ``dest`` always yields the same name in both phases -- the
+    request sequence stays deterministic. The content is spooled to a fixed
+    ``sources`` file inside that directory rather than at the top level of
+    ``/tmp``, and the elevated install ``rm -rf``s the whole directory
     afterwards, so no leftover lands in ``/tmp``. The name avoids
     *collisions*, not a hostile local user: it is predictable, so on a
     multi-tenant host the ``/tmp`` spool is still a symlink-race exposure
@@ -3504,25 +3507,47 @@ def _as_list(val: str | list[str] | tuple[str, ...] | None) -> list[str]:
     return list(val)
 
 
+def _fetch_url_bytes(url: str) -> bytes:
+    """Fetch an ``http(s)`` ``url`` control-side and return its body bytes.
+
+    The apt namespace's own copy of the ``files.download`` fetch seam
+    (``files._fetch_url_bytes``): namespaces never import each other's
+    operations -- the ``apt.key`` pattern -- so the small helper is
+    duplicated rather than shared. The single network read behind
+    ``apt.sources_file``'s URL ``signed_by`` (issue #17), run in a worker
+    thread (``asyncio.to_thread``) because ``urllib`` blocks the event loop.
+    The *control* machine -- not the target host -- opens the connection, so
+    the key download works when only the control side has internet egress
+    and the host never needs ``curl``/``wget``. The caller validates the
+    scheme, so this only ever sees an ``http(s)`` URL. An unreachable URL or
+    a non-2xx response raises ``urllib.error.URLError``/``HTTPError`` (both
+    ``OSError`` subclasses), which propagates out of the deploy exactly as a
+    host connection error would. Tests replace this function to stay offline.
+    """
+    with urllib.request.urlopen(url) as response:
+        return response.read()
+
+
 @dataclass(frozen=True)
 class AptSourcesFileUploadCommand(TransferCommand):
-    """Spool the generated deb822 content to a ``/tmp`` path on the target.
+    """Spool the generated file content to a ``/tmp`` path on the target.
 
     The first half of ``apt.sources_file``'s write direction and a
     *non-shell* descriptor: it copies the content over the connection's scp
     channel via ``Host.upload_file`` rather than running shell text, so it
     has no ``shell()`` and its loggable form is the ``__str__`` rendering
     ``command_shell`` falls back to. Unlike ``AptKeyUploadCommand`` the
-    content is not a caller-supplied stream but the deb822 text the
-    operation itself generates, so the field is a plain ``str`` -- hashable
-    and identical across phases -- wrapped in a fresh ``io.BytesIO`` only
-    at transfer time. The copy rides as the login user (transfers are
-    unprivileged, so the request's ``sudo`` does not apply to it), which is
-    why the spool path is world-writable ``/tmp`` rather than the
-    root-owned ``sources.list.d`` directory.
+    content is not a caller-supplied stream but text the operation itself
+    produces -- the generated deb822 sources text, or the ASCII-armored
+    signing key fetched from a URL ``signed_by`` (issue #17) -- so the field
+    is a plain ``str``, hashable and identical across phases, wrapped in a
+    fresh ``io.BytesIO`` only at transfer time. The copy rides as the login
+    user (transfers are unprivileged, so the request's ``sudo`` does not
+    apply to it), which is why the spool path is world-writable ``/tmp``
+    rather than the root-owned ``sources.list.d``/``keyrings`` directory.
     """
 
-    content: str  # the deb822 sources text the operation generated
+    content: str  # the deb822 sources text, or the fetched ASCII-armored key
     dest: str  # spool path on the target host
 
     def __str__(self) -> str:
@@ -3540,23 +3565,28 @@ class AptSourcesFileUploadCommand(TransferCommand):
 
 @dataclass(frozen=True)
 class AptSourcesFileInstallCommand(Command):
-    """Install the spooled deb822 file ``0644``, then remove the spool file.
+    """Install the spooled file ``0644``, then remove the spool file.
 
     The second half of ``apt.sources_file``'s write direction and the
-    elevated one: writing under ``/etc/apt/sources.list.d/`` needs root, so
-    the request is flagged ``sudo=True`` and the whole sequence is wrapped
-    in ``sh -c`` -- a bare ``sudo`` prefix would elevate only the first
-    command of the ``&&`` chain and leave the cleanup running as the login
-    user, whereas ``sudo sh -c '...'`` runs every step as root, which can
-    always remove the login-user spool file. The sequence creates the
-    destination directory, copies the spooled content over the target
-    file, chmods it ``0644`` (the baseline's fixed ``mode`` for the sources
-    file) and removes the spool file -- the ``AptKeyInstallCommand``
-    pattern without the key-content sniff. All paths are shell-quoted.
+    elevated one: writing under ``/etc/apt/sources.list.d/`` -- or
+    ``/etc/apt/keyrings/`` for the repo-named keyring the URL ``signed_by``
+    form installs (issue #17) -- needs root, so the request is flagged
+    ``sudo=True`` and the whole sequence is wrapped in ``sh -c`` -- a bare
+    ``sudo`` prefix would elevate only the first command of the ``&&``
+    chain and leave the cleanup running as the login user, whereas
+    ``sudo sh -c '...'`` runs every step as root, which can always remove
+    the login-user spool file. The sequence creates the destination
+    directory, copies the spooled content over the target file, chmods it
+    ``0644`` (the baseline's fixed ``mode`` for the sources file, and the
+    module's mode for a managed key) and removes the spool file -- the
+    ``AptKeyInstallCommand`` pattern without the key-content sniff: the URL
+    form's armored key is installed verbatim, since apt >= 1.4 accepts
+    ASCII-armored text in ``Signed-By``. All paths are shell-quoted.
     """
 
     spool: str  # where AptSourcesFileUploadCommand wrote the content
-    dest: str  # the /etc/apt/sources.list.d/<filename>.sources path
+    dest: str  # the /etc/apt/sources.list.d/<filename>.sources path, or the
+    # /etc/apt/keyrings/<filename>.asc keyring of the URL signed_by form
 
     def shell(self) -> str:
         spool = shlex.quote(self.spool)
@@ -3575,14 +3605,16 @@ class AptSourcesFileInstallCommand(Command):
 
 @dataclass(frozen=True)
 class AptSourcesFileRemoveCommand(Command):
-    """``rm -f <path>``: delete a deb822 sources file.
+    """``rm -f <path>``: delete a deb822 sources file or a managed keyring.
 
     The removal mutation ``apt.sources_file(present=False)`` yields, only
     when the ``AptSourcesFile`` fact reports the file present -- the same
     shell the baseline's ``files.file(present=False)`` delegation renders.
-    ``rm -f`` tolerates an absent path, and deleting under
-    ``sources.list.d`` needs root, so flag the request ``sudo=True`` (or
-    ``su=True``).
+    The URL ``signed_by`` form (issue #17) also yields it for the repo-named
+    keyring files it manages (``<filename>.asc`` and ``<filename>.gpg``, the
+    Ansible module's cleanup). ``rm -f`` tolerates an absent path, and
+    deleting under ``sources.list.d``/``keyrings`` needs root, so flag the
+    request ``sudo=True`` (or ``su=True``).
     """
 
     path: str
@@ -3625,8 +3657,15 @@ async def sources_file(
         architectures (str | list[str] | tuple[str, ...] | None, optional):
             Restrict to specific architectures (e.g. ``"amd64"``). Defaults
             to None.
-        signed_by (str | None, optional): Absolute path to the keyring file
-            used for signature verification. Defaults to None.
+        signed_by (str | None, optional): The keyring used for signature
+            verification: an absolute path to an existing keyring file, or
+            an ``http(s)`` URL to an ASCII-armored GPG public key. A URL is
+            fetched control-side and installed as the repo-named keyring
+            ``/etc/apt/keyrings/<filename>.asc`` (mode ``0644``, idempotent
+            on content), and the sources file references that path --
+            Ansible's ``deb822_repository`` ``signed_by`` URL form (issue
+            #17). With a URL, ``present=False`` also removes the managed
+            keyring files. Defaults to None.
         present (bool, optional): Whether the sources file should exist.
             Defaults to True.
         update_cache (bool, optional): Refresh the package index with
@@ -3649,7 +3688,7 @@ async def sources_file(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError, ValueError
+    CommandNotFoundError, HostConnectionError, OSError, ValueError
     ```
 
     Examples:
@@ -3696,20 +3735,58 @@ async def sources_file(
     # already forces the refresh, and a fresh ``AptUpdateStamp`` predates the
     # change, so gating on it would skip the refresh exactly when needed -- the
     # trap the issue names.
+    #
+    # Ansible ``deb822_repository`` ``signed_by`` URL parity (issue #17): a
+    # ``signed_by`` starting with ``http://``/``https://`` is fetched
+    # control-side once per phase (this namespace's own ``_fetch_url_bytes``
+    # copy -- namespaces never import each other's operations) and installed
+    # as the repo-named keyring ``/etc/apt/keyrings/<filename>.asc`` through
+    # the same spool-and-install descriptor pair, mode ``0644``. The key gate
+    # is content idempotence via the in-namespace ``AptSourcesFile`` raw-text
+    # fact (armored key text parses to zero deb822 entries, so the read-back
+    # seam is shared harmlessly) and is independent of the repository-identity
+    # gate: either alone triggers a write, and ``Signed-By`` always references
+    # the installed keyring path. Only ASCII-armored text is accepted -- a
+    # binary ``.gpg`` body raises ``ValueError`` naming the ``apt.key`` + path
+    # alternative. There is no checksum/refresh semantics: a URL body that
+    # changes mid-run simply reads as a content difference on the next phase.
+    # With a URL, ``present=False`` removes the sources file and any managed
+    # ``<filename>.asc``/``<filename>.gpg`` keyring, each gated on existence
+    # and without fetching. A path-valued ``signed_by`` keeps the verbatim
+    # write-into-``Signed-By`` behavior.
     dest = f"/etc/apt/sources.list.d/{filename}.sources"
+    key_url = (
+        signed_by if signed_by and signed_by.startswith(("http://", "https://")) else None
+    )
+    keyring = f"/etc/apt/keyrings/{filename}.asc" if key_url else None
 
     # Removal path -- idempotent on the file's existence (DnfRepoFile pattern).
+    # A URL signed_by also removes the managed keyrings, each existence-gated;
+    # nothing is fetched on this path.
     if not present:
         current = await ctx.facts.get(AptSourcesFile, dest)
-        if current is None:
+        key_paths: list[str] = []
+        if key_url:
+            for ext in ("asc", "gpg"):
+                path = f"/etc/apt/keyrings/{filename}.{ext}"
+                if await ctx.facts.get(AptSourcesFile, path) is not None:
+                    key_paths.append(path)
+        reasons: list[str] = []
+        if current is not None:
+            reasons.append(f'apt sources file "{dest}" will be removed')
+        reasons.extend(f'signing key "{path}" will be removed' for path in key_paths)
+        if not reasons:
             ctx.reason = f'apt sources file "{dest}" already absent'
-        else:
-            ctx.changed = True
-            ctx.reason = f'apt sources file "{dest}" will be removed'
+            return
+        ctx.changed = True
+        ctx.reason = "; ".join(reasons)
+        if current is not None:
             yield AptSourcesFileRemoveCommand(path=dest)
-            if update_cache:
-                ctx.reason += "; apt update"
-                yield AptUpdateCommand()
+        for path in key_paths:
+            yield AptSourcesFileRemoveCommand(path=path)
+        if update_cache:
+            ctx.reason += "; apt update"
+            yield AptUpdateCommand()
         return
 
     types_list = _as_list(types) or ["deb"]
@@ -3721,16 +3798,38 @@ async def sources_file(
     if not uris_list or not suites_list:
         raise ValueError("apt.sources_file requires at least one URI and one suite")
 
+    # URL signed_by (issue #17): fetch the key control-side once per phase and
+    # validate it is ASCII-armored text before any descriptor is yielded.
+    key_content: str | None = None
+    if key_url:
+        data = await asyncio.to_thread(_fetch_url_bytes, key_url)
+        try:
+            key_content = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"{key_url} is not valid UTF-8 text; apt.sources_file's URL "
+                "signed_by installs an ASCII-armored key only (a binary .gpg "
+                "body is not supported -- fetch it control-side, install it "
+                "with apt.key and pass signed_by the keyring path)"
+            ) from exc
+        if "-----BEGIN PGP PUBLIC KEY BLOCK-----" not in key_content:
+            raise ValueError(
+                f"{key_url} did not serve an ASCII-armored PGP public key "
+                "(no '-----BEGIN PGP PUBLIC KEY BLOCK-----' marker); "
+                "apt.sources_file's URL signed_by installs armored text only"
+            )
+
     # Expand into the AptSources fact's shape (list-valued options) so the
     # idempotence check compares repository *identity* -- the five semantic
     # keys, ignoring the ``filename`` provenance the fact now carries
     # (``_same_repository``) -- the baseline's AptSourcesFile.expand_to_repos()
     # in this namespace's entry shape.
+    signed_by_path = keyring if key_url else signed_by
     options: dict[str, list[str]] = {}
     if architectures_list:
         options["arch"] = architectures_list
-    if signed_by:
-        options["signed-by"] = [signed_by]
+    if signed_by_path:
+        options["signed-by"] = [signed_by_path]
     desired: list[AptSource] = [
         {
             "type": repo_type,
@@ -3744,7 +3843,12 @@ async def sources_file(
         for suite in suites_list
     ]
     sources = await ctx.facts.get(AptSources)
-    if all(any(_same_repository(entry, repo) for entry in sources) for repo in desired):
+    repo_configured = all(
+        any(_same_repository(entry, repo) for entry in sources) for repo in desired
+    )
+    key_current = await ctx.facts.get(AptSourcesFile, keyring) if key_url else None
+    key_needed = key_url is not None and key_current != key_content
+    if repo_configured and not key_needed:
         ctx.reason = f'apt sources file "{dest}" is already configured'
         return
 
@@ -3758,15 +3862,23 @@ async def sources_file(
         lines.append(f"Components: {' '.join(components_list)}")
     if architectures_list:
         lines.append(f"Architectures: {' '.join(architectures_list)}")
-    if signed_by:
-        lines.append(f"Signed-By: {signed_by}")
+    if signed_by_path:
+        lines.append(f"Signed-By: {signed_by_path}")
     content = "\n".join(lines) + "\n"
 
     ctx.changed = True
-    ctx.reason = f'apt sources file "{dest}" missing or outdated, will be written'
-    spool = _sources_spool_path(dest)
-    yield AptSourcesFileUploadCommand(content=content, dest=spool)
-    yield AptSourcesFileInstallCommand(spool=spool, dest=dest)
+    reasons = []
+    if key_needed:
+        reasons.append(f'signing key from {key_url} will be installed at "{keyring}"')
+        key_spool = _sources_spool_path(keyring)
+        yield AptSourcesFileUploadCommand(content=key_content, dest=key_spool)
+        yield AptSourcesFileInstallCommand(spool=key_spool, dest=keyring)
+    if not repo_configured:
+        reasons.append(f'apt sources file "{dest}" missing or outdated, will be written')
+        spool = _sources_spool_path(dest)
+        yield AptSourcesFileUploadCommand(content=content, dest=spool)
+        yield AptSourcesFileInstallCommand(spool=spool, dest=dest)
+    ctx.reason = "; ".join(reasons)
     if update_cache:
         ctx.reason += "; apt update"
         yield AptUpdateCommand()

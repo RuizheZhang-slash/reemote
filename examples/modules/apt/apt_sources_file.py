@@ -46,6 +46,16 @@ fact reads the file's content (None when absent), so ``present=False`` yields
 ``rm -f`` only when the file exists -- the same in-namespace existence gate
 ``dnf.repo`` uses, without importing another namespace's fact.
 
+``signed_by`` here is the Docker key *URL* (issue #17, Ansible's
+``deb822_repository`` parity): the operation fetches the ASCII-armored key
+control-side -- the target never needs ``curl``/``wget`` -- and installs it
+as ``/etc/apt/keyrings/docker.asc`` through the same spool-and-install pair,
+then writes ``Signed-By:`` pointing at that keyring. The key is idempotent
+on content, independently of the repository-identity check, so the second
+write request is a no-op for both the key and the sources file. The removal
+request passes the same URL, so ``present=False`` also removes the managed
+keyring files.
+
 ``apt.sources_file`` compares every desired entry against the ``AptSources``
 fact, so a file whose repositories are all already configured is a no-op.
 The script yields the *same* write request twice to show that idempotence
@@ -56,10 +66,10 @@ the fresh per-step fact cache now sees the entries the first step wrote. A
 third request then removes the file again (``present=False``), so the example
 is *self-restoring*: it leaves the host's apt sources exactly as it found them.
 That matters because ``run_examples.py`` sweeps every example over the same
-shared hosts -- a lingering ``docker.sources`` whose ``signed-by`` keyring is
-not installed would make the later ``apt_update.py`` example fail (``apt-get
-update`` exits 100 on an unsigned repository). The write-then-remove cycle
-keeps the sweep clean.
+shared hosts -- a lingering ``docker.sources`` would leave a third-party
+repository configured for the later ``apt_update.py`` example. The
+write-then-remove cycle -- which with the URL ``signed_by`` also removes the
+installed keyring -- keeps the sweep clean.
 
 Installing under ``/etc/apt`` needs root -- the files are root-owned -- so
 the requests are flagged ``sudo=True``; the driver elevates the install
@@ -110,10 +120,12 @@ INVENTORY_PATH = PROJECT_ROOT / "inventory.json"
 
 # The Docker repository as a deb822 sources file:
 # /etc/apt/sources.list.d/docker.sources, for Ubuntu noble (the target host's
-# suite), signed by the keyring a manual step (or apt.key) places at
-# /etc/apt/keyrings/docker.gpg. Shared by the write requests below so they
-# carry identical operation kwargs (only the log ``name`` differs). Tuples
-# keep the containers hashable and stable across the prepare and apply phases.
+# suite). signed_by is the Docker key URL (issue #17): apt.sources_file
+# fetches it control-side and installs /etc/apt/keyrings/docker.asc itself,
+# then points Signed-By at that keyring. Shared by the write requests below
+# so they carry identical operation kwargs (only the log ``name`` differs).
+# Tuples keep the containers hashable and stable across the prepare and apply
+# phases.
 DOCKER_SOURCES = {
     "filename": "docker",
     "types": ("deb",),
@@ -121,7 +133,7 @@ DOCKER_SOURCES = {
     "suites": ("noble",),
     "components": ("stable",),
     "architectures": ("amd64",),
-    "signed_by": "/etc/apt/keyrings/docker.gpg",
+    "signed_by": "https://download.docker.com/linux/ubuntu/gpg",
 }
 
 
@@ -159,17 +171,19 @@ def deploy(host: Host) -> Generator[OperationRequest]:
 
     Branch-free, so the request sequence is identical in the prepare and
     apply phases (a branch on a mutable fact would raise DeterminismError).
-    The first request spools and installs the file; the second carries the
-    same arguments and is a guaranteed no-op in the apply phase, because
-    the first write is already visible through the fresh per-step fact
-    cache. The third removes the file again (``present=False``), leaving the
-    host's sources as found so the shared-host example sweep is not polluted
-    -- a lingering ``docker.sources`` with no installed ``signed-by`` keyring
-    would break the later ``apt_update.py`` step.
+    The first request fetches the signing key control-side, spools and
+    installs it as /etc/apt/keyrings/docker.asc, then spools and installs the
+    sources file; the second carries the same arguments and is a guaranteed
+    no-op in the apply phase, because the first write is already visible
+    through the fresh per-step fact cache (both the key content and the
+    repository identity). The third removes the file and the managed keyring
+    again (``present=False`` with the same URL), leaving the host's sources
+    as found so the shared-host example sweep is not polluted.
 
     Installing under the root-owned /etc/apt needs root, so all three requests
-    are flagged ``sudo=True``; only the install shell is elevated -- the
-    scp spool upload is a transfer and always runs unprivileged.
+    are flagged ``sudo=True``; only the install shells are elevated -- the
+    scp spool uploads are transfers and always run unprivileged. The key
+    fetch happens on the control machine, so the target needs no curl/wget.
     """
     yield op(
         apt.sources_file,
@@ -189,6 +203,7 @@ def deploy(host: Host) -> Generator[OperationRequest]:
         apt.sources_file,
         name="Remove Docker apt repository",
         filename=DOCKER_SOURCES["filename"],
+        signed_by=DOCKER_SOURCES["signed_by"],
         present=False,
         sudo=True,
         when=is_ubuntu,

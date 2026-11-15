@@ -168,6 +168,12 @@ SNAPSHOT_ARGS = {
             "restart_state": "restarted",
         }
     },
+    # The Docker role migration: one factory closing over the release
+    # codename main() gathers from LinuxDistribution for the repo's Suites.
+    (
+        "examples/roles/ansible-role-docker/ansible-role-docker.py",
+        "build_setup",
+    ): lambda name: {name: "noble"},
 }
 
 # Entrypoints that only behave inside a driver run. The in-deploy action guard

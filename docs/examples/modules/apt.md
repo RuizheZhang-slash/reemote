@@ -324,23 +324,31 @@ Docker repository for Ubuntu noble (the target host's suite) as `docker.sources`
 The repository is described structurally (`types`, `uris`, `suites`,
 `components`, `architectures`,
 `signed_by`) rather than as a source line, and each list option expands into
-one entry per combination. The write direction compares every desired entry
-against the [`AptSources`][reemote.modules.apt.apt.AptSources] fact, so a
-file whose repositories are all already configured is a no-op. Where the baseline
+one entry per combination. `signed_by` is the Docker key *URL* (issue #17,
+Ansible's `deb822_repository` parity): the operation fetches the
+ASCII-armored key control-side — the target never needs `curl`/`wget` —
+and installs it as `/etc/apt/keyrings/docker.asc` through the same
+spool-and-install pair, then points `Signed-By` at that keyring. The write
+direction compares every desired entry
+against the [`AptSources`][reemote.modules.apt.apt.AptSources] fact and the
+installed key's content against the fetched key, so a file whose
+repositories are all already configured with a matching key is a no-op.
+Where the baseline
 delegates the write to `files.put`, reemote keeps the namespaces separate:
 the generated deb822 text is spooled to `/tmp` by an unprivileged scp upload
 (a transfer never elevates), then an elevated `sh -c` installs it into
 `/etc/apt/sources.list.d/` with mode `0644` and removes the spool directory — the
 same privilege split as `apt.key`. Removal is idempotent too: the
 [`AptSourcesFile`][reemote.modules.apt.apt.AptSourcesFile] fact gates the
-`rm -f`, so an already-absent file is a no-op. The script yields the same
+`rm -f`, so an already-absent file is a no-op — and with the URL passed
+again, the managed keyring files are removed alongside it. The script yields the same
 write request twice: the prepare phase plans both as changes, while the apply
 phase writes on the first and reports the second as a no-op through the
-fresh per-step fact cache. A third request then removes the file again
-(`present=False`), so the example is *self-restoring*: a lingering `docker.sources`
-whose `signed-by` keyring is not installed would make the later `apt_update.py`
-step fail (`apt-get update` exits 100 on an unsigned repository), so the
-write-then-remove cycle keeps the shared-host sweep clean.
+fresh per-step fact cache. A third request then removes the file and the
+keyring again (`present=False`), so the example is *self-restoring*: a
+lingering `docker.sources` would leave a third-party repository configured
+for the later `apt_update.py` step, so the write-then-remove cycle keeps
+the shared-host sweep clean.
 
 ::: apt_sources_file
     options:

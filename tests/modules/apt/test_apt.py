@@ -72,7 +72,12 @@ write pair replacing the ``files.put`` delegation -- plus the fact-gated
 idempotent removal (the ``AptSourcesFile`` content fact), the
 multi-value expansion idempotence, the
 SimulatedHost spool/install/remove mutations and end-to-end / dry-run /
-repeat-noop / determinism runs.
+repeat-noop / determinism runs. The URL ``signed_by`` form (issue #17,
+Ansible ``deb822_repository`` parity) is covered in a dedicated section:
+the control-side fetch seam, the repo-named ``.asc`` keyring installed
+through the same descriptor pair, the independent key-content and
+repository-identity gates, armored-only validation, keyring-aware removal
+and end-to-end / dry-run / determinism runs.
 
 The ``update_cache`` / ``cache_valid_time`` parameters added to ``apt.repo``,
 ``apt.ppa``, ``apt.key`` and ``apt.sources_file`` (issue #14) are covered in a
@@ -105,6 +110,7 @@ from reemote.drivers import (
 )
 from reemote.hosts import Host
 from reemote.modules import apt
+from reemote.modules.apt import apt as apt_module
 from reemote.modules.apt.apt import (
     AptAutoremovable,
     AptAutoRemoveCommand,
@@ -6297,3 +6303,510 @@ async def test_apt_sources_file_cache_valid_time_never_suppresses_a_forced_refre
         AptSourcesFileInstallCommand(spool=SOURCES_SPOOL, dest=DOCKER_DEST),
         AptUpdateCommand(),
     ]
+
+
+# --- URL signed_by (issue #17, Ansible deb822_repository parity) ---------------
+
+# A ``signed_by`` URL is fetched control-side once per phase and installed as
+# the repo-named keyring /etc/apt/keyrings/<filename>.asc through the same
+# spool-and-install descriptor pair; the sources file's Signed-By references
+# that path. The key gate (content idempotence via AptSourcesFile) and the
+# repository-identity gate (AptSources) are independent. The single network
+# read (``_fetch_url_bytes``, this namespace's own copy) is monkeypatched to
+# a canned-armored-key stub -- the files.download seam pattern.
+
+KEY_URL = "https://download.docker.com/linux/debian/gpg"
+KEY_TEXT = (
+    "-----BEGIN PGP PUBLIC KEY BLOCK-----\n"
+    "\n"
+    "mQINBFakeCannedArmoredKeyBodyForOfflineTests0000000000000000000\n"
+    "-----END PGP PUBLIC KEY BLOCK-----\n"
+)
+KEY_BYTES = KEY_TEXT.encode()
+KEYRING = "/etc/apt/keyrings/docker.asc"
+GPG_KEYRING = "/etc/apt/keyrings/docker.gpg"
+KEY_SPOOL_ASC = _sources_spool_path(KEYRING)
+URL_KWARGS = {**DOCKER_KWARGS, "signed_by": KEY_URL}
+URL_DEPLOY_KWARGS = {**DOCKER_DEPLOY_KWARGS, "signed_by": KEY_URL}
+URL_DOCKER_CONTENT = DOCKER_CONTENT.replace(
+    "Signed-By: /etc/apt/keyrings/docker.gpg", f"Signed-By: {KEYRING}"
+)
+URL_DOCKER_SOURCE = {
+    **DOCKER_SOURCE,
+    "options": {"arch": ["amd64"], "signed-by": [KEYRING]},
+}
+
+
+@pytest.fixture
+def canned_key_fetch(monkeypatch):
+    """Replace apt's control-side network read with a canned-armored-key stub.
+
+    ``apt.sources_file`` looks ``_fetch_url_bytes`` up as a module global at
+    call time (through ``asyncio.to_thread``), so patching the module
+    attribute redirects the fetch -- the ``files.download`` seam pattern, in
+    this namespace's own copy. Returns the list of URLs the stub was called
+    with, so a test can assert the fetch happened once per materialization
+    -- and never on the removal path.
+    """
+    fetched: list[str] = []
+
+    def fake_fetch(url: str) -> bytes:
+        fetched.append(url)
+        return KEY_BYTES
+
+    monkeypatch.setattr(apt_module, "_fetch_url_bytes", fake_fetch)
+    return fetched
+
+
+@pytest.mark.parametrize(
+    "key_url", [KEY_URL, "http://download.docker.com/linux/debian/gpg"]
+)
+async def test_apt_sources_file_url_signed_by_installs_key_then_sources(
+    key_url, canned_key_fetch
+):
+    """Both http(s) schemes are detected: an unconfigured repo with an absent
+    key yields four descriptors -- the key's spool pair first, then the
+    sources file's -- and Signed-By references the installed keyring path,
+    never the URL."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in apt.sources_file(ctx, **{**DOCKER_KWARGS, "signed_by": key_url})
+    ]
+    assert ctx.changed
+    assert ctx.reason == (
+        f'signing key from {key_url} will be installed at "{KEYRING}"; '
+        f'apt sources file "{DOCKER_DEST}" missing or outdated, will be written'
+    )
+    assert commands == [
+        AptSourcesFileUploadCommand(content=KEY_TEXT, dest=KEY_SPOOL_ASC),
+        AptSourcesFileInstallCommand(spool=KEY_SPOOL_ASC, dest=KEYRING),
+        AptSourcesFileUploadCommand(content=URL_DOCKER_CONTENT, dest=SOURCES_SPOOL),
+        AptSourcesFileInstallCommand(spool=SOURCES_SPOOL, dest=DOCKER_DEST),
+    ]
+    assert canned_key_fetch == [key_url]
+
+
+async def test_apt_sources_file_url_signed_by_converged_is_noop(canned_key_fetch):
+    """The acceptance no-op: the repo is configured with the keyring path and
+    the key content matches -- zero commands. The URL is still fetched (once)
+    to make the content comparison."""
+    host = SimulatedHost(
+        name="h",
+        apt_sources=[dict(URL_DOCKER_SOURCE)],
+        remote_files={KEYRING: KEY_BYTES},
+    )
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.sources_file(ctx, **URL_KWARGS)]
+    assert not ctx.changed
+    assert ctx.reason == f'apt sources file "{DOCKER_DEST}" is already configured'
+    assert commands == []
+    assert canned_key_fetch == [KEY_URL]
+
+
+async def test_apt_sources_file_url_signed_by_key_only_gate(canned_key_fetch):
+    """The gates are independent: a configured repo with an absent key still
+    writes -- only the key's spool pair."""
+    host = SimulatedHost(name="h", apt_sources=[dict(URL_DOCKER_SOURCE)])
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.sources_file(ctx, **URL_KWARGS)]
+    assert ctx.changed
+    assert ctx.reason == f'signing key from {KEY_URL} will be installed at "{KEYRING}"'
+    assert commands == [
+        AptSourcesFileUploadCommand(content=KEY_TEXT, dest=KEY_SPOOL_ASC),
+        AptSourcesFileInstallCommand(spool=KEY_SPOOL_ASC, dest=KEYRING),
+    ]
+
+
+async def test_apt_sources_file_url_signed_by_stale_key_rewritten(canned_key_fetch):
+    """Key idempotence is on content: a configured repo whose keyring holds
+    different text re-installs the key (and only the key)."""
+    host = SimulatedHost(
+        name="h",
+        apt_sources=[dict(URL_DOCKER_SOURCE)],
+        remote_files={KEYRING: b"-----BEGIN PGP PUBLIC KEY BLOCK-----\nstale\n"},
+    )
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.sources_file(ctx, **URL_KWARGS)]
+    assert ctx.changed
+    assert commands == [
+        AptSourcesFileUploadCommand(content=KEY_TEXT, dest=KEY_SPOOL_ASC),
+        AptSourcesFileInstallCommand(spool=KEY_SPOOL_ASC, dest=KEYRING),
+    ]
+
+
+async def test_apt_sources_file_url_signed_by_sources_only_gate(canned_key_fetch):
+    """The mirror gate: an installed, matching key with an unconfigured repo
+    writes only the sources pair, with the path-form reason verbatim."""
+    host = SimulatedHost(name="h", remote_files={KEYRING: KEY_BYTES})
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.sources_file(ctx, **URL_KWARGS)]
+    assert ctx.changed
+    assert (
+        ctx.reason
+        == f'apt sources file "{DOCKER_DEST}" missing or outdated, will be written'
+    )
+    assert commands == [
+        AptSourcesFileUploadCommand(content=URL_DOCKER_CONTENT, dest=SOURCES_SPOOL),
+        AptSourcesFileInstallCommand(spool=SOURCES_SPOOL, dest=DOCKER_DEST),
+    ]
+
+
+async def test_apt_sources_file_url_signed_by_update_cache(canned_key_fetch):
+    """issue #14 semantics carry over: a real change with update_cache=True
+    appends one AptUpdateCommand after both installs."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c async for c in apt.sources_file(ctx, **URL_KWARGS, update_cache=True)
+    ]
+    assert ctx.changed
+    assert ctx.reason.endswith("; apt update")
+    assert commands == [
+        AptSourcesFileUploadCommand(content=KEY_TEXT, dest=KEY_SPOOL_ASC),
+        AptSourcesFileInstallCommand(spool=KEY_SPOOL_ASC, dest=KEYRING),
+        AptSourcesFileUploadCommand(content=URL_DOCKER_CONTENT, dest=SOURCES_SPOOL),
+        AptSourcesFileInstallCommand(spool=SOURCES_SPOOL, dest=DOCKER_DEST),
+        AptUpdateCommand(),
+    ]
+
+
+async def test_apt_sources_file_url_signed_by_update_cache_noop(canned_key_fetch):
+    """A converged key+repo queues no refresh even with update_cache=True."""
+    host = SimulatedHost(
+        name="h",
+        apt_sources=[dict(URL_DOCKER_SOURCE)],
+        remote_files={KEYRING: KEY_BYTES},
+    )
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c async for c in apt.sources_file(ctx, **URL_KWARGS, update_cache=True)
+    ]
+    assert not ctx.changed
+    assert commands == []
+
+
+async def test_apt_sources_file_url_signed_by_remove_removes_sources_and_keys(
+    canned_key_fetch,
+):
+    """present=False with a URL removes the sources file and both managed
+    keyring extensions, each existence-gated -- and never fetches."""
+    host = SimulatedHost(name="h")
+    for path, data in (
+        (DOCKER_DEST, URL_DOCKER_CONTENT.encode()),
+        (KEYRING, KEY_BYTES),
+        (GPG_KEYRING, b"binary-keyring"),
+    ):
+        host.remote_files[path] = data
+        host.existing_files.add(path)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in apt.sources_file(
+            ctx, filename="docker", signed_by=KEY_URL, present=False
+        )
+    ]
+    assert ctx.changed
+    assert ctx.reason == (
+        f'apt sources file "{DOCKER_DEST}" will be removed; '
+        f'signing key "{KEYRING}" will be removed; '
+        f'signing key "{GPG_KEYRING}" will be removed'
+    )
+    assert commands == [
+        AptSourcesFileRemoveCommand(path=DOCKER_DEST),
+        AptSourcesFileRemoveCommand(path=KEYRING),
+        AptSourcesFileRemoveCommand(path=GPG_KEYRING),
+    ]
+    assert canned_key_fetch == []
+
+
+async def test_apt_sources_file_url_signed_by_remove_key_only(canned_key_fetch):
+    """An absent sources file with a leftover keyring still removes the key:
+    the removal reasons are per-path, not all-or-nothing."""
+    host = SimulatedHost(name="h", remote_files={KEYRING: KEY_BYTES})
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in apt.sources_file(
+            ctx, filename="docker", signed_by=KEY_URL, present=False
+        )
+    ]
+    assert ctx.changed
+    assert ctx.reason == f'signing key "{KEYRING}" will be removed'
+    assert commands == [AptSourcesFileRemoveCommand(path=KEYRING)]
+    assert canned_key_fetch == []
+
+
+async def test_apt_sources_file_url_signed_by_remove_absent_noop(canned_key_fetch):
+    """The acceptance no-op: neither the sources file nor any managed keyring
+    exists -- nothing is yielded and nothing is fetched."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in apt.sources_file(
+            ctx, filename="docker", signed_by=KEY_URL, present=False
+        )
+    ]
+    assert not ctx.changed
+    assert ctx.reason == f'apt sources file "{DOCKER_DEST}" already absent'
+    assert commands == []
+    assert canned_key_fetch == []
+
+
+async def test_apt_sources_file_remove_without_url_keeps_keyrings(canned_key_fetch):
+    """A path-form (or absent) signed_by removal keeps the prior behavior: it
+    touches only the sources file, never the keyrings, and never fetches."""
+    host = SimulatedHost(
+        name="h",
+        remote_files={
+            DOCKER_DEST: DOCKER_CONTENT.encode(),
+            KEYRING: KEY_BYTES,
+            GPG_KEYRING: b"binary-keyring",
+        },
+    )
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c async for c in apt.sources_file(ctx, filename="docker", present=False)
+    ]
+    assert ctx.changed
+    assert commands == [AptSourcesFileRemoveCommand(path=DOCKER_DEST)]
+    assert KEYRING in host.remote_files
+    assert GPG_KEYRING in host.remote_files
+    assert canned_key_fetch == []
+
+
+async def test_apt_sources_file_url_signed_by_rejects_binary_body(monkeypatch):
+    """A binary .gpg body is rejected with a clear error naming the apt.key +
+    path alternative -- before any descriptor is yielded."""
+    monkeypatch.setattr(
+        apt_module, "_fetch_url_bytes", lambda url: b"\x99\x01\x00binary-key"
+    )
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    with pytest.raises(ValueError, match="not valid UTF-8 text"):
+        _ = [c async for c in apt.sources_file(ctx, **URL_KWARGS)]
+    assert host.remote_files == {}
+
+
+async def test_apt_sources_file_url_signed_by_rejects_non_armored_text(monkeypatch):
+    """UTF-8 text without the armor marker (an HTML error page, say) is
+    rejected too -- the URL must serve an ASCII-armored PGP public key."""
+    monkeypatch.setattr(
+        apt_module, "_fetch_url_bytes", lambda url: b"<html>not a key</html>\n"
+    )
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    with pytest.raises(ValueError, match="ASCII-armored PGP public key"):
+        _ = [c async for c in apt.sources_file(ctx, **URL_KWARGS)]
+    assert host.remote_files == {}
+
+
+def test_apt_sources_file_keyring_install_command_renders_the_keyrings_dir():
+    """The reused install descriptor derives its mkdir parent from dest, so
+    the keyring install creates /etc/apt/keyrings; the key spool is keyed on
+    the keyring path, distinct from the sources spool."""
+    assert KEY_SPOOL_ASC != SOURCES_SPOOL
+    cmd = AptSourcesFileInstallCommand(spool=KEY_SPOOL_ASC, dest=KEYRING)
+    inner = shlex.split(cmd.shell())[2]
+    assert inner == (
+        "mkdir -p /etc/apt/keyrings && "
+        f"cp {KEY_SPOOL_ASC} {KEYRING} && "
+        f"chmod 0644 {KEYRING} && rm -rf {KEY_SPOOL_ASC.rsplit('/', 1)[0]}"
+    )
+
+
+async def test_apt_sources_file_url_signed_by_simulated_seam(canned_key_fetch):
+    """send_command drives the whole four-descriptor sequence: the armored
+    key lands verbatim at the keyring path (root, mode 644) and parses to
+    zero deb822 entries, so apt_sources holds only the repository."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in apt.sources_file(ctx, **URL_KWARGS)]
+    for cmd in commands:
+        await send_command(host, cmd)
+    assert host.remote_files[KEYRING] == KEY_BYTES
+    assert host.remote_files[DOCKER_DEST] == URL_DOCKER_CONTENT.encode()
+    assert KEY_SPOOL_ASC not in host.remote_files
+    assert SOURCES_SPOOL not in host.remote_files
+    assert KEYRING in host.existing_files
+    assert host.file_stats[KEYRING] == {
+        "user": "root",
+        "group": "root",
+        "mode": 644,
+        "size": len(KEY_BYTES),
+    }
+    assert host.apt_sources == [URL_DOCKER_SOURCE]
+
+
+async def test_apt_sources_file_url_signed_by_end_to_end_write_then_noop(
+    canned_key_fetch,
+):
+    """Through run(): prepare and apply fetch once each and yield the
+    identical four-descriptor sequence (no DeterminismError); the log shows
+    both scp transfers unprivileged and both installs elevated. A second run
+    is the converged no-op."""
+
+    def sources_deploy(host):
+        yield op(
+            apt.sources_file,
+            name="Add Docker apt repository (deb822, URL key)",
+            sudo=True,
+            **URL_DEPLOY_KWARGS,
+        )
+
+    host = SimulatedHost(name="h")
+
+    def factory(entry):
+        return host
+
+    plans, report, _hosts = await run(
+        [{"host": "h", "connection": {}}], sources_deploy, host_factory=factory
+    )
+    assert plans["h"][0].changed
+    (entry,) = report.log
+    assert entry.changed
+    assert entry.commands == (
+        AptSourcesFileUploadCommand(content=KEY_TEXT, dest=KEY_SPOOL_ASC),
+        AptSourcesFileInstallCommand(spool=KEY_SPOOL_ASC, dest=KEYRING),
+        AptSourcesFileUploadCommand(content=URL_DOCKER_CONTENT, dest=SOURCES_SPOOL),
+        AptSourcesFileInstallCommand(spool=SOURCES_SPOOL, dest=DOCKER_DEST),
+    )
+    assert host.remote_files[KEYRING] == KEY_BYTES
+    assert host.apt_sources == [URL_DOCKER_SOURCE]
+    log = format_log(report)
+    assert f"    $ scp <deb822 sources> -> {KEY_SPOOL_ASC}" in log
+    assert f"    $ scp <deb822 sources> -> {SOURCES_SPOOL}" in log
+    assert "    $ sudo sh -c " in log
+
+    plans2, report2, _hosts2 = await run(
+        [{"host": "h", "connection": {}}], sources_deploy, host_factory=factory
+    )
+    assert not plans2["h"][0].changed
+    (entry2,) = report2.log
+    assert not entry2.changed
+    assert entry2.reason == f'apt sources file "{DOCKER_DEST}" is already configured'
+    # One fetch per materialization: prepare + apply, twice.
+    assert canned_key_fetch == [KEY_URL] * 4
+
+
+async def test_apt_sources_file_url_signed_by_dry_run_sends_nothing(canned_key_fetch):
+    """dry=True plans the four commands (the prepare-phase fetch still runs)
+    but mutates no simulated state."""
+
+    def sources_deploy(host):
+        yield op(
+            apt.sources_file,
+            name="Add Docker apt repository (deb822, URL key)",
+            sudo=True,
+            **URL_DEPLOY_KWARGS,
+        )
+
+    host = SimulatedHost(name="h")
+    plans, report, _hosts = await run(
+        [{"host": "h", "connection": {}}],
+        sources_deploy,
+        dry=True,
+        host_factory=lambda entry: host,
+    )
+    assert report is None
+    (planned,) = plans["h"]
+    assert planned.changed
+    assert len(planned.commands) == 4
+    assert host.remote_files == {}
+    assert host.apt_sources == []
+    assert canned_key_fetch == [KEY_URL]
+
+
+async def test_apt_sources_file_url_signed_by_repeat_write_apply_noop(
+    canned_key_fetch,
+):
+    """Two identical URL-form writes: the prepare plan shows both changed,
+    the apply log shows the second as a no-op -- the fresh per-step cache
+    sees both the installed key and the configured repository."""
+
+    def sources_deploy(host):
+        yield op(apt.sources_file, name="write once", sudo=True, **URL_DEPLOY_KWARGS)
+        yield op(apt.sources_file, name="write twice", sudo=True, **URL_DEPLOY_KWARGS)
+
+    host = SimulatedHost(name="h")
+    runtimes, plans = await run_prepare([host], sources_deploy)
+    assert plans["h"][0].changed
+    assert plans["h"][1].changed
+    report = await run_apply(runtimes, plans=plans)
+    first, second = report.log
+    assert first.changed
+    assert not second.changed
+    assert second.reason == f'apt sources file "{DOCKER_DEST}" is already configured'
+    assert host.apt_sources == [URL_DOCKER_SOURCE]
+    assert host.remote_files[KEYRING] == KEY_BYTES
+    assert KEY_SPOOL_ASC not in host.remote_files
+    assert SOURCES_SPOOL not in host.remote_files
+
+
+async def test_apt_sources_file_url_signed_by_write_then_remove_in_one_deploy(
+    canned_key_fetch,
+):
+    """Write then remove in one deploy: the removal is fact-gated (a prepare
+    no-op), and in apply it removes the sources file and the installed .asc
+    keyring -- the .gpg twin was never created -- leaving every store empty.
+    The removal path never fetches."""
+
+    def sources_deploy(host):
+        yield op(apt.sources_file, name="write", sudo=True, **URL_DEPLOY_KWARGS)
+        yield op(
+            apt.sources_file,
+            name="remove",
+            filename="docker",
+            signed_by=KEY_URL,
+            present=False,
+            sudo=True,
+        )
+
+    host = SimulatedHost(name="h")
+    runtimes, plans = await run_prepare([host], sources_deploy)
+    assert plans["h"][0].changed
+    assert not plans["h"][1].changed  # still absent during prepare
+    report = await run_apply(runtimes, plans=plans)
+    write, remove = report.log
+    assert write.changed
+    assert remove.changed
+    assert remove.commands == (
+        AptSourcesFileRemoveCommand(path=DOCKER_DEST),
+        AptSourcesFileRemoveCommand(path=KEYRING),
+    )
+    assert f"$ sudo rm -f {KEYRING}" in format_log(report)
+    assert host.remote_files == {}
+    assert host.existing_files == set()
+    assert host.apt_sources == []
+    assert canned_key_fetch == [KEY_URL, KEY_URL]  # write phases only
+
+
+async def test_apt_sources_file_url_signed_by_fresh_containers_stay_deterministic(
+    canned_key_fetch,
+):
+    """The URL is a plain str kwarg and the fetched content is generated
+    inside the operation, so a deploy building fresh tuples on every
+    invocation still passes the determinism guard across both phases."""
+
+    def sources_deploy(host):
+        yield op(
+            apt.sources_file,
+            name="Add Docker apt repository (deb822, URL key)",
+            filename="docker",
+            types=("deb",),
+            uris=("https://download.docker.com/linux/debian",),
+            suites=("bookworm",),
+            components=("stable",),
+            signed_by=KEY_URL,
+            sudo=True,
+        )
+
+    host = SimulatedHost(name="h")
+    runtimes, plans = await run_prepare([host], sources_deploy)
+    report = await run_apply(runtimes, plans=plans)
+    (entry,) = report.log
+    assert entry.changed
+    assert DOCKER_DEST in host.remote_files
+    assert KEYRING in host.remote_files
