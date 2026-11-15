@@ -63,6 +63,13 @@ dropped namespace-wide, as is `mysql.user`'s `password` parameter
 (replaced by the comparable `auth_plugin`): credentials never travel
 through operation arguments, plans or logs.
 
+Fact reads ride the login user first; a read the server denies
+(`Access denied for user` — an `auth_socket` server admits only root) is
+re-read elevated with `sudo` (the `FileContents` fallback precedent), so
+the facts stay idempotent under the same socket authentication the
+operations use. The run-as user and any password come from the inventory
+`privilege` data, never from an operation.
+
 ## Facts
 
 A fact is an asynchronous, queryable resource — never yielded by a

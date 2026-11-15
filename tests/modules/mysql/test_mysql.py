@@ -29,6 +29,8 @@ renderer is checked for flag order, the first-position
 """
 
 import shlex
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -45,7 +47,7 @@ from reemote.drivers import (
     run_prepare,
     send_command,
 )
-from reemote.hosts import Host
+from reemote.hosts import CommandNotFoundError, Host
 from reemote.modules import mysql
 from reemote.modules.mysql.mysql import (
     MysqlBinaryLogs,
@@ -86,16 +88,39 @@ from tests.simulated_host import SimulatedHost
 
 
 class CannedShellHost(Host):
-    """Returns fixed stdout from ``run_shell`` instead of connecting."""
+    """Answers the transport seam with canned results instead of connecting.
 
-    def __init__(self, stdout: str):
+    The login-user read answers ``stdout`` with ``exit_status``/``stderr``;
+    a ``sudo``-wrapped re-read answers ``elevated_stdout`` when one is set
+    (the auth_socket denied-read fallback shape).
+    """
+
+    def __init__(
+        self,
+        stdout: str,
+        *,
+        exit_status: int = 0,
+        stderr: str = "",
+        elevated_stdout: str | None = None,
+    ):
         super().__init__(name="canned")
         self._stdout = stdout
+        self._exit_status = exit_status
+        self._stderr = stderr
+        self._elevated_stdout = elevated_stdout
         self.shells: list[str] = []
 
-    async def run_shell(self, shell: str, *, check: bool = False) -> str:
+    async def _run_shell(self, shell: str) -> Any:
         self.shells.append(shell)
-        return self._stdout
+        if shell.startswith("sudo ") and self._elevated_stdout is not None:
+            return SimpleNamespace(
+                exit_status=0, stdout=self._elevated_stdout, stderr=""
+            )
+        return SimpleNamespace(
+            exit_status=self._exit_status,
+            stdout=self._stdout,
+            stderr=self._stderr,
+        )
 
 
 async def materialize(host: Host, operation, **kwargs):
@@ -208,12 +233,19 @@ def test_database_command_rendering():
 
 
 def test_dump_command_rendering():
-    assert MysqlDumpCommand(dest="/tmp/d b.sql", mysql_database="shop").shell() == (
-        "mysqldump shop > '/tmp/d b.sql'"
-    )
+    # The mkdir + redirect chain rides one sh -c so a sudo-flagged request
+    # creates the parent and writes the dump elevated (the gpg.export_key
+    # precedent); a dest with shell metacharacters is quoted inside the wrap.
+    cmd = MysqlDumpCommand(dest="/tmp/d b.sql", mysql_database="shop")
+    shell = cmd.shell()
+    assert shell.startswith("sh -c ")
+    assert shlex.split(shell)[2] == "mkdir -p /tmp && mysqldump shop > '/tmp/d b.sql'"
+    assert command_shell(cmd, sudo=True).startswith("sudo sh -c ")
     # baseline parity: database=None renders a bare mysqldump (no
     # --all-databases is injected).
-    assert MysqlDumpCommand(dest="/tmp/all.sql").shell() == "mysqldump > /tmp/all.sql"
+    assert shlex.split(MysqlDumpCommand(dest="/tmp/all.sql").shell())[2] == (
+        "mkdir -p /tmp && mysqldump > /tmp/all.sql"
+    )
 
 
 def test_index_command_rendering():
@@ -239,9 +271,13 @@ def test_kill_command_rendering():
 
 
 def test_load_command_rendering():
-    assert MysqlLoadCommand(src="/tmp/d b.sql", mysql_database="shop").shell() == (
-        "mysql shop < '/tmp/d b.sql'"
-    )
+    # The < redirect rides sh -c so a sudo-flagged request reads the file
+    # elevated (the iptables.restore precedent).
+    cmd = MysqlLoadCommand(src="/tmp/d b.sql", mysql_database="shop")
+    shell = cmd.shell()
+    assert shell.startswith("sh -c ")
+    assert shlex.split(shell)[2] == "mysql shop < '/tmp/d b.sql'"
+    assert command_shell(cmd, sudo=True).startswith("sudo sh -c ")
 
 
 def test_optimize_command_rendering():
@@ -451,6 +487,104 @@ async def test_mysql_databases_seam_copy_on_read():
     assert result == {"shop": DATABASES_FACT["mysql"]}
     result["shop"]["character_set"] = "latin1"
     assert host.mysql_databases["shop"]["character_set"] == "utf8mb4"
+
+
+# --- elevated fallback (denied login-user reads) ------------------------------
+
+
+ACCESS_DENIED_STDERR = (
+    "ERROR 1045 (28000): Access denied for user 'supervisor'@'localhost' "
+    "(using password: NO)"
+)
+
+
+async def test_mysql_databases_denied_read_rereads_elevated():
+    # The auth_socket shape: the login user is denied (empty stdout), so
+    # the fact re-reads elevated -- the FileContents fallback precedent --
+    # and parses the sudo read instead of an empty server.
+    host = CannedShellHost(
+        "",
+        exit_status=1,
+        stderr=ACCESS_DENIED_STDERR,
+        elevated_stdout=DATABASES_OUTPUT,
+    )
+    assert await MysqlDatabases.process(host) == DATABASES_FACT
+    assert host.shells == [
+        "mysql -Be 'SELECT * FROM information_schema.SCHEMATA'",
+        "sudo mysql -Be 'SELECT * FROM information_schema.SCHEMATA'",
+    ]
+
+
+async def test_mysql_user_grants_denied_guarded_read_rereads_elevated():
+    # The || true guard masks the exit status but not the access-denied
+    # stderr, so a guarded fact falls back too.
+    host = CannedShellHost(
+        "", stderr=ACCESS_DENIED_STDERR, elevated_stdout=GRANTS_OUTPUT
+    )
+    assert await MysqlUserGrants.process(host, "someuser") == GRANTS_FACT
+    assert host.shells == [
+        'mysql -Be \'SHOW GRANTS FOR "someuser"@"localhost"\' || true',
+        'sudo mysql -Be \'SHOW GRANTS FOR "someuser"@"localhost"\' || true',
+    ]
+
+
+async def test_mysql_databases_missing_client_raises_without_elevation():
+    # Exit 127 stays CommandNotFoundError: a missing mysql must never
+    # parse as an empty fact, and elevating cannot install it.
+    host = CannedShellHost("", exit_status=127, stderr="sh: mysql: not found")
+    with pytest.raises(CommandNotFoundError):
+        await MysqlDatabases.process(host)
+    assert host.shells == ["mysql -Be 'SELECT * FROM information_schema.SCHEMATA'"]
+
+
+async def test_mysql_tables_statement_error_does_not_elevate():
+    # A non-auth failure keeps the tolerant empty parse: the fallback is
+    # for denied reads only, so a host without sudo is never asked.
+    host = CannedShellHost(
+        "", exit_status=1, stderr="ERROR 1049 (42000): Unknown database 'nope'"
+    )
+    assert await MysqlTables.process(host, "nope") == []
+    assert host.shells == [MysqlTables.command("nope")]
+
+
+async def test_database_noop_when_elevated_read_sees_existing_database():
+    # The reported failure: the database already exists, the login-user
+    # read is denied, and the blind fact planned a CREATE that died on
+    # ERROR 1007. The elevated fallback sees it, so the operation no-ops.
+    host = CannedShellHost(
+        "",
+        exit_status=1,
+        stderr=ACCESS_DENIED_STDERR,
+        elevated_stdout=DATABASES_OUTPUT,
+    )
+    ctx, commands = await materialize(
+        host,
+        mysql.database,
+        database="baseline_stuff",
+        charset="utf8",
+        collate="utf8_general_ci",
+    )
+    assert not ctx.changed
+    assert commands == []
+    assert ctx.reason == "mysql database baseline_stuff already exists"
+
+
+async def test_database_creates_when_elevated_read_lacks_database():
+    # The fallback cuts both ways: a database the elevated read does not
+    # see is still created, with the fact read riding sudo exactly once.
+    host = CannedShellHost(
+        "",
+        exit_status=1,
+        stderr=ACCESS_DENIED_STDERR,
+        elevated_stdout=DATABASES_OUTPUT,
+    )
+    ctx, commands = await materialize(host, mysql.database, database="shop")
+    assert ctx.changed
+    assert [cmd.shell() for cmd in commands] == ["mysql -Be 'CREATE DATABASE `shop`'"]
+    assert host.shells == [
+        "mysql -Be 'SELECT * FROM information_schema.SCHEMATA'",
+        "sudo mysql -Be 'SELECT * FROM information_schema.SCHEMATA'",
+    ]
 
 
 # --- MysqlUsers (baseline parity) ---------------------------------------------

@@ -1508,11 +1508,18 @@ async def test_dump_renders_baseline_fixture_without_the_password_prefix():
             psql_database="somedb",
         )
     ]
-    assert commands[0].shell() == (
-        "pg_dump -d somedb -U root -h localhost -p 3306 > somefile"
+    # The mkdir + redirect chain rides one sh -c so a sudo-flagged request
+    # creates the parent and writes the dump elevated (the gpg.export_key
+    # precedent).
+    shell = commands[0].shell()
+    assert shell.startswith("sh -c ")
+    assert shlex.split(shell)[2] == (
+        "mkdir -p . && pg_dump -d somedb -U root -h localhost -p 3306 > somefile"
     )
-    # A dest with shell metacharacters is quoted literally.
-    assert PostgresqlDumpCommand(dest="my file").shell() == "pg_dump > 'my file'"
+    assert command_shell(commands[0], sudo=True).startswith("sudo sh -c ")
+    # A dest with shell metacharacters is quoted literally inside the wrap.
+    inner = shlex.split(PostgresqlDumpCommand(dest="my file").shell())[2]
+    assert inner == "mkdir -p . && pg_dump > 'my file'"
 
 
 async def test_dump_seam_writes_the_marker_file():
@@ -1538,8 +1545,14 @@ async def test_load_renders_baseline_fixture_without_the_password_prefix():
     assert commands == [
         PostgresqlLoadCommand(src="somefile", psql_user="root", psql_database="somedb")
     ]
-    assert commands[0].shell() == "psql -d somedb -U root < somefile"
-    assert PostgresqlLoadCommand(src="my file").shell() == "psql < 'my file'"
+    # The < redirect rides sh -c so a sudo-flagged request reads the file
+    # elevated (the iptables.restore precedent).
+    shell = commands[0].shell()
+    assert shell.startswith("sh -c ")
+    assert shlex.split(shell)[2] == "psql -d somedb -U root < somefile"
+    assert command_shell(commands[0], sudo=True).startswith("sudo sh -c ")
+    inner = shlex.split(PostgresqlLoadCommand(src="my file").shell())[2]
+    assert inner == "psql < 'my file'"
 
 
 async def test_load_seam_changes_no_catalog_state():
@@ -2882,6 +2895,22 @@ def test_subscription_command_renders_create_alter_and_drop():
         publications=("pub_a", "pub_b"),
         enabled=False,
     ).shell() == f"psql -Ac {shlex.quote(sql)}"
+    # connect = false forces the subscription disabled server-side, so the
+    # create form renders both options even when enabled is left unset.
+    connect_sql = (
+        "CREATE SUBSCRIPTION \"sub\" CONNECTION 'host=192.168.0.10 dbname=mydb' "
+        'PUBLICATION "pub_a", "pub_b" WITH (connect = false, enabled = false)'
+    )
+    assert (
+        PostgresqlSubscriptionCommand(
+            subscription="sub",
+            connection="host=192.168.0.10 dbname=mydb",
+            publications=("pub_a", "pub_b"),
+            enabled=False,
+            connect=False,
+        ).shell()
+        == f"psql -Ac {shlex.quote(connect_sql)}"
+    )
     assert PostgresqlSubscriptionCommand(
         subscription="sub", publications=("pub_b",), enabled=False, alter=True
     ).shell() == (
@@ -2904,6 +2933,15 @@ async def test_subscription_validates_connection_and_publication_names():
             host, postgresql.subscription, subscription="sub",
             connection="host=192.168.0.10", publications=["pub,a"],
         )
+    with pytest.raises(ValueError, match="connect=False requires enabled=False"):
+        await materialize(
+            host,
+            postgresql.subscription,
+            subscription="sub",
+            connection="host=192.168.0.10",
+            publications=["pub_a"],
+            connect=False,
+        )
 
 
 async def test_subscription_creates_with_sorted_publications():
@@ -2920,6 +2958,32 @@ async def test_subscription_creates_with_sorted_publications():
             connection="host=192.168.0.10",
             publications=("pub_a", "pub_b"),
             enabled=True,
+        )
+    ]
+
+
+async def test_subscription_creates_without_connecting_to_the_publisher():
+    # connect=False pre-provisions the subscription: no publisher dial,
+    # no replication slot -- and the create is forced disabled.
+    host = SimulatedHost(name="h")
+    ctx, commands = await materialize(
+        host,
+        postgresql.subscription,
+        subscription="sub",
+        connection="host=192.168.0.10",
+        publications=["pub_a"],
+        enabled=False,
+        connect=False,
+    )
+    assert ctx.changed
+    assert ctx.reason == "postgresql subscription sub will be created"
+    assert commands == [
+        PostgresqlSubscriptionCommand(
+            subscription="sub",
+            connection="host=192.168.0.10",
+            publications=("pub_a",),
+            enabled=False,
+            connect=False,
         )
     ]
 
@@ -2946,13 +3010,15 @@ async def test_subscription_alters_publications_and_enabled():
 
 async def test_subscription_noop_ignores_connection_drift():
     # The fact deliberately hides subconninfo (it can embed a password), so
-    # a different connection string is never a drift.
+    # a different connection string is never a drift. connect is likewise
+    # create-time only: the catalog stores no connect flag to compare.
     host = SimulatedHost(
         name="h", postgres_subscriptions={"postgres": [SUBSCRIPTION_ENTRY]}
     )
     ctx, commands = await materialize(
         host, postgresql.subscription, subscription="sub",
         connection="host=elsewhere", publications=["pub_a"],
+        connect=False,
     )
     assert not ctx.changed
     assert ctx.reason == (
@@ -2993,6 +3059,22 @@ async def test_subscription_seam_create_disable_drop():
     )
     # The connection string is never stored (the fact hides conninfo).
     assert host.postgres_subscriptions == {"postgres": [SUBSCRIPTION_ENTRY]}
+    # A connect=False create lands disabled, exactly like the server forces.
+    await send_command(
+        host,
+        PostgresqlSubscriptionCommand(
+            subscription="pre",
+            connection="host=192.168.0.10",
+            publications=("pub_a",),
+            enabled=False,
+            connect=False,
+        ),
+    )
+    pre = next(s for s in host.postgres_subscriptions["postgres"] if s["name"] == "pre")
+    assert pre["enabled"] is False
+    await send_command(
+        host, PostgresqlSubscriptionCommand(subscription="pre", present=False)
+    )
     await send_command(
         host,
         PostgresqlSubscriptionCommand(

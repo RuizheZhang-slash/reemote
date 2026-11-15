@@ -209,6 +209,53 @@ async def test_snap_package_absent_reads_as_none():
     assert await SnapPackage.process(CannedShellHost(error), "foo") is None
 
 
+# A store snap that is NOT installed: ``snap info vlc`` still prints the store
+# metadata -- name/publisher/snap-id and the indented channels table -- and
+# exits zero, but carries no ``tracking:`` or ``installed:`` row. Captured from
+# the demo Ubuntu host (vlc absent). The fact must read this as None so
+# snap.package installs it rather than refreshing a snap that is not there.
+VLC_STORE_ONLY_OUTPUT = """\
+name:      vlc
+summary:   The ultimate media player
+publisher: VideoLAN**
+store-url: https://snapcraft.io/vlc
+contact:   https://www.videolan.org/support/
+license:   GPL-2.0+
+description: |
+  VLC is a free and open source cross-platform multimedia player and
+  framework that plays most multimedia files as well as DVDs, Audio CDs,
+  VCDs, and various streaming protocols.
+snap-id: RT9mcUhVsRYrDLG8qnvGiy26NKvv6Qkd
+channels:
+  latest/stable:    3.0.24-rc1                  2026-09-22 (4472) 278MB -
+  latest/candidate: 3.0.24-rc1                  2026-09-17 (4472) 278MB -
+  latest/beta:      3.0.24-65-g467f4cf351       2026-11-15 (4586) 275MB -
+  latest/edge:      4.0.0-dev-39758-g5ff4fb8562 2026-11-15 (4587) 351MB -"""
+
+
+async def test_snap_package_store_only_snap_reads_as_none():
+    """A snap present in the store but not installed prints name/publisher/
+    snap-id and the channels table but no ``installed:`` row, so the fact
+    reports ``None`` -- not a channel-less entry that would mislead
+    snap.package into refreshing a snap that is not installed."""
+    assert (
+        await SnapPackage.process(CannedShellHost(VLC_STORE_ONLY_OUTPUT), "vlc")
+        is None
+    )
+
+
+async def test_snap_package_installs_a_store_only_snap():
+    """Regression: over the real-transport parse path a store-only snap is
+    planned as an install, not a refresh of a snap that is not installed (the
+    bug that made examples/modules/snap/snap_package.py fail on vlc)."""
+    host = CannedShellHost(VLC_STORE_ONLY_OUTPUT)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in snap.package(ctx, packages=("vlc",))]
+    assert ctx.changed
+    assert ctx.reason == "1 package(s) to install"
+    assert commands == [SnapInstallCommand(packages=("vlc",))]
+
+
 # --- SimulatedHost seam -------------------------------------------------------
 
 

@@ -3563,7 +3563,8 @@ async def user_authorized_keys(
             Defaults to False.
         authorized_key_directory (str | None, optional): The directory to
             write into; defaults to the user's ``Home`` fact resolved to
-            ``<home>/.ssh``. Defaults to None.
+            ``<home>/.ssh`` -- a user with no resolvable home directory
+            (unknown to the host) raises ``OperationError``. Defaults to None.
         authorized_key_filename (str | None, optional): The file name to
             write inside ``authorized_key_directory``; defaults to
             ``authorized_keys``. Defaults to None.
@@ -3603,6 +3604,15 @@ async def user_authorized_keys(
     # stand-ins. Those state verbs stay in-place (a touch/mkdir/chmod/chown
     # payload is not file text); only the key-content write below moved to
     # the spool-and-install family.
+    #
+    # The ``Home`` fact answers ``None`` for a user the host does not know
+    # (its ``echo ~user`` stays unexpanded), and that reads as an
+    # ``OperationError`` naming the user before any command is planned --
+    # never a literal ``None/.ssh`` path that would mkdir/chmod a junk
+    # directory and only fail later at ``chown`` (developer decision: the
+    # baseline builds the bogus path; the fact's own no-masquerade rule is
+    # enforced here). An explicit ``authorized_key_directory`` bypasses the
+    # Home read entirely, so the guard never fires for it.
     #
     # Key idempotence rides the ``AuthorizedKeys`` fact (read with an
     # explicit ``path``, never tilde-resolved): with ``delete_keys=False``
@@ -3647,6 +3657,8 @@ async def user_authorized_keys(
 
     if authorized_key_directory is None:
         home = await ctx.facts.get(Home, user=user)
+        if home is None:
+            raise OperationError(f"cannot resolve a home directory for user {user!r}")
         authorized_key_directory = f"{home}/.ssh"
 
     if authorized_key_filename is None:

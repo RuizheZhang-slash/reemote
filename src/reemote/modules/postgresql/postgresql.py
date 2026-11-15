@@ -56,6 +56,7 @@
 import shlex
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any, TypedDict, cast
 
 from ...commands import Command
@@ -2007,20 +2008,26 @@ async def database(
 
 @dataclass(frozen=True)
 class PostgresqlDumpCommand(_PsqlCommand):
-    """``pg_dump ... > <dest>``: dump a database to a host-side file.
+    """``sh -c 'mkdir -p <parent> && pg_dump ... > <dest>'``: dump to a file.
 
     The stateless mutation ``postgresql.dump`` yields. ``dest`` is a path
     on the TARGET host (a shell redirect, not a transfer -- reemote's
     IO-only transfer rule concerns controller-side paths, which a
-    dump never takes either). Under ``sudo=True`` the driver's
-    ``run_shell_privileged`` keeps the redirect inside the elevated
-    shell, so the dump file is written as the run-as user.
+    dump never takes either). The parent directory is created when
+    missing, and the redirect is wrapped in ``sh -c`` so the whole write
+    runs elevated under ``sudo sh -c '...'`` -- a bare ``sudo pg_dump >
+    /var/lib/...`` would open the redirect as the login user (the
+    GpgExportCommand precedent).
     """
 
     dest: str
 
     def shell(self) -> str:
-        return f"{self._base('pg_dump')} > {shlex.quote(self.dest)}"
+        parent = shlex.quote(str(PurePosixPath(self.dest).parent))
+        inner = (
+            f"mkdir -p {parent} && {self._base('pg_dump')} > {shlex.quote(self.dest)}"
+        )
+        return f"sh -c {shlex.quote(inner)}"
 
 
 async def dump(
@@ -2036,7 +2043,8 @@ async def dump(
 
     Args:
         ctx (OpContext): Execution context for the operation.
-        dest (str): Path on the target host to write the dump to.
+        dest (str): Path on the target host to write the dump to; its
+            parent directory is created when missing.
         psql_user (str | None, optional): Role to connect as.
             Defaults to None.
         psql_host (str | None, optional): Server host to connect to.
@@ -2063,8 +2071,11 @@ async def dump(
     # ``postgresql.dump``: non-idempotent by design, always yields.
     # Requires ``pg_dump`` on the
     # target host. ``psql_password`` is deliberately dropped (the
-    # namespace credentials decision). ``**kwargs`` absorbs any
-    # global arguments.
+    # namespace credentials decision). The descriptor creates ``dest``'s
+    # parent directory and wraps the redirect in ``sh -c``, so a
+    # ``sudo=True`` request writes the dump as the run-as user even into
+    # a root-only directory (the gpg.export_key precedent).
+    # ``**kwargs`` absorbs any global arguments.
     ctx.changed = True
     ctx.reason = f"postgresql database will be dumped to {dest}"
     yield PostgresqlDumpCommand(
@@ -2436,17 +2447,21 @@ async def index(
 
 @dataclass(frozen=True)
 class PostgresqlLoadCommand(_PsqlCommand):
-    """``psql ... < <src>``: load a host-side SQL file into a database.
+    """``sh -c 'psql ... < <src>'``: load a host-side SQL file.
 
     The stateless mutation ``postgresql.load`` yields. ``src`` is a path
     on the TARGET host (a shell redirect, not a transfer); to load
-    controller-side bytes, spool them with ``files.put`` first.
+    controller-side bytes, spool them with ``files.put`` first. The
+    ``<`` redirect is wrapped in ``sh -c`` so the read runs elevated
+    under ``sudo sh -c '...'`` even for a root-only dump file (the
+    IptablesRestoreCommand precedent).
     """
 
     src: str
 
     def shell(self) -> str:
-        return f"{self._base()} < {shlex.quote(self.src)}"
+        inner = f"{self._base()} < {shlex.quote(self.src)}"
+        return f"sh -c {shlex.quote(inner)}"
 
 
 async def load(
@@ -3633,7 +3648,9 @@ class PostgresqlSubscriptionCommand(_PsqlCommand):
     """``psql -Ac 'CREATE/ALTER/DROP SUBSCRIPTION ...'``: logical replication.
 
     The create form renders CREATE SUBSCRIPTION ... CONNECTION '...'
-    PUBLICATION ... (WITH (enabled = false) when created disabled);
+    PUBLICATION ... (WITH (enabled = false) when created disabled, or
+    WITH (connect = false, enabled = false) when ``connect=False`` --
+    the server then dials no publisher and creates no replication slot);
     ``alter=True`` renders ALTER SUBSCRIPTION SET PUBLICATION and/or
     ENABLE/DISABLE; ``present=False`` renders DROP SUBSCRIPTION.
     """
@@ -3642,6 +3659,7 @@ class PostgresqlSubscriptionCommand(_PsqlCommand):
     connection: str | None = None
     publications: tuple[str, ...] = ()
     enabled: bool | None = None
+    connect: bool = True
     present: bool = True
     alter: bool = False
 
@@ -3666,7 +3684,11 @@ class PostgresqlSubscriptionCommand(_PsqlCommand):
             f"CONNECTION {_quote_literal(self.connection or '')} "
             f"PUBLICATION {listed}"
         )
-        if self.enabled is False:
+        if not self.connect:
+            # connect = false forces the subscription disabled server-side
+            # (and rejects an explicit enabled = true), so render both.
+            sql += " WITH (connect = false, enabled = false)"
+        elif self.enabled is False:
             sql += " WITH (enabled = false)"
         return self._sql_shell(sql)
 
@@ -3678,6 +3700,7 @@ async def subscription(
     publications: list[str] | None = None,
     present: bool = True,
     enabled: bool = True,
+    connect: bool = True,
     psql_user: str | None = None,
     psql_host: str | None = None,
     psql_port: int | None = None,
@@ -3703,6 +3726,15 @@ async def subscription(
         enabled (bool, optional): Whether the subscription should be
             enabled; reconciled (ENABLE/DISABLE) when it differs.
             Defaults to True.
+        connect (bool, optional): Create-time only: whether CREATE
+            SUBSCRIPTION dials the publisher at all. ``False`` renders
+            WITH (connect = false, enabled = false) -- no connection,
+            no replication slot, no table sync -- so a subscription can
+            be pre-provisioned before its publisher exists; requires
+            ``enabled=False`` when creating. Starting replication later
+            needs the slot created manually on the publisher, then
+            ENABLE. Ignored on an existing subscription (the catalog
+            stores no connect flag). Defaults to True.
         psql_user (str | None, optional): Role to connect as.
             Defaults to None.
         psql_host (str | None, optional): Server host to connect to.
@@ -3736,6 +3768,8 @@ async def subscription(
     # never reads subconninfo because it can embed a password (the
     # namespace credentials decision). Publication names may not
     # contain commas or braces (the fact parses the text[] rendering).
+    # ``connect`` is create-time only, like the connection string: the
+    # catalog has no connect column to reconcile against.
     # Needs superuser: flag the request ``sudo=True`` with
     # ``privilege.sudo_user = "postgres"``. ``**kwargs`` absorbs
     # any further global arguments.
@@ -3776,6 +3810,14 @@ async def subscription(
 
     desired_pubs = tuple(sorted(set(publications or [])))
     if current is None:
+        if not connect and enabled:
+            # The server rejects this pair as mutually exclusive; fail
+            # here before any command is sent. Only the create path
+            # checks: on an existing subscription connect is ignored,
+            # so enabled=True can later start a pre-provisioned one.
+            raise ValueError(
+                "postgresql.subscription connect=False requires enabled=False"
+            )
         ctx.changed = True
         ctx.reason = f"postgresql subscription {subscription} will be created"
         yield PostgresqlSubscriptionCommand(
@@ -3783,6 +3825,7 @@ async def subscription(
             connection=connection,
             publications=desired_pubs,
             enabled=enabled,
+            connect=connect,
             **conn,
         )
         return

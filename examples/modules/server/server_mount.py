@@ -22,20 +22,20 @@ unmount or remount acts on. Like the baseline, ``/etc/fstab`` is never
 touched: a mount made this way does not survive a reboot unless an fstab
 entry is managed separately (a ``files.edit`` recipe).
 
-The mount target directory must already exist and the device must be
-present -- this example does not create ``/data`` or partition disks. A
-missing device or directory makes ``mount`` exit non-zero and the run fails
-with a typed ``CommandError``, which ``main`` reports as one line; an
-already-unmounted ``/scratch`` simply plans no change.
-
-**Host-policy and storage prerequisite.** The demo hosts have no
-``/dev/sdb1`` (only ``/dev/sda``), and on the CentOS hosts SELinux
-``staff_t`` confinement additionally denies creating the ``/data`` mount
-point and mounting filesystems. The script is correct (``sudo=True``); it
-needs a real block device provisioned by the operator, an existing mount
-point, and an unconfined ``sudo`` domain. Point ``INVENTORY_PATH`` at a host
-with the target device and directory -- or relax SELinux and attach a
-disk -- to run it for real.
+The operation itself still requires an existing mount target directory and
+a present device -- it does not create ``/data`` or partition disks -- so
+this example provisions its own prerequisites before deploying: ``main``
+first awaits ``provision_mounts`` from the sibling ``provision.py``, which
+creates ``/data`` and ``/scratch`` with ``files.directory`` and attaches a
+64M loop-backed ext4 image as ``/dev/sdb1`` (the demo hosts have no spare
+disk, only ``/dev/sda``). Both steps are idempotent and scoped to the
+``"centos"`` group, so the example runs even on a host where none of this
+storage exists. The loop attachment does not survive a reboot, but
+provisioning re-attaches the existing image without reformatting it. A
+``mount``/``umount`` that still exits non-zero (a busy filesystem on
+unmount, for instance) fails the run with a typed ``CommandError``, which
+``main`` reports as one line; an already-unmounted ``/scratch`` simply plans
+no change.
 
 Every failure mode of the run -- an unreachable host, a rejected elevation,
 or a ``mount``/``umount`` that exits non-zero (a missing device, a busy
@@ -56,10 +56,7 @@ is a stable module-level function, so the prepare and apply phases reach
 the same skip decision. The driver skips a rejected request without
 materializing it, so on hosts outside the ``"centos"`` group neither the
 commands nor the facts behind them run, and plan and log render the step
-as ``[skipped: when guard is_centos]`` in its lockstep slot. The path is
-resolved from ``__file__``, so the example works from any working
-directory; point ``INVENTORY_PATH`` at your own file to target your
-machines.
+as ``[skipped: when guard is_centos]`` in its lockstep slot.
 
 The path is resolved from ``__file__``, so the example works from any
 working directory; point ``INVENTORY_PATH`` at your own file (or edit
@@ -91,6 +88,14 @@ from reemote import (
     server,
     validate_inventory,
 )
+
+# The mount provisioning helper sits beside this script; add its directory
+# to sys.path so ``import provision`` resolves whether the example is run by
+# path or imported by the offline example harness.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+from provision import provision_mounts
 
 # examples/modules/server/server_mount.py -> the project root, so the inventory
 # is found whatever the current working directory is.
@@ -156,6 +161,13 @@ async def main() -> None:
         inventory = load_inventory(INVENTORY_PATH)
         print(f"== Inventory loaded from {INVENTORY_PATH} ==")
         print(", ".join(entry["host"] for entry in inventory))
+
+        # Provision the mount points and the loop-backed /dev/sdb1 on the
+        # CentOS hosts before anything below reads or mutates mount state,
+        # so the example runs even on a host with no spare disk (see
+        # provision.py).
+        print("\n== Provisioning mount prerequisites (provision.py) ==")
+        await provision_mounts(inventory)
 
         # --dry: prepare phase only. The mount list is still gathered over
         # SSH (read-only) so the plan reflects each host's real pre-deployment

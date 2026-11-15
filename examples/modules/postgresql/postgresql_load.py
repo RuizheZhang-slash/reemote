@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Kim Jarvis.
 # SPDX-License-Identifier: EPL-2.0
 
-"""Example: load a host-side SQL file through psql on real CentOS hosts.
+"""Example: load a host-side SQL file through psql on real Ubuntu hosts.
 
 This is a *usage* example, not part of the library. It drives reemote's
 two-phase execution model end to end over a **real SSH transport**
@@ -26,33 +26,34 @@ runs the two requests in lockstep order, so the dump is on disk before
 the load reads it.
 
 **Host prerequisite.** This example needs a running PostgreSQL server. The
-demo CentOS hosts install the packages fine (``sudo dnf install -y
-postgresql-server``), but their ``staff_t``-confined sudo cannot initialize
-the cluster: ``initdb`` cannot exec ``/usr/bin/postgres`` and
-``postgresql-setup --initdb``'s ``runuser`` cannot setuid, so the server
-never starts and no ``/var/run/postgresql`` socket exists for either the
-login-user fact reads or the ``sudo -u postgres`` operations. Compile-checked
-and exercised by the offline harness, not run against shared hosts; relax the
-demo hosts' sudo or point ``INVENTORY_PATH`` at your own PostgreSQL machines to run
-live.
+demo Ubuntu host runs PostgreSQL 18.6 as a snap whose local socket uses
+``trust`` authentication, so the ``postgres`` superuser role is reachable
+without a password -- but there is no ``postgres`` OS user. The ``sudo=True``
+operations ride under root and connect as that role through
+``psql_user="postgres"``; the login-user fact reads need a role for the login
+user (created out of band) or ``psql_user="postgres"`` on ``gather_fact``. A
+stock apt install uses peer authentication instead, where root reaches the
+``postgres`` role only if ``pg_hba.conf`` allows it (or the inventory
+privilege sets ``sudo_user="postgres"``). Point ``INVENTORY_PATH`` at your
+own PostgreSQL machines to run live.
 
-Every request carries ``when=is_centos``, the declarative eligibility
+Every request carries ``when=is_ubuntu``, the declarative eligibility
 guard: the predicate reads only **static** inventory data --
 ``host.group``, set by the ``"group"`` key of the inventory entry -- and
 is a stable module-level function, so the prepare and apply phases reach
 the same skip decision. The driver skips a rejected request without
-materializing it, so on hosts outside the ``"centos"`` group neither the
+materializing it, so on hosts outside the ``"ubuntu"`` group neither the
 commands nor the facts behind them run, and plan and log render the step
-as ``[skipped: when guard is_centos]`` in its lockstep slot. The path is
+as ``[skipped: when guard is_ubuntu]`` in its lockstep slot. The path is
 resolved from ``__file__``, so the example works from any working
 directory; point ``INVENTORY_PATH`` at your own file to target your
 machines.
 
-The shared ``inventory.json`` carries no ``privilege`` section, so ``main``
-attaches ``{"sudo_user": "postgres"}`` to the loaded ``centos`` entries:
-the ``sudo=True`` requests ride under the ``postgres`` OS user, so the
-``psql`` client connects through peer authentication -- no password
-travels through operation arguments, plans or logs (the baseline's
+The ``sudo=True`` requests ride under root, and every request passes
+``psql_user="postgres"`` so the ``psql`` client connects as the ``postgres``
+superuser role -- through the demo snap's trust-authenticated local socket,
+or a host-side ``~/.pgpass`` / peer entry elsewhere. No password travels
+through operation arguments, plans or logs (the baseline's
 ``psql_password`` option is deliberately dropped namespace-wide).
 
 Run it with::
@@ -88,15 +89,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 INVENTORY_PATH = PROJECT_ROOT / "inventory.json"
 
 
-# The privilege section these scripts attach to the loaded ``centos``
-# inventory entries (the shared file carries none): ``sudo_user="postgres"``
-# is the OS user the ``sudo=True`` requests ride under, so the ``psql``
-# client connects through peer authentication -- no password travels
-# through operation arguments, plans or logs.
-PRIVILEGE = {"sudo_user": "postgres"}
-
 # The host-side SQL file both requests share: the dump writes it, the load
-# reads it, both under the postgres user's home on the TARGET host.
+# reads it, both under /var/lib/postgresql on the TARGET host.
 DUMP_PATH = "/var/lib/postgresql/postgres_roundtrip.sql"
 
 
@@ -114,15 +108,15 @@ def load_inventory(path: Path) -> list[dict[str, Any]]:
     return inventory
 
 
-def is_centos(host: Host) -> bool:
-    """``when`` guard: the host belongs to the inventory group ``"centos"``.
+def is_ubuntu(host: Host) -> bool:
+    """``when`` guard: the host belongs to the inventory group ``"ubuntu"``.
 
     Reads only static inventory data (``host.group``, set by the ``"group"``
     key of the inventory entry), never a mutable fact, and stays a stable
     module-level function -- the two rules every ``when`` predicate follows
     so both deploy phases reach the same eligibility decision.
     """
-    return host.group == "centos"
+    return host.group == "ubuntu"
 
 
 def deploy(host: Host) -> Generator[OperationRequest]:
@@ -131,8 +125,9 @@ def deploy(host: Host) -> Generator[OperationRequest]:
     Branch-free, so the request sequence is identical in the prepare and
     apply phases (a branch on a mutable fact would raise DeterminismError).
 
-    Both requests are flagged ``sudo=True`` and ride under the inventory's
-    postgres user, which can write and read under /var/lib/postgresql.
+    Both requests are flagged ``sudo=True`` (root) and connect as the
+    ``postgres`` role through ``psql_user="postgres"``; root can write and
+    read under /var/lib/postgresql.
     """
     yield op(
         postgresql.dump,
@@ -140,7 +135,8 @@ def deploy(host: Host) -> Generator[OperationRequest]:
         dest=DUMP_PATH,
         psql_database="postgres",
         sudo=True,
-        when=is_centos,
+        psql_user="postgres",
+        when=is_ubuntu,
     )
     yield op(
         postgresql.load,
@@ -148,21 +144,14 @@ def deploy(host: Host) -> Generator[OperationRequest]:
         src=DUMP_PATH,
         psql_database="postgres",
         sudo=True,
-        when=is_centos,
+        psql_user="postgres",
+        when=is_ubuntu,
     )
 
 
 async def main() -> None:
     try:
         inventory = load_inventory(INVENTORY_PATH)
-
-        # The shared inventory carries no privilege section; attach this
-        # namespace's to the centos entries, so elevation stays an inventory
-        # parameter and psql rides the postgres user's peer-authenticated
-        # socket.
-        for entry in inventory:
-            if entry.get("group") == "centos":
-                entry["privilege"] = dict(PRIVILEGE)
         print(f"== Inventory loaded from {INVENTORY_PATH} ==")
         print(", ".join(entry["host"] for entry in inventory))
 

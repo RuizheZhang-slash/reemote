@@ -542,9 +542,12 @@ server {
 }
 """
 
-# StrictUndefined / keep_trailing_newline are now YOUR renderer's choices;
-# reemote only ever sees the finished string.
-ENV = Environment(undefined=StrictUndefined, keep_trailing_newline=True)
+# The renderer's choices are now YOURS; reemote only ever sees the finished
+# string. Match Ansible's environment: trim_blocks=True (drop the newline
+# after a block tag) and keep_trailing_newline=True (preserve the final one).
+ENV = Environment(
+    undefined=StrictUndefined, trim_blocks=True, keep_trailing_newline=True
+)
 
 
 def build_install(rendered_by_host):
@@ -614,6 +617,17 @@ deploy for a `files.install` of your own rendered text.
   does not cover queues nothing — the deploy `return`s early — so a subset gather
   and a `when`-guarded deploy compose the same way they do in the
   [include_vars migration](#migrating-include_vars-os-dispatch).
+- **Reproduce Ansible's environment when you hand-render.** Ansible renders
+  with `trim_blocks=True` (the newline after a `{% … %}` block tag is dropped)
+  and preserves trailing newlines; a bare `Environment()` does neither, so the
+  bytes diverge. A template that is exactly `"{{ var }}"` also resolves to the
+  variable's *native type* — an int `0` stays `0`, so `default(500, true)`
+  yields `500`, not `0` — which a stringify-first renderer gets wrong. And a
+  variable that both gates a task (`when: x | bool`) and renders verbatim must
+  keep its raw value for the render: derive a separate bool for the gate, or
+  you render `True` where Ansible renders `1`. The PHP migration
+  (`examples/roles/ansible-role-php/ansible-role-php.py`) renders every template
+  in pure Python and was verified byte-identical to Jinja2 under these defaults.
 
 ## Migrating a validate hook
 

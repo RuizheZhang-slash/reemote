@@ -144,14 +144,17 @@ is not found directly but `device` is given, the mount is located by device
 instead, and that found mount point is what an unmount or remount acts on.
 Like the baseline, `/etc/fstab` is never touched — a
 mount made this way does not survive a reboot unless an fstab entry is
-managed separately. The mount target directory must already exist and the
-device must be present; a missing device or directory makes `mount` exit
-non-zero and the run fails with a typed `CommandError`, which the script
-reports as one line. The demo hosts have no `/dev/sdb1` (only `/dev/sda`), and
-CentOS `staff_t` confinement additionally denies creating `/data` and mounting
-filesystems — a **host-policy and storage prerequisite**, not a script defect:
-it needs an operator-provisioned device, an existing mount point and an
-unconfined `sudo` domain.
+managed separately. The operation itself requires an existing mount target
+directory and a present device, so the script provisions its own
+prerequisites before deploying: `main` first awaits `provision_mounts` from
+the sibling `provision.py`, which creates `/data` and `/scratch` with
+`files.directory` and attaches a 64M loop-backed ext4 image as `/dev/sdb1`
+(the demo hosts have no spare disk, only `/dev/sda`). Both steps are
+idempotent and scoped to the `centos` group; the loop attachment does not
+survive a reboot, but provisioning re-attaches the existing image without
+reformatting it. A `mount`/`umount` that still exits non-zero (a busy
+filesystem on unmount, for instance) fails the run with a typed
+`CommandError`, which the script reports as one line.
 
 ::: server_mount
     options:
