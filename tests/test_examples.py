@@ -83,6 +83,13 @@ SNAPSHOT_ARGS = {
         "examples/modules/lxd/lxd_image_alias.py",
         "build_alias_image",
     ): lambda name: {name: "0" * 64},
+    # The fetch_url example freezes the Composer installer signature main()
+    # fetches control-side into the download's checksum; a 96-char hex str is
+    # the sha384 shape main() reads.
+    (
+        "examples/modules/files/files_fetch_url.py",
+        "build_installer",
+    ): lambda name: "0" * 96,
     # The DataDog role migration: five factories, each closing over the
     # frozen reads its deploy branches on. The payloads are plain
     # bytes/str/tuple/frozenset -- the shapes main() freezes between runs.

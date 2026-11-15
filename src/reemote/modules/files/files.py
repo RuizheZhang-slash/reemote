@@ -3021,7 +3021,8 @@ async def transform(
 def _fetch_url_bytes(url: str) -> bytes:
     """Fetch an ``http(s)`` ``url`` control-side and return its body bytes.
 
-    The single network read behind ``files.download``, run in a worker thread
+    The single network read behind ``files.fetch_url`` (and so
+    ``files.download``), run in a worker thread
     (``asyncio.to_thread``) because ``urllib`` blocks the event loop. The
     *control* machine -- not the target host -- opens the connection, so the
     download works when only the control side has internet egress and the host
@@ -3058,6 +3059,83 @@ def _parse_checksum(checksum: str) -> tuple[str, str]:
     if algorithm not in hashlib.algorithms_available:
         raise ValueError(f"unknown checksum algorithm {algorithm!r} in {checksum!r}")
     return algorithm, expected
+
+
+async def fetch_url(url: str, *, checksum: str | None = None) -> str:
+    """Fetch an ``http(s)`` URL control-side and return its body as text.
+
+    The control-side GET helper -- Ansible's ``uri`` with ``return_content:
+    true`` mapped to a plain coroutine. It is **not an operation**: call it
+    from ``main()`` (or any control-side code), never through ``op()``, and
+    freeze the returned text into the per-host plan the deploy consumes --
+    the fetch-once-then-freeze recipe that keeps both deploy phases
+    deterministic. ``files.download`` is the install-at-a-path sibling and
+    delegates its fetch half here, so the two share one scheme guard, one
+    checksum contract and one text-only decode.
+
+    Args:
+        url (str): The ``http(s)`` URL to fetch control-side.
+        checksum (str | None, optional): An Ansible-style
+            ``"<algorithm>:<hexdigest>"`` (eg ``"sha384:9f2c..."``) the fetched
+            bytes must match; a mismatch raises ``ValueError`` before the
+            caller sees the content. Defaults to None (fetch without
+            verification).
+
+    Returns:
+        str: The response body decoded as UTF-8.
+
+    **Raises:**
+
+    ```python
+    OSError, ValueError
+    ```
+
+    Examples:
+        Examples can be found in ``examples/modules/files/files_fetch_url.py``.
+    """
+
+    # The uri ``return_content: true`` GET shape: the *control* machine opens
+    # the connection (``urllib`` in a worker thread, the same seam
+    # ``files.download`` rides), so the fetch works when only the control side
+    # has internet egress and the target never needs ``curl``/``wget``. Unlike
+    # an operation body -- which runs once per phase per host -- this helper
+    # runs exactly when the caller awaits it, so the determinism recipe is to
+    # fetch once in ``main()`` and freeze the text into the plan (a checksum
+    # pin then makes any per-phase re-fetch byte-identical). On-target HTTP
+    # stays a ``Shell`` action: no command execution inside deploys.
+    #
+    # The guard order is download's: reject a non-http(s) scheme and parse the
+    # optional checksum *before* any fetch, so a typo fails fast at the call
+    # line rather than after a network round-trip; verify the digest against
+    # the raw bytes before decoding, so a mismatch raises before the caller
+    # sees the content. Text only -- a binary body (a ``.rpm``, a tarball)
+    # raises ``ValueError`` and stays ``files.put``'s job (fetch it
+    # control-side into an ``io.BytesIO`` and put it into a login-writable
+    # path). An unreachable URL or a non-2xx response raises
+    # ``urllib.error.URLError``/``HTTPError`` (both ``OSError`` subclasses).
+    # Tests replace ``_fetch_url_bytes`` to stay offline.
+    if not url.startswith(("http://", "https://")):
+        raise ValueError(f"url must be an http(s) URL, got: {url!r}")
+    expected = _parse_checksum(checksum) if checksum is not None else None
+
+    data = await asyncio.to_thread(_fetch_url_bytes, url)
+    if expected is not None:
+        algorithm, digest = expected
+        actual = hashlib.new(algorithm, data).hexdigest().lower()
+        if actual != digest:
+            raise ValueError(
+                f"checksum mismatch for {url}: expected {algorithm} {digest}, "
+                f"got {actual}"
+            )
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"{url} is not valid UTF-8 text; files.fetch_url and files.download "
+            "return text content only (a binary body -- a .rpm, a tarball -- "
+            "stays files.put's job: fetch it control-side into an io.BytesIO "
+            "and put it into a login-writable path)"
+        ) from exc
 
 
 async def download(
@@ -3124,9 +3202,12 @@ async def download(
     # install a host-side (binary) file, not because reemote cannot download.
     #
     # The write is delegated to ``files.install`` (the project's rule for a
-    # derived content-producing files operation): the body fetches the URL
-    # *control-side*, verifies the optional checksum, decodes the bytes to
-    # text, and hands the string to install -- which re-reads ``FileContents``
+    # derived content-producing files operation) and the fetch half to
+    # ``files.fetch_url`` (the control-side content-returning helper, so the
+    # scheme guard, checksum contract and text-only decode are shared, not
+    # duplicated): fetch_url fetches the URL *control-side*, verifies the
+    # optional checksum, decodes the bytes to text, and download hands the
+    # returned string to install -- which re-reads ``FileContents``
     # (served from the same phase ``FactCache``, no second host round-trip),
     # yields nothing when the text already equals the file's content, validates
     # ``mode`` (raising ``ValueError`` on a non-octal-digit string), derives the
@@ -3164,28 +3245,7 @@ async def download(
     # (or ``su=True``); the spool transfer stays unprivileged regardless.
     # ``**kwargs`` absorbs any further global arguments (``op()`` already strips
     # ``name``/``sudo``/``su``).
-    if not url.startswith(("http://", "https://")):
-        raise ValueError(f"url must be an http(s) URL, got: {url!r}")
-    expected = _parse_checksum(checksum) if checksum is not None else None
-
-    data = await asyncio.to_thread(_fetch_url_bytes, url)
-    if expected is not None:
-        algorithm, digest = expected
-        actual = hashlib.new(algorithm, data).hexdigest().lower()
-        if actual != digest:
-            raise ValueError(
-                f"checksum mismatch for {url}: expected {algorithm} {digest}, "
-                f"got {actual}"
-            )
-    try:
-        content = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            f"{url} is not valid UTF-8 text; files.download installs text "
-            "content only (a binary body -- a .rpm, a tarball -- stays "
-            "files.put's job: fetch it control-side into an io.BytesIO and "
-            "put it into a login-writable path)"
-        ) from exc
+    content = await fetch_url(url, checksum=checksum)
 
     async for command in install(
         ctx,
@@ -3815,6 +3875,7 @@ __all__ = [
     "directory",
     "download",
     "edit",
+    "fetch_url",
     "file",
     "flags",
     "get",

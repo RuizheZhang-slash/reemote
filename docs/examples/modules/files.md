@@ -342,8 +342,9 @@ body at a root-owned `dest` in one `sudo=True` request, retiring the hand-rolled
 force (each *rejects* a URL `src`). The fetch is *control-side* — the control
 machine opens the connection (`urllib` in a worker thread), not the target host,
 so the download works when only the control side has internet egress and the host
-never needs `curl`/`wget`. The body decodes the fetched bytes to text and
-delegates the write to `files.install`, so a download inherits install's
+never needs `curl`/`wget`. The body delegates the fetch to `files.fetch_url`
+(which verifies the optional checksum and decodes the bytes to text) and the
+write to `files.install`, so a download inherits install's
 content-only idempotence, its dest-derived `/tmp` spool, its owner/mode handling,
 its optional `validate` hook and its two-privilege-level signature (unprivileged
 scp transfer + elevated `sh -c` install). The optional `checksum` is Ansible's
@@ -364,6 +365,37 @@ published value. See
 for the `get_url`/`rpm_key` mapping.
 
 ::: files_download
+    options:
+      members: []
+
+## Fetching a URL's content control-side
+
+`files.fetch_url` (a reemote original) is the control-side GET helper —
+Ansible's `uri` with `return_content: true` mapped to a plain coroutine: it
+fetches an `http(s)` URL on the *control* machine (`urllib` in a worker
+thread, the same seam `files.download` rides) and hands the response body
+back to the program as UTF-8 text, instead of installing it at a remote path.
+It is **not an operation** — no `OpContext`, never `op()` — so the
+determinism recipe is to await it once in `main()` and freeze the returned
+text into the per-host plan the deploy consumes. The example is the
+geerlingguy.composer signature shape: `main()` fetches the installer's SHA-384
+signature from `composer.github.io` (the `return_content` payoff — the body
+is a plain `str` the program prints and freezes), the `build_installer`
+factory closes over it, and one `files.download` request lands the installer
+at `/tmp/composer-installer.php` with `mode="0755"` and
+`checksum=f"sha384:{signature}"` — the pin that makes both phases install
+byte-identical content. `/tmp` is login-writable, so no `sudo` is needed. The
+optional `checksum` is verified before the caller sees the content, a
+`file:`/`ftp:` scheme raises before any fetch, and a binary body raises
+`ValueError` (text only — a binary download stays `files.put`'s job). The
+script runs the same deploy twice to show the second reporting no change.
+Unlike the `files_download` sibling it passes a live checksum: the fetched
+signature *is* the pin. On-target HTTP —
+a POST, a webhook — stays a `Shell` action outside the deploy. See
+[Migrating a content-returning GET](../../migrating.md#migrating-a-content-returning-get-uri)
+for the `uri`/`return_content` mapping.
+
+::: files_fetch_url
     options:
       members: []
 

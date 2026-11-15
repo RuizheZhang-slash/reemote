@@ -1048,6 +1048,10 @@ read the path `files.download` wrote.
 The runnable version of this — the two Docker CE downloads, run twice to prove
 the second is a no-op — is the
 [`files.download` example](examples/modules/files.md#downloading-a-url-to-a-root-owned-path).
+The companion shape — a role that needs the response *body back in the
+program* rather than installed at a path (Ansible's `uri` with
+`return_content: true`) — is
+[Migrating a content-returning GET](#migrating-a-content-returning-get-uri) below.
 
 ### What to watch
 
@@ -1073,6 +1077,131 @@ the second is a no-op — is the
   always rides as the login user into world-writable `/tmp`; only the `sh -c`
   install that overlays the protected file elevates — the same trade-off every
   spool-and-install operation makes.
+
+## Migrating a content-returning GET (uri)
+
+Ansible's `uri` module with `return_content: true` performs an HTTP request and
+hands the response body back to the play as a registered variable. The
+geerlingguy.composer role is the canonical case: a `uri` task fetches the
+Composer installer's SHA-384 signature from `composer.github.io`, and the
+registered `.content` then pins the installer download
+(`checksum: "sha384:{{ composer_installer_signature.content }}"`). The
+`get_url` half maps to [`files.download`][reemote.modules.files.files.download]
+above; the `uri` half — an HTTP fetch whose *body returns to the program* —
+maps to [`files.fetch_url`][reemote.modules.files.files.fetch_url].
+
+`files.fetch_url(url, *, checksum=None) -> str` is a **control-side helper, not
+an operation**: a plain coroutine you await from `main()` (or any control-side
+code), never through [`op(...)`][reemote.core.op]. It fetches the `http(s)` URL
+on the *control* machine (`urllib` in a worker thread — the same seam
+`files.download` rides, which delegates its fetch half to it), verifies the
+optional Ansible-style `"<algorithm>:<hexdigest>"` checksum against the raw
+bytes, and returns the body decoded as UTF-8. The determinism recipe is
+**fetch once, then freeze**: await it once in `main()` and close the returned
+text into the per-host plan the deploy consumes, so both deploy phases build
+identical requests from the same frozen string.
+
+### The mapping
+
+| Ansible | reemote |
+| --- | --- |
+| `uri: {url, return_content: true}` (a GET) | `await files.fetch_url(url)` in `main()` — the body comes back as a `str` |
+| `register: sig` + `{{ sig.content }}` | an ordinary Python variable — freeze it into the deploy factory |
+| the signature-pinned `get_url` follow-up | [`files.download(checksum=f"sha384:{signature}")`][reemote.modules.files.files.download] — the same `"<algorithm>:<hexdigest>"` spelling |
+| `uri` running **on each target host** | the *controller* fetches once for all targets (the same HTTPS trust model); on-target HTTP stays a [`Shell`][reemote.actions.Shell] action outside the deploy |
+| full `uri` parity (POST/PUT, headers, body, status-code handling) | out of scope for this helper — an op-level HTTP surface is tracked separately if POST/webhook use cases materialize |
+
+### The process
+
+1. **Fetch once in `main()`.** `signature = (await files.fetch_url(SIG_URL)).strip()`
+   — one control-side GET per program run, before any deploy. Pass
+   `checksum="<algorithm>:<hexdigest>"` when the artifact has a published
+   digest; a mismatch raises `ValueError` before the caller sees the content.
+2. **Freeze the text into the plan.** Build the deploy with a factory closing
+   over the fetched `str` (the same frozen-plan shape the
+   [host_vars](#migrating-host_vars) and handler recipes use). Never fetch
+   inside the deploy generator: the body runs once per phase per host, and a
+   URL whose body changes mid-run would plan one value and apply another.
+3. **Consume the frozen text.** The composer shape feeds it to
+   `files.download(checksum=f"sha384:{signature}")`; other roles feed a fetched
+   config to `files.install(content=...)` or branch on it between deploys.
+4. **Gate the fetch as the role gated the task.** The composer role runs the
+   `uri` task `when: not composer_bin.stat.exists` — gather the
+   already-installed state first (a fact deploy or a `Shell` probe) and skip
+   the fetch when no target needs it.
+
+### Before / after
+
+```yaml
+# Ansible -------------------------------------------------------------
+# roles/composer/tasks/main.yml
+- name: Get Composer installer signature.
+  uri:
+    url: https://composer.github.io/installer.sig
+    return_content: true
+  register: composer_installer_signature
+  when: not composer_bin.stat.exists
+
+- name: Download Composer installer.
+  get_url:
+    url: https://getcomposer.org/installer
+    dest: /tmp/composer-installer.php
+    mode: '0755'
+    checksum: "sha384:{{ composer_installer_signature.content }}"
+  when: not composer_bin.stat.exists
+```
+
+```python
+# reemote -------------------------------------------------------------
+import asyncio
+from reemote import files, op, run
+
+SIG_URL = "https://composer.github.io/installer.sig"
+INSTALLER_URL = "https://getcomposer.org/installer"
+
+def build_installer(signature):
+    def deploy(host):
+        yield op(files.download, name="Download Composer installer",
+                 url=INSTALLER_URL, dest="/tmp/composer-installer.php",
+                 mode="0755", checksum=f"sha384:{signature}")
+    return deploy
+
+async def main():
+    # The uri return_content half: one control-side GET, frozen into the plan.
+    signature = (await files.fetch_url(SIG_URL)).strip()
+    await run(inventory, build_installer(signature))
+
+asyncio.run(main())
+```
+
+The registered variable becomes an ordinary `str`: the `uri` task is the
+`await files.fetch_url(...)` line, and the `get_url` task is the
+checksum-pinned `files.download` request the factory yields. The runnable
+version — signature fetch, pinned download, second-run no-op — is the
+[`files.fetch_url` example](examples/modules/files.md#fetching-a-urls-content-control-side).
+
+### What to watch
+
+- **The fetch is control-side and once per run.** Ansible's `uri` runs on each
+  target, per run; the helper fetches on the controller, once for all targets.
+  The trust model is the same (HTTPS to the vendor), but the *controller* needs
+  egress to the URL. That is the deliberate trade-off — no host `curl`/`wget`,
+  and one fetch instead of one per host per phase.
+- **Not an operation.** `fetch_url` takes no `OpContext` and never enters an
+  `OperationRequest`, so the request hashability rule does not apply to the
+  helper call itself — but the text you freeze into `op(...)` arguments must
+  stay hashable, and a `str` is. On-target HTTP (a POST, a webhook, a GET that
+  must run on the host) stays a [`Shell`][reemote.actions.Shell] action driven
+  by [`gather_action`](guide.md#actions), outside any deploy.
+- **Text only, `http(s)` only.** A binary body raises `ValueError` (fetch it
+  control-side into an `io.BytesIO` and
+  [`files.put`][reemote.modules.files.files.put] it into a login-writable
+  path); a `file:`/`ftp:` scheme raises before any fetch.
+- **The checksum pin is the determinism guarantee.** Without it, a URL whose
+  body changes between the fetch and a later re-fetch would feed different
+  values to different phases. The composer shape pins the *download* with the
+  fetched signature; the signature fetch itself is the root of trust and runs
+  once, so both phases consume the same frozen digest.
 
 ## Migrating a build-from-source role
 

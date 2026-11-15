@@ -31,6 +31,7 @@
         - directory
         - download
         - edit
+        - fetch_url
         - file
         - flags
         - get
@@ -368,7 +369,8 @@ install a host-side binary file, not because reemote cannot download). The fetch
 opens the connection (`urllib` in a worker thread), not the target host, so the
 download works when only the control side has internet egress and the host never
 needs `curl`/`wget` (the opposite of Ansible's `get_url`, which fetches on the
-target). The body decodes the fetched bytes to text and delegates the write to
+target). The body delegates the fetch to `files.fetch_url` below (which
+verifies the optional checksum and decodes the bytes to text) and the write to
 `files.install` above, so a download inherits install's content-only idempotence
 (a converged file yields zero commands), its dest-derived `/tmp` spool, its
 owner/mode handling, its optional `validate` hook and its two-privilege-level
@@ -390,6 +392,26 @@ under `/etc` needs root, so flag the request `sudo=True`; the spool transfer
 stays unprivileged regardless. See
 [Migrating a URL download](../migrating.md#migrating-a-url-download-get_url)
 for the `get_url`/`rpm_key` mapping.
+
+`files.fetch_url` is the control-side GET helper and a reemote original: it
+fetches an `http(s)` `url` on the *control* machine (`urllib` in a worker
+thread, the same seam `files.download` rides) and returns the response body
+to the program as UTF-8 text — Ansible's `uri` with `return_content: true`
+mapped to a plain coroutine. It is **not an operation**: it takes no
+`OpContext`, is never passed to `op()`, and is called from `main()` (or any
+control-side code), so the determinism recipe is to fetch once and freeze the
+returned text into the per-host plan the deploy consumes — the composer
+installer-signature shape, where a fetched sha384 digest becomes
+`files.download(checksum=f"sha384:{signature}")`'s pin. `files.download`
+delegates its fetch half here, so the two share one scheme guard (a
+`file:`/`ftp:` scheme raises `ValueError` before any fetch), one Ansible-style
+`checksum` contract (an optional `"<algorithm>:<hexdigest>"` verified against
+the raw bytes before the caller sees the content) and one text-only decode (a
+binary body raises `ValueError` and stays `files.put`'s job). On-target HTTP —
+a POST, a webhook, anything that must run on the host — stays a `Shell`
+action outside the deploy. See
+[Migrating a content-returning GET](../migrating.md#migrating-a-content-returning-get-uri)
+for the `uri`/`return_content` mapping.
 
 `files.move` mirrors the baseline's `files.move`: `src` is a remote path, `dest`
 is the remote *directory* to move it into (the moved path becomes

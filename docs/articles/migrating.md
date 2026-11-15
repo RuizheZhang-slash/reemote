@@ -109,6 +109,7 @@ That completeness is what makes translation near-mechanical:
 | `lineinfile` / `blockinfile` | `files.edit` / `files.transform` |
 | `file` (mode/owner/state) | `files.file`, `files.directory`, `files.link` |
 | `get_url` | `files.download` |
+| `uri` (`return_content: true` GET) | `files.fetch_url` (control-side helper) |
 | `stat` | the file metadata, existence, and hash facts |
 | `service` / `systemd` | `systemd.service` |
 | `notify` + handler | two deploys + `changed_hosts` / `restart_handler` |

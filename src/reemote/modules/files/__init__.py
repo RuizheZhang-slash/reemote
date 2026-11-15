@@ -6,7 +6,8 @@
 Re-exports everything from ``files.py`` so the operations (``files.link``,
 ``files.file``, ``files.put``, ``files.get``, ``files.edit``,
 ``files.install``, ``files.transform``, ``files.download``, ``files.move``,
-``files.copy``, ``files.directory`` and ``files.flags``) and the facts
+``files.copy``, ``files.directory`` and ``files.flags``), the control-side
+content-fetch helper (``files.fetch_url``) and the facts
 (``files.FileLink``, ``files.FileExists``,
 ``files.RemoteFileSha1``, ``files.Sha256File``, ``files.Sha384File``,
 ``files.Md5File``, ``files.FileContents``, ``files.FileFlags``,
@@ -60,6 +61,7 @@ from .files import (
     directory,
     download,
     edit,
+    fetch_url,
     file,
     flags,
     get,
@@ -111,6 +113,7 @@ __all__ = [
     "directory",
     "download",
     "edit",
+    "fetch_url",
     "file",
     "files",
     "flags",
