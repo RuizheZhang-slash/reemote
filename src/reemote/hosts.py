@@ -670,8 +670,8 @@ class Host:
     first-class can still be supplied through the ``asyncssh_connect_kwargs``
     mapping, which is merged last. A connection is opened lazily on first
     use and cached on the instance; ``SimulatedHost`` never triggers this
-    because it overrides the ``execute_command``/``packages``/``links``
-    seams instead.
+    because it overrides the ``execute_command``/``_run_shell``/
+    ``packages``/``links`` seams instead.
     """
 
     name: str
@@ -731,8 +731,8 @@ class Host:
     # connection is opened lazily on first use and cached in ``_conn`` (a
     # non-field attribute, so it stays out of the dataclass constructor,
     # equality and repr). The test framework's SimulatedHost provides the
-    # execute_command/packages/links/remote_files seams instead, so it never
-    # reaches here.
+    # execute_command/_run_shell/packages/links/remote_files seams instead,
+    # so it never reaches here.
 
     def _connect_options(self) -> tuple[str, dict[str, Any]]:
         """Build ``(address, kwargs)`` for ``asyncssh.connect``.

@@ -46,19 +46,16 @@ load-bearing, not stylistic:
    notifying names, split by ``apache_restart_state`` into
    ``service_handler(action="restarted"|"reloaded")``
 
-Implementation gaps
--------------------
+Implementation notes
+--------------------
 
-One genuine gap was proven while mapping the role. It is a *test-framework*
-gap, feature-only and workaroundable, so the migration completes; a second
-pass will retire the workaround once the library extension lands:
-
-* GAP-1 (#16) -- ``SimulatedHost`` exposes no ``_run_shell`` action transport
-  seam, so the ``Shell`` version probe cannot be gathered offline. The real
-  ``Host`` runs it fine; only the offline test needs a shim. The workaround is
-  a test-local ``SimulatedHost`` subclass overriding ``_run_shell`` (the
-  ``ActionHost`` pattern from ``tests/test_actions.py``), marked ``GAP-1`` in
-  ``tests/test_roles_ansible_role_apache.py``.
+The one gap proven while mapping the role was a *test-framework* one:
+``SimulatedHost`` exposed no ``_run_shell`` action transport seam (#16), so
+the ``Shell`` version probe could not be gathered offline. It is closed --
+the class now answers ``gather_action``'s ``Shell``/``Script`` gathers from
+a seeded ``shell_results`` map (``tests/test_simulated_host.py`` proves the
+seam), and ``tests/test_roles_ansible_role_apache.py`` seeds the
+``apache2 -v`` record there instead of its former ``_run_shell`` shim.
 
 Everything else mapped to a covered operation or a documented recipe; the
 deliberate deviations (symlink modes dropped, ``no_log`` boundary, the
@@ -794,9 +791,9 @@ async def main() -> None:
         await execute(inventory, deploy_install, "Deploy 1: install Apache")
 
         # The version probe, AFTER the install apply so the binary exists.
-        # gather_action closes its own hosts. GAP-1 (#16): offline verification
-        # of this Shell gather needs the SimulatedHost._run_shell shim in
-        # tests/test_roles_ansible_role_apache.py -- the real Host runs it fine.
+        # gather_action closes its own hosts. On the real transport this is a
+        # plain SSH command; offline, tests/test_roles_ansible_role_apache.py
+        # seeds the answer in SimulatedHost.shell_results (the #16 action seam).
         probe = f"{DEBIAN_VARS['daemon_path']}{DEBIAN_VARS['daemon']} -v"
         results = await gather_action(targets, Shell, command=probe)
         versions = {}

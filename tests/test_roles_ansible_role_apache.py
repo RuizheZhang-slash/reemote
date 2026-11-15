@@ -18,26 +18,21 @@ DataDog migration, no between-pass bridge is needed here: every subsystem
 the deploys touch (apt's update stamp, the file/link stores, systemd's
 service state) is maintained by the simulation's own mutators.
 
-One simulation limit is bridged by a test-local subclass:
+The version probe is answered offline by the first-class action seam (#16):
+``seed()`` plants the canned ``apache2 -v`` record in ``host.shell_results``
+and ``gather_action(targets, Shell, ...)`` reads it through
+``SimulatedHost._run_shell`` -- every shell the seam ran is recorded in
+``ran_shells``, which the exactly-once assertions below read.
 
-* GAP-1 (#16) -- ``SimulatedHost`` exposes no ``_run_shell`` action
-  transport seam, so the ``Shell`` version probe (``apache2 -v``) cannot be
-  gathered offline. ``ApacheSimulatedHost`` below overrides ``_run_shell``
-  with a canned completion record -- the ``ActionHost`` pattern from
-  ``tests/test_actions.py``. When #16 lands, the subclass is replaced by the
-  first-class seam (the example's second pass).
-
-A second bridge is a seeding choice, not a subclass: the simulated apt
-install does not materialize a package's own files, so ``ports.conf``, the
-default-vhost symlink and the ``/etc/apache2`` directory tree are seeded as
-the package's post-install state -- the configure deploy runs after the
-install apply, when a real machine has them.
+Another seeding choice, not a bridge: the simulated apt install does not
+materialize a package's own files, so ``ports.conf``, the default-vhost
+symlink and the ``/etc/apache2`` directory tree are seeded as the package's
+post-install state -- the configure deploy runs after the install apply,
+when a real machine has them.
 """
 
 import importlib.util
-from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -80,26 +75,6 @@ VHOSTS_FILE = f"{SITES_AVAILABLE}/vhosts.conf"
 VHOSTS_LINK = f"{SITES_ENABLED}/vhosts.conf"
 CERT_FILE = "/etc/ssl/certs/secure.pem"
 KEY_FILE = "/etc/ssl/private/secure.key"
-
-
-@dataclass
-class ApacheSimulatedHost(SimulatedHost):
-    """GAP-1 (#16) workaround: a ``SimulatedHost`` that can answer the probe.
-
-    ``SimulatedHost`` provides the fact seams and ``execute_command`` but no
-    ``_run_shell`` action transport seam, so ``gather_action(..., Shell, ...)``
-    would reach the real asyncssh transport. This override answers the
-    ``apache2 -v`` probe with a canned completion record (the ``ActionHost``
-    pattern from ``tests/test_actions.py``) and records every shell it sees,
-    so the test can assert the probe ran exactly once per pass. When #16
-    lands, this subclass is replaced by the first-class seam.
-    """
-
-    probe_shells: list[str] = field(default_factory=list)
-
-    async def _run_shell(self, shell: str) -> Any:
-        self.probe_shells.append(shell)
-        return SimpleNamespace(exit_status=0, stdout=VERSION_STDOUT, stderr="")
 
 
 def make_inventory(**overrides: Any) -> list[dict[str, Any]]:
@@ -184,13 +159,21 @@ def seed(host: SimulatedHost) -> None:
     }
     host.services = {}
     host.enabled_services = set()
+    # The version probe rides the first-class action seam (#16): the exact
+    # shell ``gather_action`` renders is the key, and the canned record is
+    # the ``apache2 -v`` answer the version-table selection consumes.
+    host.shell_results[PROBE] = {
+        "exit_status": 0,
+        "stdout": VERSION_STDOUT,
+        "stderr": "",
+    }
 
 
-def make_hosts(inventory: list[dict[str, Any]]) -> dict[str, ApacheSimulatedHost]:
+def make_hosts(inventory: list[dict[str, Any]]) -> dict[str, SimulatedHost]:
     """Materialize the inventory into persistent simulated hosts, seeded targets."""
-    hosts: dict[str, ApacheSimulatedHost] = {}
+    hosts: dict[str, SimulatedHost] = {}
     for entry in inventory:
-        host = ApacheSimulatedHost.from_inventory(entry)
+        host = SimulatedHost.from_inventory(entry)
         if apache.is_ubuntu(host):
             seed(host)
         hosts[host.name] = host
@@ -199,7 +182,7 @@ def make_hosts(inventory: list[dict[str, Any]]) -> dict[str, ApacheSimulatedHost
 
 async def migrate(
     inventory: list[dict[str, Any]],
-    hosts: dict[str, ApacheSimulatedHost],
+    hosts: dict[str, SimulatedHost],
     *,
     dry: bool = True,
 ) -> dict[str, Any]:
@@ -213,7 +196,7 @@ async def migrate(
     settings = {host.name: apache.role_settings(host) for host in targets}
     reports: list[Any] = []
 
-    def factory(entry: dict[str, Any]) -> ApacheSimulatedHost:
+    def factory(entry: dict[str, Any]) -> SimulatedHost:
         # The *same* host object every run, so state survives the barriers.
         return hosts[entry["host"]]
 
@@ -228,7 +211,7 @@ async def migrate(
     # Deploy 1: the apt cache refresh and the packages.
     await execute(apache.deploy_install)
 
-    # The version probe, after the install apply (GAP-1: the shim answers it).
+    # The version probe, after the install apply (the seeded seam answers it).
     results = await gather_action(targets, Shell, command=PROBE)
     versions = {}
     for host in targets:
@@ -277,7 +260,7 @@ async def migrate(
 
 
 @pytest.fixture
-def rig() -> tuple[list[dict[str, Any]], dict[str, ApacheSimulatedHost]]:
+def rig() -> tuple[list[dict[str, Any]], dict[str, SimulatedHost]]:
     """An inventory plus the persistent simulated hosts it materializes into."""
     inventory = make_inventory()
     return inventory, make_hosts(inventory)
@@ -302,7 +285,7 @@ async def test_first_pass_installs_and_configures_apache(rig):
     assert host.apt_update_stamp is not None
 
     # The probe ran once, and its version selected the 2.4 variable table.
-    assert host.probe_shells == [PROBE]
+    assert host.ran_shells == [PROBE]
     assert result["versions"] == {"ubuntu": "2.4.58"}
     assert result["plans"]["ubuntu"]["default_vhost_filename"] == "000-default.conf"
 
@@ -359,7 +342,7 @@ async def test_non_ubuntu_host_is_never_touched(rig):
     assert skipped.apt_packages == {}
     assert skipped.links == {}
     assert skipped.services == {}
-    assert skipped.probe_shells == []
+    assert skipped.ran_shells == []
     for report in result["reports"]:
         for entry in report.log:
             if entry.host == "web1":
@@ -400,7 +383,7 @@ async def test_second_pass_changes_nothing_and_queues_no_handler(rig):
     # The handler deploy still runs, but it holds no request for any host:
     # nothing is restarted on a converged machine.
     assert not any(entry.changed for entry in second["handler_report"].log)
-    assert hosts["ubuntu"].probe_shells == [PROBE, PROBE]
+    assert hosts["ubuntu"].ran_shells == [PROBE, PROBE]
 
 
 async def test_dry_preview_mutates_nothing(rig):
@@ -411,7 +394,7 @@ async def test_dry_preview_mutates_nothing(rig):
     before_links = dict(host.links)
     before_services = dict(host.services)
 
-    def factory(entry: dict[str, Any]) -> ApacheSimulatedHost:
+    def factory(entry: dict[str, Any]) -> SimulatedHost:
         return hosts[entry["host"]]
 
     settings = apache.role_settings(host)
@@ -507,7 +490,7 @@ def test_ports_items_follow_the_version_tables():
 
 def test_configure_plan_rejects_an_unsupported_version():
     inventory = make_inventory()
-    host = ApacheSimulatedHost.from_inventory(inventory[0])
+    host = SimulatedHost.from_inventory(inventory[0])
     settings = apache.role_settings(host)
     with pytest.raises(ValueError, match="unsupported Apache version"):
         apache.configure_plan(settings, "2.0.65", ())

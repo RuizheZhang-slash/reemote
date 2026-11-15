@@ -17,6 +17,15 @@ a real asyncssh transport is missing:
   takes the real-transport path instead, dispatching on the descriptor kind:
   ``transfer`` for a ``TransferCommand``, ``wait`` for a ``WaitCommand``, and
   the rendered shell over asyncssh for anything else.
+- ``_run_shell(shell)``: the action-transport seam ``gather_action``'s
+  ``Shell``/``Script`` fan-out reaches through
+  ``run_shell_result``/``run_shell_privileged_result``. The override below
+  records every shell verbatim in ``ran_shells`` and answers from
+  ``shell_results`` (the exact shell string -> a ``Result``-shaped record,
+  the command-keyed convention of ``find_results``/``grep_files``); an
+  unseeded command raises ``UnseededShellResult`` rather than silently
+  succeeding. Without the override the same call reaches the real transport
+  (``Host._run_shell`` -> ``connect()`` -> asyncssh).
 - ``packages`` / ``links`` / ``existing_files`` / ``file_stats`` /
   ``file_flags`` / ``directory_stats`` / ``directory_entries`` /
   ``link_stats`` / ``socket_stats`` / ``same_files`` /
@@ -158,8 +167,10 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
+from types import SimpleNamespace
 from typing import Any
 
+from reemote.actions import Result
 from reemote.commands import Command, StringCommand, WaitTimeoutError
 from reemote.hosts import CommandError, Host
 from reemote.modules.apk.apk import (
@@ -525,14 +536,29 @@ from reemote.modules.ufw.ufw import (
 )
 
 
+class UnseededShellResult(Exception):
+    """A simulated host was asked to run an action shell with no seeded answer.
+
+    ``SimulatedHost._run_shell`` answers ``gather_action``'s ``Shell`` and
+    ``Script`` gathers from ``shell_results``, keyed by the exact shell
+    string. A command absent from that map raises this hard error -- never
+    a silent success -- so a new action read cannot pass unseeded. The shell
+    that reached the seam is in the message and recorded in ``ran_shells``;
+    seeding ``host.shell_results[shell]`` with a
+    ``{exit_status, stdout, stderr}`` record makes the gather pass.
+    """
+
+
 @dataclass
 class SimulatedHost(Host):
     """In-memory stand-in for a real machine.
 
     Inherits the inventory fields from ``Host`` and adds the state facts
-    read and ``execute_command`` mutates. Only ever constructed by
-    tests/examples (injected via ``run``'s ``host_factory``), never by the
-    library itself.
+    read and ``execute_command`` mutates, plus the ``_run_shell`` action
+    transport ``gather_action``'s ``Shell``/``Script`` gathers ride
+    (answered from ``shell_results``, recorded in ``ran_shells``). Only ever
+    constructed by tests/examples (injected via ``run``'s ``host_factory``),
+    never by the library itself.
     """
 
     # Installed dnf packages -- the state store the fact reads, kept as the
@@ -1859,6 +1885,52 @@ class SimulatedHost(Host):
     # step.
     installs_links: dict[str, dict[str, str]] = field(default_factory=dict)
     installs_files: dict[str, set[str]] = field(default_factory=dict)
+
+    # Canned action answers (the exact shell string -> the ``Result``-shaped
+    # ``{exit_status, stdout, stderr}`` record a ``gather_action`` call
+    # returns), backing ``_run_shell``. Keyed like ``find_results``: the key
+    # is the *exact* shell the action rendered -- the ``Shell`` ``command``
+    # verbatim (its ``env`` prefix included), a ``Script`` gather's full
+    # ``sh -c`` wrapper, an escalated gather's ``sudo``/``doas``/``su``
+    # rendering -- because a prefix-insensitive key could answer a different
+    # question than the one asked. A read-only seam: a test seeds it
+    # directly; no ``execute_command`` mutator maintains it.
+    shell_results: dict[str, Result] = field(default_factory=dict)
+    # Every shell string ``_run_shell`` has been asked to run, verbatim and
+    # in order. Lets a test prove an action ran -- and ran exactly once per
+    # pass -- and shows the exact key to seed when ``UnseededShellResult``
+    # fires. A recorder, not state: only the test reads it back.
+    ran_shells: list[str] = field(default_factory=list)
+
+    # Action transport seam: ``reemote.actions.gather_action``'s
+    # ``Shell``/``Script`` fan-out reaches it through
+    # ``run_shell_result``/``run_shell_privileged_result``. The command seam
+    # below is the apply-path counterpart.
+
+    async def _run_shell(self, shell: str) -> Any:
+        """Answer one action shell from the ``shell_results`` seam.
+
+        Overrides the inherited real transport (``Host._run_shell`` ->
+        ``connect()`` -> asyncssh) so ``gather_action``'s ``Shell`` and
+        ``Script`` fan-out runs offline. Every shell is recorded verbatim
+        in ``ran_shells``; the answer comes from ``shell_results`` keyed by
+        the exact shell string, and a command absent from the map raises
+        ``UnseededShellResult`` rather than silently succeeding -- a new
+        action read must never pass unseeded.
+        """
+        self.ran_shells.append(shell)
+        record = self.shell_results.get(shell)
+        if record is None:
+            raise UnseededShellResult(
+                f"host {self.name}: no shell_results entry for the action "
+                f"shell {shell!r} -- seed host.shell_results[{shell!r}] with "
+                "a {'exit_status': int, 'stdout': str, 'stderr': str} record"
+            )
+        return SimpleNamespace(
+            exit_status=record["exit_status"],
+            stdout=record["stdout"],
+            stderr=record["stderr"],
+        )
 
     # Command seam: reemote.drivers.send_command forwards here. The match
     # on the typed descriptors lives in the test framework, not the library.
@@ -6994,4 +7066,4 @@ class SimulatedHost(Host):
             )
 
 
-__all__ = ["SimulatedHost"]
+__all__ = ["SimulatedHost", "UnseededShellResult"]

@@ -1,0 +1,129 @@
+# Copyright (c) 2026 Kim Jarvis.
+# SPDX-License-Identifier: EPL-2.0
+
+"""Offline proof of the ``SimulatedHost`` action-transport seam (#16).
+
+``SimulatedHost`` used to expose only the fact/command seams, so a
+``gather_action(..., Shell, ...)`` against one reached the real asyncssh
+transport. The class now overrides ``_run_shell``: every shell is recorded
+verbatim in ``ran_shells`` and the answer comes from the ``shell_results``
+map keyed by the exact shell string -- the command-keyed convention of
+``find_results``/``grep_files``. An unseeded command is a hard error
+(``UnseededShellResult``), so a new action read can never silently pass.
+
+Covered: a seeded ``Shell`` gather returns the canned record offline (no
+socket, no asyncssh), an unseeded command raises ``UnseededShellResult``
+naming the shell to seed, the recorder accumulates every shell verbatim
+across gathers, a passwordless-elevated gather rides the same seam (its
+``sudo`` rendering is the key), and ``Script`` -- which delegates to
+``Shell.process`` -- answers from the seam keyed by its rendered
+``sh -c`` wrapper.
+"""
+
+import pytest
+
+from reemote import Script, Shell, gather_action
+from tests.simulated_host import SimulatedHost, UnseededShellResult
+
+PROBE = "/usr/sbin/apache2 -v"
+
+
+def make_host(**privilege: str) -> SimulatedHost:
+    """One simulated host, optionally carrying an inventory privilege block."""
+    return SimulatedHost.from_inventory(
+        {
+            "host": "sim1",
+            "connection": {"address": "192.0.2.10"},
+            "privilege": dict(privilege),
+        }
+    )
+
+
+async def test_seeded_shell_gather_answers_offline():
+    host = make_host()
+    host.shell_results[PROBE] = {
+        "exit_status": 0,
+        "stdout": "Server version: Apache/2.4.58 (Ubuntu)\n",
+        "stderr": "",
+    }
+
+    results = await gather_action([host], Shell, command=PROBE)
+
+    # The seeded record comes back whole, as the library-owned Result.
+    assert results["sim1"] == {
+        "exit_status": 0,
+        "stdout": "Server version: Apache/2.4.58 (Ubuntu)\n",
+        "stderr": "",
+    }
+    assert host.ran_shells == [PROBE]
+
+
+async def test_unseeded_command_is_a_hard_error():
+    host = make_host()
+
+    with pytest.raises(UnseededShellResult) as excinfo:
+        await gather_action([host], Shell, command="bespoke-tool --version")
+
+    # The error names the shell to seed and the seam to seed it in.
+    message = str(excinfo.value)
+    assert "bespoke-tool --version" in message
+    assert "shell_results" in message
+    assert host.ran_shells == ["bespoke-tool --version"]
+
+
+async def test_recorder_accumulates_every_shell_verbatim():
+    host = make_host()
+    host.shell_results["first --probe"] = {
+        "exit_status": 0,
+        "stdout": "",
+        "stderr": "",
+    }
+    host.shell_results["second --probe"] = {
+        "exit_status": 1,
+        "stdout": "",
+        "stderr": "boom",
+    }
+
+    first = await gather_action([host], Shell, command="first --probe")
+    second = await gather_action([host], Shell, command="second --probe")
+
+    assert first["sim1"]["exit_status"] == 0
+    assert second["sim1"]["exit_status"] == 1
+    assert second["sim1"]["stderr"] == "boom"
+    assert host.ran_shells == ["first --probe", "second --probe"]
+
+
+async def test_sudo_gather_rides_the_same_seam():
+    """The escalated rendering is the key: the sudo command, not the bare one."""
+    host = make_host(sudo_user="root")
+    host.shell_results["sudo id -u"] = {
+        "exit_status": 0,
+        "stdout": "root\n",
+        "stderr": "",
+    }
+
+    results = await gather_action([host], Shell, command="id -u", sudo=True)
+
+    assert results["sim1"]["stdout"] == "root\n"
+    assert host.ran_shells == ["sudo id -u"]
+
+
+async def test_script_rides_the_seam_via_its_rendered_wrapper():
+    """Script delegates to Shell.process, so the key is its full sh -c wrapper.
+
+    The failed first gather doubles as the workflow demo: the recorder shows
+    the exact key to seed, the seed makes the second gather pass.
+    """
+    host = make_host()
+
+    with pytest.raises(UnseededShellResult):
+        await gather_action([host], Script, path="/tmp/setup.sh")
+
+    wrapper = host.ran_shells[0]
+    assert wrapper.startswith("sh -c ")
+    host.shell_results[wrapper] = {"exit_status": 0, "stdout": "ran\n", "stderr": ""}
+
+    results = await gather_action([host], Script, path="/tmp/setup.sh")
+
+    assert results["sim1"]["stdout"] == "ran\n"
+    assert host.ran_shells == [wrapper, wrapper]

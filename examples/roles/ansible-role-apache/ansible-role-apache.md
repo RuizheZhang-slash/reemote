@@ -240,26 +240,28 @@ shape change), **workaround** (possible with a recorded deviation).
 ## 6. Implementation gaps
 
 One genuine gap was proven (absence protocol: full surface enumeration +
-identifier greps, re-proved at report time). It is tracked as
-**[GAP-1 (#16)](https://github.com/kimjarvis/reemote/issues/16)**.
+identifier greps, re-proved at report time), tracked as
+**[GAP-1 (#16)](https://github.com/kimjarvis/reemote/issues/16)** — now
+closed:
 
-### GAP-1 (#16) — `SimulatedHost` has no action transport seam
+### GAP-1 (#16) — `SimulatedHost` had no action transport seam (closed)
 
 - **What**: `Shell`/`Script` actions gathered with `gather_action` ride
   `Host.run_shell_result` → `Host._run_shell` → real `asyncssh`.
-  `tests/simulated_host.py` provides `execute_command` (the command seam)
+  `tests/simulated_host.py` provided `execute_command` (the command seam)
   and the fact state seams, but no `_run_shell` override — so the version
-  probe cannot be gathered offline.
+  probe could not be gathered offline.
 - **Class**: genuine *test-framework* gap (the real `Host` runs the probe
-  fine). **Rank**: feature-only — it blocks offline verification, never the
-  migration itself.
-- **Workaround (in use)**: `tests/test_roles_ansible_role_apache.py` defines
-  a test-local `SimulatedHost` subclass overriding `_run_shell` with a
-  canned `apache2 -v` completion record — the `ActionHost` pattern from
-  `tests/test_actions.py`. Marked `GAP-1` at the subclass and at the probe
-  in the program's `main()`.
-- **Second pass**: when #16 lands (a first-class action seam on
-  `SimulatedHost`), delete the subclass and use the seam directly (§10).
+  fine). **Rank**: feature-only — it blocked offline verification, never
+  the migration itself.
+- **Resolution**: `SimulatedHost` now overrides `_run_shell`, answering
+  `gather_action`'s `Shell`/`Script` gathers from a seeded `shell_results`
+  map (the exact shell string is the key; an unseeded command is a hard
+  `UnseededShellResult` error) and recording every shell in `ran_shells`.
+  The seam is proven in `tests/test_simulated_host.py`; the former
+  test-local `ApacheSimulatedHost` shim is retired — `seed()` plants the
+  canned `apache2 -v` record and the exactly-once assertions read
+  `ran_shells`.
 
 Everything else mapped to a covered operation or a documented recipe; the
 non-gaps considered and rejected during the audit (symlink `mode`, `no_log`,
@@ -333,8 +335,10 @@ pass 2 observes pass 1). It proves:
   (`lineinfile_transform` fixpoint, `parse_apache_version`, the 2.2/2.4
   ports items) are unit-tested directly.
 
-The GAP-1 workaround (the `_run_shell` shim) is what lets the version probe
-run offline; the simulation bridges are documented in the test docstring.
+The version probe runs offline through the first-class `SimulatedHost`
+action seam (#16): `seed()` plants the canned `apache2 -v` record in
+`shell_results`; the remaining seeding choices are documented in the test
+docstring.
 
 ## 9. Scoped out
 
@@ -348,14 +352,16 @@ run offline; the simulation bridges are documented in the test docstring.
 
 ## 10. Second pass
 
-When [GAP-1 (#16)](https://github.com/kimjarvis/reemote/issues/16) is resolved:
+Done. The [GAP-1 (#16)](https://github.com/kimjarvis/reemote/issues/16)
+resolution landed:
 
-1. replace the test-local `ApacheSimulatedHost` shim in
-   `tests/test_roles_ansible_role_apache.py` with the new first-class
-   `SimulatedHost` action seam (seed the canned `apache2 -v` record);
-2. remove the `GAP-1` markers from the test and from the program's `main()`
-   comment and module docstring;
-3. re-run the gates: `uv run pytest tests/ -q`, `uv run ruff check .`, and
-   the two-pass no-op proof.
+1. the test-local `ApacheSimulatedHost` shim in
+   `tests/test_roles_ansible_role_apache.py` is replaced by the first-class
+   `SimulatedHost` action seam (`seed()` plants the canned `apache2 -v`
+   record in `shell_results`);
+2. the `GAP-1` markers are gone from the test and from the program's
+   `main()` comment and module docstring;
+3. the gates were re-run: `uv run pytest tests/ -q`, `uv run ruff check .`,
+   and the two-pass no-op proof.
 
-No program behaviour changes are expected — the gap is test-framework-only.
+No program behaviour changed — the gap was test-framework-only.
