@@ -14,8 +14,8 @@ real-transport parity reuses the baseline's own fixtures verbatim (the canned
 including the injection-quoting case, and the noop reasons). The fifteen
 reemote-original facts have no upstream fixture, so they are exercised
 with realistic canned ``lxc --format json`` documents plus their parsing
-edge cases (empty output, the guarded single-target reads, the shared
-``lxc info`` command, the snapshots projection).
+edge cases (empty output, the guarded single-target reads, the guarded
+``lxc query`` REST reads, the snapshots projection).
 
 Every fact also reads its ``SimulatedHost`` seam with copy-on-read
 semantics, every descriptor's shell rendering is checked (remote prefix,
@@ -177,9 +177,7 @@ SNAPSHOT_ENTRY: LxdSnapshot = {
     "stateful": False,
 }
 STATE_DOC: LxdInstanceStateData = {
-    "name": "web1",
     "status": "Running",
-    "type": "container",
     "pid": 4242,
     "processes": 12,
     "memory": {"usage": 1024, "usage_peak": 2048},
@@ -196,8 +194,10 @@ STATE_DOC: LxdInstanceStateData = {
             "state": "up",
         }
     },
-    "snapshots": [SNAPSHOT_ENTRY],
 }
+# The recursive REST instance document the snapshots fact projects from
+# (lxc query ...?recursion=1): only the keys the projection touches.
+SNAPSHOTS_DOC = {"name": "web1", "snapshots": [SNAPSHOT_ENTRY]}
 NETWORK_ENTRY: LxdNetwork = {
     "name": "lxdbr0",
     "description": "",
@@ -235,15 +235,19 @@ PROJECT_ENTRY: LxdProject = {
     "config": {"features.images": "false", "features.profiles": "false"},
     "used_by": [],
 }
+# The REST /1.0 server document (lxc query /1.0): the server identity
+# and version live INSIDE environment, not at the top level.
 SERVER_INFO: LxdServerInfoData = {
-    "server": "lxd",
-    "server_version": "5.21",
     "api_version": "1.0",
     "api_status": "stable",
     "api_extensions": ["etag", "instances", "projects"],
     "auth": "trusted",
     "config": {},
-    "environment": {"kernel": "Linux", "server": "lxd"},
+    "environment": {
+        "kernel": "Linux",
+        "server": "lxd",
+        "server_version": "5.21",
+    },
 }
 SERVER_RESOURCES: LxdServerResourcesData = {
     "cpu": {"total": 8},
@@ -521,20 +525,20 @@ async def test_instances_reads_the_simulated_seam():
 # --- LxdInstanceConfig -------------------------------------------------------
 
 
-def test_instance_config_command_is_guarded_and_quotes_the_target():
+def test_instance_config_command_is_the_guarded_query_read():
+    # lxc config show has no --format flag: the config fact reads the
+    # REST instance resource through lxc query, the project riding in
+    # the URL. The plain GET already carries expanded_config/devices.
     assert LxdInstanceConfig.command("web1") == (
-        "lxc config show web1 --expanded --format json --project default"
-        " 2>/dev/null || true"
-    )
-    # The injection case: the instance name is shlex-quoted, never
-    # interpolated raw into the shell.
-    assert LxdInstanceConfig.command("a; rm -rf /") == (
-        "lxc config show 'a; rm -rf /' --expanded --format json"
-        " --project default 2>/dev/null || true"
+        "lxc query '/1.0/instances/web1?project=default' 2>/dev/null || true"
     )
     assert LxdInstanceConfig.command("web1", remote="prod", project="apps") == (
-        "lxc config show prod:web1 --expanded --format json --project apps"
-        " 2>/dev/null || true"
+        "lxc query 'prod:/1.0/instances/web1?project=apps' 2>/dev/null || true"
+    )
+    # A hostile name is percent-encoded into the URL path, never shell.
+    assert LxdInstanceConfig.command("a; rm -rf /") == (
+        "lxc query '/1.0/instances/a%3B%20rm%20-rf%20%2F?project=default' "
+        "2>/dev/null || true"
     )
 
 
@@ -562,15 +566,19 @@ async def test_instance_config_reads_the_simulated_seam():
 # --- LxdInstanceState --------------------------------------------------------
 
 
-def test_instance_state_command_is_the_guarded_info_read():
+def test_instance_state_command_is_the_guarded_query_read():
+    # lxc info has no --format flag: the state fact reads the REST
+    # state resource through lxc query, the project riding in the URL.
     assert LxdInstanceState.command("web1") == (
-        "lxc info web1 --format json --project default 2>/dev/null || true"
+        "lxc query '/1.0/instances/web1/state?project=default' 2>/dev/null || true"
     )
     assert LxdInstanceState.command("web1", remote="prod", project="apps") == (
-        "lxc info prod:web1 --format json --project apps 2>/dev/null || true"
+        "lxc query 'prod:/1.0/instances/web1/state?project=apps' 2>/dev/null || true"
     )
+    # A hostile name is percent-encoded into the URL path, never shell.
     assert LxdInstanceState.command("a; rm -rf /") == (
-        "lxc info 'a; rm -rf /' --format json --project default 2>/dev/null || true"
+        "lxc query '/1.0/instances/a%3B%20rm%20-rf%20%2F/state?project=default' "
+        "2>/dev/null || true"
     )
 
 
@@ -599,14 +607,21 @@ async def test_instance_state_reads_the_simulated_seam():
 # --- LxdInstanceSnapshots ----------------------------------------------------
 
 
-def test_instance_snapshots_shares_the_state_command():
-    # The DnfRepoFile shared-command precedent: both facts read the same
-    # lxc info document, the snapshots fact projects its array.
-    assert LxdInstanceSnapshots.command("web1") == LxdInstanceState.command("web1")
+def test_instance_snapshots_command_is_the_guarded_recursive_query():
+    # The snapshots array only materializes in the recursive instance
+    # document; the project joins the existing query string with &.
+    assert LxdInstanceSnapshots.command("web1") == (
+        "lxc query '/1.0/instances/web1?recursion=1&project=default' "
+        "2>/dev/null || true"
+    )
+    assert LxdInstanceSnapshots.command("web1", remote="prod", project="apps") == (
+        "lxc query 'prod:/1.0/instances/web1?recursion=1&project=apps' "
+        "2>/dev/null || true"
+    )
 
 
 def test_instance_snapshots_parse_projects_the_snapshots_array():
-    assert LxdInstanceSnapshots.parse([json.dumps(STATE_DOC)]) == [SNAPSHOT_ENTRY]
+    assert LxdInstanceSnapshots.parse([json.dumps(SNAPSHOTS_DOC)]) == [SNAPSHOT_ENTRY]
     # A missing instance, an instance without snapshots and a null
     # snapshots key all read as [].
     assert LxdInstanceSnapshots.parse([]) == []
@@ -615,7 +630,7 @@ def test_instance_snapshots_parse_projects_the_snapshots_array():
 
 
 async def test_instance_snapshots_real_transport_and_seam():
-    host = CannedShellHost(json.dumps(STATE_DOC))
+    host = CannedShellHost(json.dumps(SNAPSHOTS_DOC))
     assert await LxdInstanceSnapshots.process(host, "web1") == [SNAPSHOT_ENTRY]
     assert host.shells == [LxdInstanceSnapshots.command("web1")]
     simulated = SimulatedHost(
@@ -772,15 +787,17 @@ async def test_project_config_reads_the_simulated_seam():
 # --- LxdServerInfo -----------------------------------------------------------
 
 
-def test_server_info_command_is_the_bare_info_read():
-    assert LxdServerInfo.command() == "lxc info --format json"
-    assert LxdServerInfo.command(remote="prod") == "lxc info prod: --format json"
+def test_server_info_command_is_the_query_read():
+    # lxc info has no --format flag: the server fact reads the REST
+    # /1.0 document through lxc query. Server-wide: no project.
+    assert LxdServerInfo.command() == "lxc query /1.0"
+    assert LxdServerInfo.command(remote="prod") == "lxc query prod:/1.0"
 
 
 async def test_server_info_real_transport_and_the_empty_fallback():
     host = CannedShellHost(json.dumps(SERVER_INFO))
     assert await LxdServerInfo.process(host) == SERVER_INFO
-    assert host.shells == ["lxc info --format json"]
+    assert host.shells == ["lxc query /1.0"]
     # An empty document reads as {} so capability checks never crash on
     # a missing api_extensions key.
     assert LxdServerInfo.parse([]) == {}
@@ -790,25 +807,25 @@ async def test_server_info_reads_the_simulated_seam():
     host = SimulatedHost(name="h", lxd_server_info=SERVER_INFO)
     assert await LxdServerInfo.process(host) == SERVER_INFO
     result = await LxdServerInfo.process(host)
-    result["server_version"] = "9.9"
-    assert host.lxd_server_info["server_version"] == "5.21"
+    result["auth"] = "untrusted"
+    assert host.lxd_server_info["auth"] == "trusted"
     assert await LxdServerInfo.process(SimulatedHost(name="h")) == {}
 
 
 # --- LxdServerResources ------------------------------------------------------
 
 
-def test_server_resources_command_adds_the_resources_flag():
-    assert LxdServerResources.command() == "lxc info --resources --format json"
+def test_server_resources_command_is_the_query_read():
+    assert LxdServerResources.command() == "lxc query /1.0/resources"
     assert LxdServerResources.command(remote="prod") == (
-        "lxc info prod: --resources --format json"
+        "lxc query prod:/1.0/resources"
     )
 
 
 async def test_server_resources_real_transport_and_the_empty_fallback():
     host = CannedShellHost(json.dumps(SERVER_RESOURCES))
     assert await LxdServerResources.process(host) == SERVER_RESOURCES
-    assert host.shells == ["lxc info --resources --format json"]
+    assert host.shells == ["lxc query /1.0/resources"]
     assert LxdServerResources.parse([]) == {}
 
 
@@ -1415,7 +1432,10 @@ async def test_instance_op_reconciles_profiles_config_and_devices():
 async def test_instance_op_reports_image_drift_without_recreating():
     # The developer-approved decision: the alias now resolves to a
     # DIFFERENT fingerprint than volatile.base_image; the mismatch is
-    # reported in the reason only -- no commands, not changed.
+    # reported in the reason only -- no commands, not changed. The
+    # reference is the locally cached alias (a remote source reference
+    # like ubuntu:24.04 resolves to 24.04, which the store does not
+    # carry as an alias, so the check would skip silently).
     drifted_image = {
         **IMAGE_ENTRY,
         "fingerprint": COPY_FP,
@@ -1423,11 +1443,13 @@ async def test_instance_op_reports_image_drift_without_recreating():
     host = SimulatedHost(
         name="h", lxd_instances=[INSTANCE_ENTRY], lxd_images=[drifted_image]
     )
-    ctx, commands = await materialize(host, lxd.instance, instance="web1")
+    ctx, commands = await materialize(
+        host, lxd.instance, instance="web1", image="local:ubuntu/24.04"
+    )
     assert not ctx.changed
     assert ctx.reason == (
         "lxd instance web1 exists (base image differs from "
-        "images:ubuntu/24.04 (not recreated))"
+        "local:ubuntu/24.04 (not recreated))"
     )
     assert commands == []
 
@@ -2437,7 +2459,7 @@ async def test_lxd_instance_end_to_end_create_then_noop():
     (entry,) = report.log
     assert entry.changed
     assert host.lxd_instances[0]["name"] == "web1"
-    assert "$ sudo lxc launch images:ubuntu/24.04 web1 --project default < /dev/null" in (
+    assert "$ sudo lxc launch ubuntu:24.04 web1 --project default < /dev/null" in (
         format_log(report)
     )
 

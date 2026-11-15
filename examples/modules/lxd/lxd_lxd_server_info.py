@@ -28,13 +28,13 @@ driving the two-phase execution model:
    host-name-keyed mapping -- then print each host's daemon metadata
    document with ``json.dumps(..., indent=2)``.
 
-The fact runs ``lxc info --format json`` as the login user, who needs
-access to the LXD daemon socket (member of the ``lxd`` group). The
-document carries the server version, the ``api_extensions`` capability
-list a deploy can branch on before using extension-dependent features,
-and the server environment (addresses, storage drivers in use, cluster
-membership). An unreachable daemon reads as ``{}`` rather than failing
-the gather. Server info is server-wide: pass ``remote`` to
+The fact runs ``lxc query /1.0`` as the login user, who needs access to
+the LXD daemon socket (member of the ``lxd`` group). The REST server
+document carries the ``api_extensions`` capability list a deploy can
+branch on before using extension-dependent features, and the server
+environment (version, addresses, storage drivers in use, cluster
+membership). An unreachable or misconfigured daemon fails the gather
+with a ``CommandError``. Server info is server-wide: pass ``remote`` to
 ``gather_fact`` to read another configured remote's daemon.
 
 Every host's connection is closed with ``aclose`` once the facts are
@@ -127,7 +127,7 @@ async def main() -> None:
         # Gather the fact across the guarded hosts concurrently: gather_fact
         # fans LxdServerInfo.process out with asyncio.gather and returns a
         # host-name-keyed mapping, so both SSH round-trips overlap instead of
-        # running one host at a time. process runs lxc info and parses the
+        # running one host at a time. process runs lxc query and parses the
         # daemon metadata (version, api_extensions, environment).
         info = await gather_fact(hosts, LxdServerInfo)
     except (OSError, json.JSONDecodeError) as exc:

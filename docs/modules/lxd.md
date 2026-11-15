@@ -58,13 +58,14 @@
 single source, extending the baseline's one-fact/one-operation `lxd` namespace
 (`lxd.LxdContainers` / `lxd.container`) toward complete control over and
 visibility into the LXD daemon. Every fact and operation runs through the
-`lxc` client on the target host with `--format json`, so the daemon's
-asynchronous mutations (launch, state changes, copies, image downloads)
-are waited on by the CLI itself — no REST polling is modelled in the
-library. Collections are project-scoped through an explicit `project`
-option (default `"default"`), and a `remote` option addresses any remote
-configured in the host's `lxc remote` list; the parity pair
-(`LxdContainers` / `container`) keeps upstream's unscoped shells.
+`lxc` client on the target host (`--format json` listings, `lxc query`
+REST reads), so the daemon's asynchronous mutations (launch, state
+changes, copies, image downloads) are waited on by the CLI itself — no
+REST polling is modelled in the library. Collections are project-scoped
+through an explicit `project` option (default `"default"`), and a
+`remote` option addresses any remote configured in the host's `lxc
+remote` list; the parity pair (`LxdContainers` / `container`) keeps
+upstream's unscoped shells.
 
 ## Facts
 
@@ -85,18 +86,20 @@ entries, with empty output hardened to `[]` instead of upstream's
 assert-on-one-line crash.
 
 The fifteen reemote-original facts answer the visibility gaps the baseline
-leaves: `LxdServerInfo` (daemon metadata and the `api_extensions`
-capability list a deploy can branch on before using extension-dependent
-features), `LxdServerResources` (CPU/memory/GPU/storage/network hardware
-from `lxc info --resources`), `LxdProjects` and `LxdProjectConfig`
+leaves: `LxdServerInfo` (the REST `/1.0` daemon metadata and the
+`api_extensions` capability list a deploy can branch on before using
+extension-dependent features), `LxdServerResources`
+(CPU/memory/GPU/storage/network hardware from the REST resources
+document via `lxc query`), `LxdProjects` and `LxdProjectConfig`
 (project listings and one project's configuration document),
 `LxdInstances` (the FULL `lxc list` — config, devices, profiles and the
 `volatile.base_image` fingerprint, VMs alongside containers),
-`LxdInstanceConfig` (`lxc config show --expanded`: own plus
-profile-inherited configuration), `LxdInstanceState` (runtime status,
-PID, memory and network from `lxc info <instance>`),
-`LxdInstanceSnapshots` (the snapshots array projected from the same
-`lxc info` document), `LxdImages` and `LxdImageAliases` (the image store
+`LxdInstanceConfig` (the REST instance document via `lxc query`: own
+plus profile-inherited configuration), `LxdInstanceState` (runtime status,
+PID, memory and network from the REST state resource via `lxc query`),
+`LxdInstanceSnapshots` (the snapshots array projected from the
+recursive REST instance document via `lxc query`), `LxdImages` and
+`LxdImageAliases` (the image store
 and its alias-to-fingerprint mappings), `LxdNetworks` (managed and
 unmanaged networks), `LxdProfiles` (profiles with config and devices),
 `LxdStoragePools` and `LxdStorageVolumes` (pools and their custom plus

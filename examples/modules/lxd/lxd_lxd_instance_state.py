@@ -28,9 +28,9 @@ driving the two-phase execution model:
    host-name-keyed mapping -- then print each host's runtime state
    document with ``json.dumps(..., indent=2)``.
 
-The fact runs ``lxc info web1 --format json --project default`` as the
-login user, who needs access to the LXD daemon socket (member of the
-``lxd`` group). The document carries the runtime status (Running,
+The fact runs ``lxc query '/1.0/instances/web1/state?project=default'``
+as the login user, who needs access to the LXD daemon socket (member of
+the ``lxd`` group). The document carries the runtime status (Running,
 Stopped, Frozen), PID, memory usage and network interfaces -- the state
 the ``lxd.instance_state`` operation checks before driving a lifecycle
 verb. The read is guarded (``2>/dev/null || true``): a missing instance
@@ -128,7 +128,7 @@ async def main() -> None:
         # Gather the fact across the guarded hosts concurrently: gather_fact
         # fans LxdInstanceState.process out with asyncio.gather and returns a
         # host-name-keyed mapping, so both SSH round-trips overlap instead of
-        # running one host at a time. process runs lxc info for the instance
+        # running one host at a time. process runs lxc query for the instance
         # named web1 and parses the runtime state document.
         states = await gather_fact(hosts, LxdInstanceState, "web1")
     except (OSError, json.JSONDecodeError) as exc:

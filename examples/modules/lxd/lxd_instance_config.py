@@ -20,13 +20,14 @@ two-phase execution model end to end over a **real SSH transport**
 
 ``lxd.instance_config`` is the dedicated reconciliation half of
 ``lxd.instance`` for an instance that must already exist. It reads the
-``LxdInstanceConfig`` fact (``lxc config show --expanded``) and compares
-desired keys against the instance's OWN config -- an inherited profile
-value is not an own key, so setting it IS a change. Drifted ``devices``
-are removed and re-added, and a ``profiles`` tuple is assigned wholesale
-when it differs (``None`` leaves the current list alone). Config keys
-are only SET, never unset. A missing instance raises ``OperationError``
-in prepare, so create it with ``lxd_instance.py`` first.
+``LxdInstanceConfig`` fact (the REST instance document via ``lxc
+query``) and compares desired keys against the instance's OWN config --
+an inherited profile value is not an own key, so setting it IS a change.
+Drifted ``devices`` are removed and re-added, and a ``profiles`` tuple
+is assigned wholesale when it differs (``None`` leaves the current list
+alone). Config keys are only SET, never unset. A missing instance raises
+``OperationError`` in prepare, so create it with ``lxd_instance.py``
+first.
 
 The deploy yields the same set request twice: the second is a guaranteed
 no-op in the apply phase, because the first set is visible to it through

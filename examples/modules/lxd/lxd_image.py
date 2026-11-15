@@ -20,8 +20,10 @@ two-phase execution model end to end over a **real SSH transport**
 
 ``lxd.image`` reads the ``LxdImages`` fact and matches ``image`` by
 fingerprint OR alias: a cached image is a no-op, an absent one is copied
-from ``source`` (a remote image reference such as ``images:ubuntu/24.04``;
-absent plus no source raises ``ValueError``). ``present=False`` deletes
+from ``source`` (a remote image reference such as ``ubuntu:24.04`` --
+the ``ubuntu:`` remote serves the container images, while the ``images:``
+remote currently publishes only desktop variants; absent plus no source
+raises ``ValueError``). ``present=False`` deletes
 the cached image. Non-fingerprint names are registered as ``--alias`` on
 the copy, so the alias resolves to the cached image afterwards.
 
@@ -121,7 +123,7 @@ def deploy(host: Host) -> Generator[OperationRequest]:
         lxd.image,
         name="Cache ubuntu/24.04",
         image="ubuntu/24.04",
-        source="images:ubuntu/24.04",
+        source="ubuntu:24.04",
         sudo=True,
         when=is_ubuntu,
     )
@@ -129,7 +131,7 @@ def deploy(host: Host) -> Generator[OperationRequest]:
         lxd.image,
         name="Cache ubuntu/24.04 (again)",
         image="ubuntu/24.04",
-        source="images:ubuntu/24.04",
+        source="ubuntu:24.04",
         sudo=True,
         when=is_ubuntu,
     )

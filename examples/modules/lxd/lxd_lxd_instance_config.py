@@ -28,10 +28,10 @@ driving the two-phase execution model:
    host-name-keyed mapping -- then print each host's configuration
    document with ``json.dumps(..., indent=2)``.
 
-The fact runs ``lxc config show web1 --expanded --format json --project
-default`` as the login user, who needs access to the LXD daemon socket
-(member of the ``lxd`` group). The ``--expanded`` document carries the
-instance's OWN ``config``/``devices``/``profiles`` alongside the
+The fact runs ``lxc query '/1.0/instances/web1?project=default'`` as the
+login user, who needs access to the LXD daemon socket (member of the
+``lxd`` group). The REST instance document carries the instance's OWN
+``config``/``devices``/``profiles`` alongside the
 ``expanded_config``/``expanded_devices`` inherited from its profiles --
 the own-config view the ``lxd.instance_config`` operation reconciles
 against. The read is guarded (``2>/dev/null || true``): a missing
@@ -129,8 +129,8 @@ async def main() -> None:
         # Gather the fact across the guarded hosts concurrently: gather_fact
         # fans LxdInstanceConfig.process out with asyncio.gather and returns a
         # host-name-keyed mapping, so both SSH round-trips overlap instead of
-        # running one host at a time. process runs lxc config show --expanded
-        # for the instance named web1 and parses the configuration document.
+        # running one host at a time. process runs lxc query for the
+        # instance named web1 and parses the configuration document.
         configs = await gather_fact(hosts, LxdInstanceConfig, "web1")
     except (OSError, json.JSONDecodeError) as exc:
         # The inventory file is missing, unreadable or not valid JSON. Python's

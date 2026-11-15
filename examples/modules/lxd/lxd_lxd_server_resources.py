@@ -28,14 +28,14 @@ driving the two-phase execution model:
    host-name-keyed mapping -- then print each host's hardware resource
    document with ``json.dumps(..., indent=2)``.
 
-The fact runs ``lxc info --resources --format json`` as the login user,
-who needs access to the LXD daemon socket (member of the ``lxd``
-group). The document describes the hardware available on the LXD host:
-CPU sockets/cores/threads, memory totals, GPUs, storage devices and
-network cards -- the capacity view for sizing instances and pools. An
-unreachable daemon reads as ``{}`` rather than failing the gather.
-Resources are server-wide: pass ``remote`` to ``gather_fact`` to read
-another configured remote's hardware.
+The fact runs ``lxc query /1.0/resources`` as the login user, who needs
+access to the LXD daemon socket (member of the ``lxd`` group). The
+document describes the hardware available on the LXD host: CPU
+sockets/cores/threads, memory totals, GPUs, storage devices and network
+cards -- the capacity view for sizing instances and pools. An
+unreachable or misconfigured daemon fails the gather with a
+``CommandError``. Resources are server-wide: pass ``remote`` to
+``gather_fact`` to read another configured remote's hardware.
 
 Every host's connection is closed with ``aclose`` once the facts are
 gathered. ``gather_fact`` and ``process`` are coroutines, so ``main`` is
@@ -127,8 +127,8 @@ async def main() -> None:
         # Gather the fact across the guarded hosts concurrently: gather_fact
         # fans LxdServerResources.process out with asyncio.gather and returns a
         # host-name-keyed mapping, so both SSH round-trips overlap instead of
-        # running one host at a time. process runs lxc info --resources and
-        # parses the hardware document (cpu, memory, gpu, storage, network).
+        # running one host at a time. process runs lxc query and parses the
+        # hardware document (cpu, memory, gpu, storage, network).
         resources = await gather_fact(hosts, LxdServerResources)
     except (OSError, json.JSONDecodeError) as exc:
         # The inventory file is missing, unreadable or not valid JSON. Python's

@@ -32,13 +32,18 @@
 # waits on or cancels a background operation.
 #
 # Transport decision (developer-approved): everything runs through the
-# ``lxc`` CLI on the target host with ``--format json``, never the REST
-# API directly. The CLI blocks on LXD's asynchronous operations natively
-# (no manual 202/operation-wait handling), and remotes/TLS certificates
-# come from the host's configured ``lxc remote`` list through the
-# ``remote`` parameter (an empty string means the local daemon).
+# ``lxc`` CLI on the target host, never the REST API directly. Most
+# commands render ``--format json``; the single-resource facts (the
+# instance config/state/snapshots reads and the server reads) use
+# ``lxc query`` instead, because ``lxc info`` and ``lxc config show``
+# have no ``--format`` flag. The CLI blocks on LXD's asynchronous
+# operations natively (no manual 202/operation-wait handling), and
+# remotes/TLS certificates come from the host's configured ``lxc
+# remote`` list through the ``remote`` parameter (an empty string
+# means the local daemon).
 # Project-scoped facts and operations take ``project`` (default
-# ``"default"``) and render an explicit ``--project`` flag; the
+# ``"default"``) and render an explicit ``--project`` flag (``lxc
+# query`` carries the project in the URL instead); the
 # ``LxdContainers``/``container`` pair keeps its
 # exact unscoped commands.
 #
@@ -59,6 +64,7 @@ import shlex
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
 from typing import Any, NotRequired, TypedDict, cast
+from urllib.parse import quote
 
 from ...commands import Command, WaitCommand, WaitTimeoutError
 from ...core import OpContext, OperationError
@@ -66,7 +72,7 @@ from ...hosts import Host
 
 
 def _parse_json(output: Iterable[str]) -> Any:
-    """Join ``lxc --format json`` stdout lines and decode the document.
+    """Join lxc JSON stdout lines and decode the document.
 
     Empty output reads as None -- the guarded single-target facts append
     ``2>/dev/null || true``, so a missing instance/project/pool produces
@@ -104,6 +110,24 @@ def _remote_name(name: str, remote: str) -> str:
     local daemon. The composed string is quoted by the caller.
     """
     return f"{remote}:{name}" if remote else name
+
+
+def _lxc_query(path: str, remote: str = "", project: str = "") -> str:
+    """Render ``lxc query '<remote>:<path>[?project=<project>]'``.
+
+    ``lxc query`` reads a REST resource as JSON without a ``--format``
+    flag (``lxc info`` and ``lxc config show`` have none), and it
+    rejects ``--project`` -- the project rides in the URL instead. The
+    path segments and the project value are percent-encoded, then the
+    whole URL is shell-quoted as one argument; a non-empty remote
+    prefixes the path the same way ``_remote_name`` prefixes a resource
+    name.
+    """
+    url = f"{remote}:{path}" if remote else path
+    if project:
+        separator = "&" if "?" in url else "?"
+        url += f"{separator}project={quote(project, safe='')}"
+    return f"lxc query {shlex.quote(url)}"
 
 
 def _config_pairs(config: tuple[str, ...]) -> list[tuple[str, str]]:
@@ -458,7 +482,7 @@ class LxdInstanceConfig:
     **Commands:**
 
     ```bash
-    lxc config show <remote>:<instance> --expanded --format json [--project <project>] 2>/dev/null || true
+    lxc query '<remote>:/1.0/instances/<instance>?project=<project>' 2>/dev/null || true
     ```
 
     **Returns:**
@@ -478,30 +502,27 @@ class LxdInstanceConfig:
     """
 
     # reemote-original: there is no other per-instance configuration fact.
-    # ``lxc config show --expanded`` returns the instance's editable
-    # document: its OWN config/devices plus expanded_config/
-    # expanded_devices with profile inheritance applied, so the same
-    # LxdInstance entry type serves both this fact and LxdInstances.
-    # The 2>/dev/null || true guard reads a MISSING instance as None
-    # (the mysql.MysqlUserGrants absent-user precedent) and masks exit
-    # 127, so CommandNotFoundError is not on the Raises list.
-    # lxd.instance_config compares desired keys against the OWN config
-    # (an inherited value is not an own key, so setting it IS a change).
+    # ``lxc query`` reads the REST /1.0/instances/<name> resource as
+    # JSON -- ``lxc config show`` has no ``--format`` flag, so the
+    # earlier ``lxc config show --expanded --format json`` rendering
+    # failed on every real daemon and the guard silently read None. The
+    # plain GET already carries the instance's OWN config/devices plus
+    # expanded_config/expanded_devices with profile inheritance applied
+    # (no recursion needed), so the same LxdInstance entry type serves
+    # both this fact and LxdInstances. The 2>/dev/null || true guard
+    # reads a MISSING instance as None (the mysql.MysqlUserGrants
+    # absent-user precedent) and masks exit 127, so CommandNotFoundError
+    # is not on the Raises list. lxd.instance_config compares desired
+    # keys against the OWN config (an inherited value is not an own key,
+    # so setting it IS a change).
 
     @classmethod
     def command(
         cls, instance: str, remote: str = "", project: str = "default"
     ) -> str:
         """Shell reading one instance's expanded configuration as JSON."""
-        parts = [
-            "config",
-            "show",
-            shlex.quote(_remote_name(instance, remote)),
-            "--expanded",
-            "--format",
-            "json",
-        ]
-        return _lxc_command(parts, project) + " 2>/dev/null || true"
+        path = f"/1.0/instances/{quote(instance, safe='')}"
+        return _lxc_query(path, remote, project) + " 2>/dev/null || true"
 
     @classmethod
     def parse(cls, output: Iterable[str]) -> LxdInstance | None:
@@ -526,11 +547,9 @@ class LxdInstanceConfig:
 class LxdInstanceStateData(TypedDict, total=False):
     """
     Attributes:
-        name: The instance name.
         status: The runtime status (``Running``, ``Stopped``,
             ``Frozen``).
-        type: The instance type (``container`` or ``virtual-machine``).
-        architecture: The instance architecture.
+        status_code: The numeric LXD status code.
         pid: The init process ID; absent or 0 when stopped.
         processes: The number of processes; absent when stopped.
         cpu: CPU usage counters (``usage`` in nanoseconds); absent
@@ -544,8 +563,6 @@ class LxdInstanceStateData(TypedDict, total=False):
             absent when stopped.
         disk: Per-disk usage gauges keyed by device name; absent when
             stopped.
-        snapshots: The instance's snapshots (the same entries
-            ``LxdInstanceSnapshots`` projects).
     """
 
 
@@ -555,7 +572,7 @@ class LxdInstanceState:
     **Commands:**
 
     ```bash
-    lxc info <remote>:<instance> --format json [--project <project>] 2>/dev/null || true
+    lxc query '<remote>:/1.0/instances/<instance>/state?project=<project>' 2>/dev/null || true
     ```
 
     **Returns:**
@@ -574,12 +591,14 @@ class LxdInstanceState:
         Examples can be found in ``examples/modules/lxd/lxd_lxd_instance_state.py``.
     """
 
-    # reemote-original: there is no other instance-state fact. ``lxc info
-    # <instance> --format json`` is the CLI rendering of the REST
-    # /1.0/instances/<name>/state resource plus identity and snapshots;
-    # the runtime keys (pid/processes/cpu/memory/network/disk) appear
-    # only while the instance runs. The 2>/dev/null || true guard reads
-    # a MISSING instance as None and masks exit 127.
+    # reemote-original: there is no other instance-state fact. ``lxc
+    # query`` reads the REST /1.0/instances/<name>/state resource as
+    # JSON -- ``lxc info`` has no ``--format`` flag, so the earlier
+    # ``lxc info <instance> --format json`` rendering failed on every
+    # real daemon and the guard silently read None. The runtime keys
+    # (pid/processes/cpu/memory/network/disk) appear only while the
+    # instance runs. The 2>/dev/null || true guard reads a MISSING
+    # instance as None and masks exit 127.
     # lxd.instance_state compares the status string against this fact
     # for idempotent start/stop/freeze. The entry type carries the
     # "Data" suffix because the fact name takes the singular slot (the
@@ -590,13 +609,8 @@ class LxdInstanceState:
         cls, instance: str, remote: str = "", project: str = "default"
     ) -> str:
         """Shell reading one instance's runtime state as JSON."""
-        parts = [
-            "info",
-            shlex.quote(_remote_name(instance, remote)),
-            "--format",
-            "json",
-        ]
-        return _lxc_command(parts, project) + " 2>/dev/null || true"
+        path = f"/1.0/instances/{quote(instance, safe='')}/state"
+        return _lxc_query(path, remote, project) + " 2>/dev/null || true"
 
     @classmethod
     def parse(cls, output: Iterable[str]) -> LxdInstanceStateData | None:
@@ -636,7 +650,7 @@ class LxdInstanceSnapshots:
     **Commands:**
 
     ```bash
-    lxc info <remote>:<instance> --format json [--project <project>] 2>/dev/null || true
+    lxc query '<remote>:/1.0/instances/<instance>?recursion=1&project=<project>' 2>/dev/null || true
     ```
 
     **Returns:**
@@ -656,25 +670,22 @@ class LxdInstanceSnapshots:
         ``examples/modules/lxd/lxd_lxd_instance_snapshots.py``.
     """
 
-    # reemote-original: there is no other snapshot-visibility fact. Shares
-    # LxdInstanceState's ``lxc info <instance>`` command (the DnfRepoFile
-    # shared-command precedent) and projects the document's snapshots
-    # array; a missing instance or an instance without snapshots reads
-    # as []. lxd.instance_snapshot compares snapshot names against this
-    # fact.
+    # reemote-original: there is no other snapshot-visibility fact.
+    # ``lxc query`` reads the recursive REST instance document (the
+    # snapshots array only materializes with recursion=1) and this
+    # fact projects the array -- ``lxc info`` has no ``--format`` flag,
+    # so the earlier ``lxc info <instance> --format json`` rendering
+    # failed on every real daemon and the guard silently read []. A
+    # missing instance or an instance without snapshots reads as [].
+    # lxd.instance_snapshot compares snapshot names against this fact.
 
     @classmethod
     def command(
         cls, instance: str, remote: str = "", project: str = "default"
     ) -> str:
         """Shell reading the instance document the snapshots project from."""
-        parts = [
-            "info",
-            shlex.quote(_remote_name(instance, remote)),
-            "--format",
-            "json",
-        ]
-        return _lxc_command(parts, project) + " 2>/dev/null || true"
+        path = f"/1.0/instances/{quote(instance, safe='')}?recursion=1"
+        return _lxc_query(path, remote, project) + " 2>/dev/null || true"
 
     @classmethod
     def parse(cls, output: Iterable[str]) -> list[LxdSnapshot]:
@@ -1062,13 +1073,6 @@ class LxdProjectConfig:
 class LxdServerInfoData(TypedDict, total=False):
     """
     Attributes:
-        server: The server implementation name (``lxd`` or ``incus``).
-        server_name: The server's host name.
-        server_version: The server version string, e.g. ``5.21``.
-        server_pid: The daemon's process ID.
-        server_clustered: Whether the server is part of a cluster.
-        server_lts: Whether the server is an LTS release.
-        server_event_mode: The cluster event distribution mode.
         api_version: The REST API version, e.g. ``1.0``.
         api_status: The API stability status (``stable``,
             ``development``, ``deprecated``).
@@ -1082,9 +1086,11 @@ class LxdServerInfoData(TypedDict, total=False):
             ``tls``).
         public: Whether the server is exposed publicly.
         config: The daemon's configuration keys.
-        environment: The server environment (kernel, OS, storage
-            driver, LXC version, addresses, ...); dynamic keys keep a
-            plain dict.
+        environment: The server environment -- the server identity
+            and version (``server``, ``server_name``, ``server_version``,
+            ``server_pid``, ``server_clustered``, ``server_lts``,
+            ``server_event_mode``), kernel, OS, storage drivers, LXC
+            version, addresses, ...; dynamic keys keep a plain dict.
     """
 
 
@@ -1094,7 +1100,7 @@ class LxdServerInfo:
     **Commands:**
 
     ```bash
-    lxc info [<remote>:] --format json
+    lxc query '<remote>:/1.0'
     ```
 
     **Returns:**
@@ -1114,9 +1120,11 @@ class LxdServerInfo:
     """
 
     # reemote-original: there is no other daemon-visibility fact. ``lxc
-    # info`` with no instance argument renders the REST /1.0 document;
-    # the raw JSON object is passed through verbatim (an unreachable or
-    # misconfigured daemon fails the command, it does not read as {}).
+    # query`` reads the REST /1.0 document -- ``lxc info`` has no
+    # ``--format`` flag, so the earlier ``lxc info --format json``
+    # rendering failed on every real daemon. The raw JSON object is
+    # passed through verbatim (an unreachable or misconfigured daemon
+    # fails the command, it does not read as {}).
     # api_extensions is the capability list the discussion's
     # feature-gating note calls for: a deploy can gather this fact and
     # branch on extension membership before yielding an operation. The
@@ -1126,11 +1134,7 @@ class LxdServerInfo:
     @classmethod
     def command(cls, remote: str = "") -> str:
         """Shell reading the daemon metadata as JSON."""
-        parts = ["info"]
-        if remote:
-            parts.append(f"{remote}:")
-        parts.extend(["--format", "json"])
-        return _lxc_command(parts)
+        return _lxc_query("/1.0", remote)
 
     @classmethod
     def parse(cls, output: Iterable[str]) -> LxdServerInfoData:
@@ -1170,7 +1174,7 @@ class LxdServerResources:
     **Commands:**
 
     ```bash
-    lxc info [<remote>:] --resources --format json
+    lxc query '<remote>:/1.0/resources'
     ```
 
     **Returns:**
@@ -1191,8 +1195,10 @@ class LxdServerResources:
     """
 
     # reemote-original: there is no other host-hardware fact for LXD.
-    # ``lxc info --resources`` renders the REST /1.0/resources document;
-    # the raw JSON object is passed through verbatim. The nested
+    # ``lxc query`` reads the REST /1.0/resources document -- ``lxc
+    # info`` has no ``--format`` flag, so the earlier ``lxc info
+    # --resources --format json`` rendering failed on every real daemon.
+    # The raw JSON object is passed through verbatim. The nested
     # hardware records are deeply dynamic (per-socket CPU caches,
     # per-card PCI addresses), so the entry declares the top-level
     # sections only and keeps each a plain dict (the CpuInfo
@@ -1201,11 +1207,7 @@ class LxdServerResources:
     @classmethod
     def command(cls, remote: str = "") -> str:
         """Shell reading the host hardware inventory as JSON."""
-        parts = ["info"]
-        if remote:
-            parts.append(f"{remote}:")
-        parts.extend(["--resources", "--format", "json"])
-        return _lxc_command(parts)
+        return _lxc_query("/1.0/resources", remote)
 
     @classmethod
     def parse(cls, output: Iterable[str]) -> LxdServerResourcesData:
@@ -1583,7 +1585,7 @@ async def image(
         present (bool, optional): Whether the image should be cached.
             Defaults to True.
         source (str, optional): The remote image reference to copy
-            from when caching, e.g. ``images:ubuntu/24.04``; required
+            from when caching, e.g. ``ubuntu:24.04``; required
             when present=True and the image is absent. Defaults to "".
         remote (str, optional): The configured lxc remote whose image
             store to manage; empty means the local daemon. Defaults
@@ -1855,7 +1857,7 @@ async def instance(
     ctx: OpContext,
     instance: str,
     present: bool = True,
-    image: str = "images:ubuntu/24.04",
+    image: str = "ubuntu:24.04",
     instance_type: str = "container",
     profiles: tuple[str, ...] = (),
     config: tuple[str, ...] = (),
@@ -1873,8 +1875,8 @@ async def instance(
         present (bool, optional): Whether the instance should exist.
             Defaults to True.
         image (str, optional): The image reference to launch from,
-            e.g. ``images:ubuntu/24.04`` or a fingerprint. Defaults to
-            "images:ubuntu/24.04".
+            e.g. ``ubuntu:24.04`` or a fingerprint. Defaults to
+            "ubuntu:24.04".
         instance_type (str, optional): ``container`` or ``vm``.
             Defaults to "container".
         profiles (tuple[str, ...], optional): The profiles to apply,

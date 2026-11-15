@@ -91,17 +91,21 @@ def run_example(script: Path) -> tuple[int, float, str]:
 
 
 def failure_reason(output: str) -> str:
-    """Pick the line from a failed run's output that explains the failure.
+    """Pick the lines from a failed run's output that explain the failure.
 
-    Every example reports typed errors as an ``ERROR: <message>`` line on
-    stderr (merged into the captured output), so the last such line is the
-    reason when present. Otherwise fall back to the last non-empty line --
-    e.g. the exception line of an unexpected traceback.
+    Every example reports typed errors as an ``ERROR: <message>`` block on
+    stderr (merged into the captured output), so the last such block is the
+    reason when present. The message may span several lines -- a
+    ``CommandError`` appends the failing command's captured stderr below
+    the summary line -- and the example exits right after printing it, so
+    the block runs to the end of the output. Otherwise fall back to the
+    last non-empty line -- e.g. the exception line of an unexpected
+    traceback.
     """
     lines = [line.strip() for line in output.splitlines() if line.strip()]
-    for line in reversed(lines):
-        if line.startswith("ERROR:"):
-            return line
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].startswith("ERROR:"):
+            return "\n".join(lines[index:])
     return lines[-1] if lines else "no output was produced"
 
 

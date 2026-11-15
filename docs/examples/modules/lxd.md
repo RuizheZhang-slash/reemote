@@ -184,7 +184,7 @@ changes).
 The image operation: `lxd.image` reads
 [`LxdImages`][reemote.modules.lxd.lxd.LxdImages]: an image already
 cached by fingerprint OR alias is a no-op; an absent one is copied from
-`source` (e.g. `images:ubuntu/24.04` — the CLI waits on the asynchronous
+`source` (e.g. `ubuntu:24.04` — the CLI waits on the asynchronous
 download natively), adding `--alias` when the reference is an alias
 rather than a fingerprint. `present=False` deletes by the given
 reference. The script yields the same cache request twice — the second

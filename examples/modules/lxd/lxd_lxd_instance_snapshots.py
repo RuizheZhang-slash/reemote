@@ -28,10 +28,11 @@ driving the two-phase execution model:
    host-name-keyed mapping -- then print each host's list of snapshot
    entries with ``json.dumps(..., indent=2)``.
 
-The fact runs ``lxc info web1 --format json --project default`` as the
+The fact runs
+``lxc query '/1.0/instances/web1?recursion=1&project=default'`` as the
 login user, who needs access to the LXD daemon socket (member of the
-``lxd`` group), and projects the document's ``snapshots`` array -- the
-same read ``LxdInstanceState`` uses, so both facts share one command.
+``lxd`` group), and projects the recursive instance document's
+``snapshots`` array (the array only materializes with ``recursion=1``).
 The snapshot list is what the ``lxd.instance_snapshot`` operation
 reconciles against. The read is guarded (``2>/dev/null || true``): a
 missing instance reads as ``[]`` rather than failing the gather. Create
@@ -128,7 +129,7 @@ async def main() -> None:
         # Gather the fact across the guarded hosts concurrently: gather_fact
         # fans LxdInstanceSnapshots.process out with asyncio.gather and returns
         # a host-name-keyed mapping, so both SSH round-trips overlap instead of
-        # running one host at a time. process runs lxc info for the instance
+        # running one host at a time. process runs lxc query for the instance
         # named web1 and projects the snapshots array from the document.
         snapshots = await gather_fact(hosts, LxdInstanceSnapshots, "web1")
     except (OSError, json.JSONDecodeError) as exc:
