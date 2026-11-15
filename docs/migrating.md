@@ -120,10 +120,36 @@ preview and inventory loading — is
   `restart_handler(changed, ("nginx", "php-fpm"))` restarts both on the notified
   hosts. That is equivalent here, but a hand-composition rather than a keyword:
   order the `services` tuple to reproduce the chain's ordering (upstream first).
-- **A handler that is not a systemd service action** — a script, a custom
-  command — has no factory. Build the same shape by hand: a function closing
-  over `changed_hosts(...)` that `return`s for hosts outside the set and
-  `yield`s your requests for those inside it.
+- **A handler that is not a systemd service action has no factory — and the
+  shape depends on its body.** An *operation-bodied* handler (one whose work
+  is expressible as operations — a `sysctl` reload, a `firewalld` reload)
+  migrates as a hand-built deploy: a function closing over
+  `changed_hosts(...)` that `return`s for hosts outside the set and `yield`s
+  your requests for those inside it. A *command/shell/script-bodied* handler
+  has no operation to yield — a bare command inside a deploy raises
+  [`ActionInDeployError`](guide.md#actions). Compose the notification read
+  with the command-task recipe instead: `changed_hosts(report, NOTIFYING)`
+  between runs, then
+  [`gather_action(notified, Shell, command=..., sudo=True)`](guide.md#actions)
+  **outside** any deploy, on the notified hosts only. The command's exit
+  status is data in the `Result` — interpret it yourself and raise
+  [`CommandError`][reemote.hosts.CommandError] on non-zero (the
+  [build-from-source](#migrating-a-build-from-source-role) recipe's action
+  step is the same shape).
+- **`reload_handler`/`restart_handler` are not faithful substitutes for a
+  command handler.** The reload/restart verb acts only on an *already-running*
+  unit; on a stopped unit the verb is skipped and the operation's default
+  `running=True` **starts the unit instead** — so the handler's own command
+  never runs, and the service ends up started where the play may have
+  deliberately left it stopped. The NFS role is the worked counterexample:
+  its `reload nfs` handler is `command: exportfs -ra`, and on the default path
+  (`nfs_exports: []`) the service-start task is skipped — yet Ansible runs
+  `exportfs -ra` whenever `/etc/exports` changed, with the unit still stopped.
+  `reload_handler(changed, "nfs-kernel-server")` would start the unit the gate
+  left stopped and never run `exportfs`. The faithful shape is the gather
+  above; the full program is
+  `examples/roles/ansible-role-nfs/ansible-role-nfs.py` (its `reload_nfs`),
+  proven offline by `tests/test_roles_ansible_role_nfs.py`.
 - For the full rationale and the reference signatures, see the
   [handlers guide section](guide.md#change-notification-handlers) and the
   [handlers reference](handlers.md).

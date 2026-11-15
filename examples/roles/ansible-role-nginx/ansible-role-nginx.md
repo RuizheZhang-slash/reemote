@@ -61,6 +61,26 @@ plugins.
   the program adds `ppa:nginx/<version>` itself, which needs outbound
   HTTPS to `ppa.launchpad.net`).
 
+**Shared demo host: stop apache2 first (ports 80/443).** The shared
+`ubuntu` demo host (`192.168.0.181`) is also the apache role example's
+target (`examples/roles/ansible-role-apache/`), and that example leaves
+`apache2` enabled and active, holding ports 80 and 443. nginx cannot bind
+while apache2 holds them: the rendered config still validates (`nginx -t`
+passes), but deploy 3's final service task fails with
+`ERROR: command failed on ubuntu (exit 1): sudo systemctl start nginx.service`
+— the journal shows `bind() to 0.0.0.0:80 failed (98: Address already in
+use)`. Free the ports before running this example:
+
+```bash
+ssh supervisor@192.168.0.181 'sudo systemctl stop apache2 && sudo systemctl disable apache2'
+```
+
+This is host state, not a program defect — the example correctly surfaces
+the failed start as a typed `CommandError`. To check who owns the ports:
+`sudo ss -tlnp | grep -E ':80\b|:443\b'`. Re-running the apache example
+later re-enables apache2 and recreates the conflict: the two role
+examples cannot both keep their service running on the same host.
+
 ### 1.4 Inventory: what you must add
 
 The program loads the project-root `inventory.json`. A target entry needs
