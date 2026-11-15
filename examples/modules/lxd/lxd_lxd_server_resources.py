@@ -41,13 +41,18 @@ Every host's connection is closed with ``aclose`` once the facts are
 gathered. ``gather_fact`` and ``process`` are coroutines, so ``main`` is
 async and driven by ``asyncio.run``.
 
-**Host prerequisite.** This example needs the ``lxc`` CLI and a running,
-initialized LXD daemon (login user in the ``lxd`` group for fact reads;
-operations ride ``sudo=True``). The demo Ubuntu host has LXD snap-installed
-and the login user in the ``lxd`` group, but its daemon is not initialized
-(no storage pool), so run ``sudo lxd init`` there before creating anything.
-Compile-checked and exercised by the offline harness; point
-``INVENTORY_PATH`` at LXD-enabled machines to run live.
+LXD is *not* set up out of the box on Ubuntu -- it ships as a snap, not a
+default install -- so this example provisions it itself before gathering:
+``main`` first awaits ``provision_lxd`` from the sibling ``provision_lxd.py``,
+which installs the ``lxd`` snap with ``snap.package`` (pinned to the
+``6/stable`` channel) and runs ``lxd init --auto``. Both steps are
+idempotent -- the install on the ``SnapPackage`` fact, the init on the
+daemon's own already-configured checks -- so the fact reads even on a
+host where LXD was never installed, and a re-run leaves an initialized
+daemon untouched. The one prerequisite provisioning does not cover is
+socket access for the fact reads: they run unprivileged as the login
+user, who must be a member of the ``lxd`` group (the demo Ubuntu host
+already is).
 
 The path is resolved from ``__file__``, so the example works from any
 working directory; point ``INVENTORY_PATH`` at your own file (or edit
@@ -70,9 +75,18 @@ from reemote import (
     HostConnectionError,
     InventoryError,
     LxdServerResources,
+    PrivilegeError,
     gather_fact,
     validate_inventory,
 )
+
+# The LXD provisioning helper sits beside this script; add its directory
+# to sys.path so ``import provision_lxd`` resolves whether the example is
+# run by path or imported by the offline example harness.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+from provision_lxd import provision_lxd
 
 # examples/modules/lxd/lxd_lxd_server_resources.py -> the project root, so the inventory
 # is found whatever the current working directory is.
@@ -100,7 +114,10 @@ def is_ubuntu(host: Host) -> bool:
     Reads only static inventory data (``host.group``, set by the ``"group"``
     key of the inventory entry), never a mutable fact, and stays a stable
     module-level function -- the two rules every ``when`` predicate follows
-    so both deploy phases reach the same eligibility decision.
+    so both deploy phases reach the same eligibility decision. The Ubuntu
+    demo host is the one ``provision_lxd.py`` provisions with LXD before
+    this gather (see the module docstring), so the gather is guarded to
+    that group.
     """
     return host.group == "ubuntu"
 
@@ -111,6 +128,12 @@ async def main() -> None:
         inventory = load_inventory(INVENTORY_PATH)
         print(f"== Inventory loaded from {INVENTORY_PATH} ==")
         print(", ".join(entry["host"] for entry in inventory))
+
+        # Provision LXD (the snap + ``lxd init --auto``) on the Ubuntu hosts
+        # before the fact is gathered, so the example reads even on a host
+        # where LXD was never installed (see provision_lxd.py).
+        print("\n== Provisioning LXD (provision_lxd.py) ==")
+        await provision_lxd(inventory)
 
         # Materialize every inventory entry up front, then guard the gather
         # below -- a skipped host never reaches the fan-out at all.
@@ -142,11 +165,13 @@ async def main() -> None:
         # whole report -- and it fails before any host is materialized.
         print(f"\nERROR: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
-    except (CommandError, HostConnectionError) as exc:
-        # The library reports an unreachable host or a failed fact command as a
-        # typed error whose message already names the host. Print that message
-        # -- no traceback -- and exit non-zero so the failure stays
-        # script-visible.
+    except (CommandError, HostConnectionError, PrivilegeError) as exc:
+        # The library reports an unreachable host, a failed fact command or a
+        # rejected sudo credential as a typed error whose message already names
+        # the host. A CommandError here means the connection broke or
+        # provisioning's ``lxd init --auto`` failed; PrivilegeError means an
+        # elevated provisioning step was rejected. Print that message -- no
+        # traceback -- and exit non-zero so the failure stays script-visible.
         print(f"\nERROR: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     finally:

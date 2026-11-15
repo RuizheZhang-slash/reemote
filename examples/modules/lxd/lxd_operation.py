@@ -32,13 +32,18 @@ BOTH requests run in the apply phase -- neither is a no-op; the second
 simply finds the operation already finished (or unregistered) and
 succeeds on its first poll.
 
-**Host prerequisite.** This example needs the ``lxc`` CLI and a running,
-initialized LXD daemon (login user in the ``lxd`` group for fact reads;
-operations ride ``sudo=True``). The demo Ubuntu host has LXD snap-installed
-and the login user in the ``lxd`` group, but its daemon is not initialized
-(no storage pool), so run ``sudo lxd init`` there before creating anything.
-Compile-checked and exercised by the offline harness; point
-``INVENTORY_PATH`` at LXD-enabled machines to run live.
+LXD is *not* set up out of the box on Ubuntu -- it ships as a snap, not a
+default install -- so this example provisions it itself before deploying:
+``main`` first awaits ``provision_lxd`` from the sibling ``provision_lxd.py``,
+which installs the ``lxd`` snap with ``snap.package`` (pinned to the
+``6/stable`` channel) and runs ``lxd init --auto``. Both steps are
+idempotent -- the install on the ``SnapPackage`` fact, the init on the
+daemon's own already-configured checks -- so the example runs even on a
+host where LXD was never installed, and a re-run leaves an initialized
+daemon untouched. The one prerequisite provisioning does not cover is
+socket access for the unprivileged fact reads: the login user must be a
+member of the ``lxd`` group (the demo Ubuntu host already is); the
+operations themselves ride ``sudo=True`` and need no group membership.
 
 Every request carries ``when=is_ubuntu``, the declarative eligibility
 guard: the predicate reads only **static** inventory data --
@@ -80,6 +85,14 @@ from reemote import (
     validate_inventory,
 )
 
+# The LXD provisioning helper sits beside this script; add its directory
+# to sys.path so ``import provision_lxd`` resolves whether the example is
+# run by path or imported by the offline example harness.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+from provision_lxd import provision_lxd
+
 # Placeholder operation UUID: replace with a live operation's id -- see
 # lxd_lxd_operations.py. An unregistered id succeeds on the first poll.
 OPERATION_ID = "00000000-0000-0000-0000-000000000000"
@@ -110,7 +123,10 @@ def is_ubuntu(host: Host) -> bool:
     Reads only static inventory data (``host.group``, set by the ``"group"``
     key of the inventory entry), never a mutable fact, and stays a stable
     module-level function -- the two rules every ``when`` predicate follows
-    so both deploy phases reach the same eligibility decision.
+    so both deploy phases reach the same eligibility decision. The Ubuntu
+    demo host is the one ``provision_lxd.py`` provisions with LXD before
+    this example deploys (see the module docstring), so the deploy is
+    guarded to that group.
     """
     return host.group == "ubuntu"
 
@@ -151,6 +167,13 @@ async def main() -> None:
         inventory = load_inventory(INVENTORY_PATH)
         print(f"== Inventory loaded from {INVENTORY_PATH} ==")
         print(", ".join(entry["host"] for entry in inventory))
+
+        # Provision LXD (the snap + ``lxd init --auto``) on the Ubuntu hosts
+        # before anything below reads or mutates LXD state, so the example
+        # runs even on a host where LXD was never installed (see
+        # provision_lxd.py).
+        print("\n== Provisioning LXD (provision_lxd.py) ==")
+        await provision_lxd(inventory)
 
         # --dry: prepare phase only. Facts are still gathered over SSH (read-only)
         # so the plan reflects each host's real pre-deployment state; no command
