@@ -47,6 +47,13 @@ optional ``mysql_defaults_file`` connection argument renders
 credentials. ``mysql.user`` takes an ``auth_plugin`` option (e.g.
 ``auth_socket``) instead of a password.
 
+Fact reads ride the login user first; a read the server denies
+(``Access denied for user`` -- an ``auth_socket`` server admits only
+root) is re-read elevated with ``sudo`` (the ``FileContents`` fallback
+precedent), so the facts stay idempotent under the same socket
+authentication the operations use. The run-as user and any password
+come from the inventory ``privilege`` data, never from an operation.
+
 Every fact and operation accepts the connection keyword arguments
 ``mysql_user``/``mysql_host``/``mysql_port``/``mysql_database``/
 ``mysql_defaults_file`` (the ``mysql_*`` module arguments minus
@@ -57,11 +64,12 @@ import re
 import shlex
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any, TypedDict, cast
 
 from ...commands import Command
 from ...core import OpContext, OperationError
-from ...hosts import Host
+from ...hosts import CommandNotFoundError, Host
 
 
 def _mysql_base(
@@ -191,6 +199,14 @@ def _parse_rows(
     return rows
 
 
+#: The mysql client's authentication-rejection signature ("ERROR 1045
+#: (28000): Access denied for user 'x'@'localhost' (using password: NO)").
+#: Matched case-insensitively on stderr -- the hosts._is_privilege_failure
+#: idiom -- because the ``|| true`` guard on the IGNORE_ERRORS facts masks
+#: the exit status but never the message.
+_ACCESS_DENIED_MARKER = "access denied for user"
+
+
 class _MysqlFact:
     """Shared transport plumbing for the mysql-backed facts.
 
@@ -201,6 +217,14 @@ class _MysqlFact:
     from the positional arguments. Never exported or rendered; every
     concrete fact keeps its own ``process`` classmethod choosing
     between the SimulatedHost seam and ``_run``.
+
+    The real-transport read is two-tier (the ``FileContents`` fallback
+    precedent): the statement rides the login user first, and a read
+    the server denies -- an ``auth_socket`` server admits only root --
+    is re-read elevated with ``sudo``, so the socket authentication the
+    operations ride keeps the facts idempotent instead of parsing the
+    denial as an empty server. The run-as user and any password come
+    from the inventory ``privilege`` data, never from an operation.
     """
 
     MYSQL: str
@@ -230,7 +254,22 @@ class _MysqlFact:
     @classmethod
     async def _run(cls, host: Host, shell: str) -> Any:
         # Real transport: run the statement over asyncssh and parse stdout.
-        stdout = await host.run_shell(shell)
+        # The raw result keeps the exit status and stderr a plain run_shell
+        # read hides: 127 stays CommandNotFoundError (a missing mysql must
+        # never parse as an empty fact), and the access-denied signature
+        # triggers the elevated re-read.
+        result = await host.run_shell_result(shell)
+        if result.exit_status == 127:
+            raise CommandNotFoundError(
+                host.name, shell, result.exit_status, result.stderr
+            )
+        if _ACCESS_DENIED_MARKER in (result.stderr or "").lower():
+            # The login user cannot authenticate: re-read elevated, the
+            # FileContents fallback precedent. A guarded fact's || true
+            # keeps the re-read's own statement errors tolerated.
+            stdout = await host.run_shell_privileged(shell, sudo=True)
+        else:
+            stdout = result.stdout or ""
         return cls.parse(stdout.splitlines())  # type: ignore[attr-defined]
 
 
@@ -254,6 +293,11 @@ class MysqlBinaryLog(TypedDict):
 class MysqlBinaryLogs(_MysqlFact):
     """The server's binary-log files and their sizes.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -269,7 +313,7 @@ class MysqlBinaryLogs(_MysqlFact):
     **Raises:**
 
     ```python
-    HostConnectionError
+    CommandError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -360,6 +404,11 @@ class MysqlColumn(TypedDict):
 class MysqlColumns(_MysqlFact):
     """One table's column definitions, in ordinal order.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -375,7 +424,7 @@ class MysqlColumns(_MysqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -493,6 +542,11 @@ class MysqlConnection(TypedDict):
 class MysqlConnections(_MysqlFact):
     """The server's client connections, without the query text.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -508,7 +562,7 @@ class MysqlConnections(_MysqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -587,6 +641,11 @@ class MysqlDatabase(TypedDict):
 class MysqlDatabases(_MysqlFact):
     """The server's databases, keyed by database name.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -602,7 +661,7 @@ class MysqlDatabases(_MysqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -688,6 +747,11 @@ class MysqlEngine(TypedDict):
 class MysqlEngines(_MysqlFact):
     """The server's storage engines and their capabilities.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -703,7 +767,7 @@ class MysqlEngines(_MysqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -783,6 +847,11 @@ class MysqlIndex(TypedDict):
 class MysqlIndexes(_MysqlFact):
     """A database's index definitions, one entry per index.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -798,7 +867,7 @@ class MysqlIndexes(_MysqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -921,6 +990,11 @@ class MysqlPlugin(TypedDict):
 class MysqlPlugins(_MysqlFact):
     """The server's installed plugins and their status.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -936,7 +1010,7 @@ class MysqlPlugins(_MysqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1026,6 +1100,11 @@ class MysqlReplicaStatus(TypedDict):
 class MysqlReplication(_MysqlFact):
     """The server's replica channels and their replication state.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1041,7 +1120,7 @@ class MysqlReplication(_MysqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1109,6 +1188,11 @@ class MysqlReplication(_MysqlFact):
 class MysqlStatus(_MysqlFact):
     """The server's global runtime status counters, keyed by counter name.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1124,7 +1208,7 @@ class MysqlStatus(_MysqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1203,6 +1287,11 @@ class MysqlTable(TypedDict):
 class MysqlTables(_MysqlFact):
     """One database's tables and their metadata, in name order.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1218,7 +1307,7 @@ class MysqlTables(_MysqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1322,6 +1411,11 @@ MYSQL_ROLE_GRANT_REGEX = r"^GRANT (`[^`]+`@`[^`]+`(?:,\s*`[^`]+`@`[^`]+`)*) TO "
 class MysqlUserGrants(_MysqlFact):
     """One account's grants, keyed by ``database.table`` target.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1337,7 +1431,7 @@ class MysqlUserGrants(_MysqlFact):
     **Raises:**
 
     ```python
-    HostConnectionError
+    CommandError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1499,6 +1593,11 @@ class MysqlUser(TypedDict, total=False):
 class MysqlUsers(_MysqlFact):
     """The server's accounts, keyed by ``user@host``.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1514,7 +1613,7 @@ class MysqlUsers(_MysqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1594,6 +1693,11 @@ class MysqlUsers(_MysqlFact):
 class MysqlVariables(_MysqlFact):
     """The server's global system variables, keyed by variable name.
 
+    A read the server denies the login user (an ``auth_socket`` server
+    admits only root) is re-read elevated with ``sudo`` -- the run-as
+    user and any password come from the inventory ``privilege`` data,
+    never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1609,7 +1713,7 @@ class MysqlVariables(_MysqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1894,7 +1998,7 @@ async def database(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError, OperationError
+    CommandError, CommandNotFoundError, HostConnectionError, OperationError, PrivilegeError
     ```
 
     Examples:
@@ -1981,17 +2085,26 @@ async def database(
 
 @dataclass(frozen=True)
 class MysqlDumpCommand(_MysqlCommand):
-    """``mysqldump ... > <dest>``: dump a database to a host-side file.
+    """``sh -c 'mkdir -p <parent> && mysqldump ... > <dest>'``: dump to a file.
 
     The stateless mutation ``mysql.dump`` yields. ``dest`` is a path on
     the TARGET host (a shell redirect, not a transfer); to pull the
-    bytes controller-side, follow up with ``files.get``.
+    bytes controller-side, follow up with ``files.get``. The parent
+    directory is created when missing, and the redirect is wrapped in
+    ``sh -c`` so the whole write runs elevated under ``sudo sh -c '...'``
+    -- a bare ``sudo mysqldump > /var/backups/...`` would open the
+    redirect as the login user (the GpgExportCommand precedent).
     """
 
     dest: str
 
     def shell(self) -> str:
-        return f"{self._base(executable='mysqldump')} > {shlex.quote(self.dest)}"
+        parent = shlex.quote(str(PurePosixPath(self.dest).parent))
+        inner = (
+            f"mkdir -p {parent} && {self._base(executable='mysqldump')} "
+            f"> {shlex.quote(self.dest)}"
+        )
+        return f"sh -c {shlex.quote(inner)}"
 
 
 async def dump(
@@ -2008,7 +2121,8 @@ async def dump(
 
     Args:
         ctx (OpContext): Execution context for the operation.
-        dest (str): Path on the target host to dump the SQL to.
+        dest (str): Path on the target host to dump the SQL to; its
+            parent directory is created when missing.
         database (str | None, optional): Name of the database to dump.
             Defaults to None.
         mysql_user (str | None, optional): User to connect as.
@@ -2039,11 +2153,12 @@ async def dump(
     # (it is non-idempotent by design). Requires ``mysqldump`` on
     # the target host. database=None renders a bare
     # mysqldump (no --all-databases is injected), so name a database or
-    # supply one through the option file. The redirect runs in the
-    # connection user's shell, so ``dest`` must be writable by that
-    # user (or flag the request ``sudo=True``). ``mysql_password`` is
-    # deliberately dropped. ``**kwargs`` absorbs any further global
-    # arguments.
+    # supply one through the option file. The descriptor creates
+    # ``dest``'s parent directory and wraps the redirect in ``sh -c``,
+    # so a ``sudo=True`` request writes the dump as the run-as user even
+    # into a root-only directory (the gpg.export_key precedent).
+    # ``mysql_password`` is deliberately dropped. ``**kwargs`` absorbs
+    # any further global arguments.
     ctx.changed = True
     ctx.reason = f"mysql dump will be written to {dest}"
     yield MysqlDumpCommand(
@@ -2142,7 +2257,7 @@ async def index(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError, OperationError, ValueError
+    CommandError, CommandNotFoundError, HostConnectionError, OperationError, PrivilegeError, ValueError
     ```
 
     Examples:
@@ -2304,17 +2419,21 @@ async def kill(
 
 @dataclass(frozen=True)
 class MysqlLoadCommand(_MysqlCommand):
-    """``mysql ... < <src>``: load a host-side SQL file into a database.
+    """``sh -c 'mysql ... < <src>'``: load a host-side SQL file.
 
     The stateless mutation ``mysql.load`` yields. ``src`` is a path on
     the TARGET host (a shell redirect, not a transfer); to load
-    controller-side bytes, spool them with ``files.put`` first.
+    controller-side bytes, spool them with ``files.put`` first. The
+    ``<`` redirect is wrapped in ``sh -c`` so the read runs elevated
+    under ``sudo sh -c '...'`` even for a root-only dump file (the
+    IptablesRestoreCommand precedent).
     """
 
     src: str
 
     def shell(self) -> str:
-        return f"{self._base()} < {shlex.quote(self.src)}"
+        inner = f"{self._base()} < {shlex.quote(self.src)}"
+        return f"sh -c {shlex.quote(inner)}"
 
 
 async def load(
@@ -2359,7 +2478,8 @@ async def load(
 
     # ``mysql.load``: non-idempotent, always yields
     # (it is non-idempotent by design). ``src`` is a host-side
-    # path read by the connection user's shell redirect -- reemote
+    # path read by a shell redirect wrapped in ``sh -c`` (so a
+    # ``sudo=True`` request reads it as the run-as user) -- reemote
     # transfers take IO streams, so controller-side bytes go through
     # files.put first (the postgresql.load precedent).
     # ``mysql_password`` is deliberately dropped. ``**kwargs`` absorbs
@@ -2533,7 +2653,7 @@ async def plugin(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError, OperationError, ValueError
+    CommandError, CommandNotFoundError, HostConnectionError, OperationError, PrivilegeError, ValueError
     ```
 
     Examples:
@@ -2673,7 +2793,7 @@ async def privileges(
     **Raises:**
 
     ```python
-    HostConnectionError, OperationError
+    CommandError, HostConnectionError, OperationError, PrivilegeError
     ```
 
     Examples:
@@ -2778,7 +2898,7 @@ async def replica(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError, OperationError
+    CommandError, CommandNotFoundError, HostConnectionError, OperationError, PrivilegeError
     ```
 
     Examples:
@@ -2915,7 +3035,7 @@ async def role(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError, ValueError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError, ValueError
     ```
 
     Examples:
@@ -3156,7 +3276,7 @@ async def table(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError, ValueError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError, ValueError
     ```
 
     Examples:
@@ -3356,7 +3476,7 @@ async def user(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError, OperationError
+    CommandError, CommandNotFoundError, HostConnectionError, OperationError, PrivilegeError
     ```
 
     Examples:
@@ -3596,7 +3716,7 @@ async def variable(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError, ValueError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError, ValueError
     ```
 
     Examples:

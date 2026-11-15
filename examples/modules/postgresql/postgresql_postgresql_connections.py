@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Kim Jarvis.
 # SPDX-License-Identifier: EPL-2.0
 
-"""Example: gather the ``postgresql.PostgresqlConnections`` fact on real CentOS hosts.
+"""Example: gather the ``postgresql.PostgresqlConnections`` fact on real Ubuntu hosts.
 
 This is a *usage* example, not part of the library. It reads a single
 **fact** directly over the *real SSH transport* (asyncssh) instead of
@@ -15,13 +15,13 @@ driving the two-phase execution model:
 2. Materialize each entry into a plain ``Host`` with the default
    ``Host.from_inventory`` factory. Each ``Host`` lazily opens an asyncssh
    connection from its ``connection`` data when a fact is gathered.
-3. Guard the gather with a ``when`` predicate: ``is_centos`` reads only
+3. Guard the gather with a ``when`` predicate: ``is_ubuntu`` reads only
    **static** inventory data -- ``host.group`` -- and the fact is gathered
    on the hosts that pass it. ``gather_fact`` itself takes no ``when``
    parameter, so the predicate filters the host list before the fan-out --
    the direct equivalent of a driver-side skip. Hosts outside the
-   ``"centos"`` group are named on a
-   ``== Skipped (when guard is_centos): ... ==`` line and never connected.
+   ``"ubuntu"`` group are named on a
+   ``== Skipped (when guard is_ubuntu): ... ==`` line and never connected.
 4. Gather ``PostgresqlConnections`` on the guarded hosts at once with the
    driver's ``gather_fact`` helper -- it fans the fact's ``process``
    coroutine out across the inventory with ``asyncio.gather`` and returns
@@ -44,15 +44,16 @@ gathered. ``gather_fact`` and ``process`` are coroutines, so ``main`` is
 async and driven by ``asyncio.run``.
 
 **Host prerequisite.** This example needs a running PostgreSQL server. The
-demo CentOS hosts install the packages fine (``sudo dnf install -y
-postgresql-server``), but their ``staff_t``-confined sudo cannot initialize
-the cluster: ``initdb`` cannot exec ``/usr/bin/postgres`` and
-``postgresql-setup --initdb``'s ``runuser`` cannot setuid, so the server
-never starts and no ``/var/run/postgresql`` socket exists for either the
-login-user fact reads or the ``sudo -u postgres`` operations. Compile-checked
-and exercised by the offline harness, not run against shared hosts; relax the
-demo hosts' sudo or point ``INVENTORY_PATH`` at your own PostgreSQL machines to run
-live.
+demo Ubuntu host runs PostgreSQL 18.6 as a snap whose local socket uses
+``trust`` authentication, so the ``postgres`` superuser role is reachable
+without a password -- but there is no ``postgres`` OS user. The ``sudo=True``
+operations ride under root and connect as that role through
+``psql_user="postgres"``; the login-user fact reads need a role for the login
+user (created out of band) or ``psql_user="postgres"`` on ``gather_fact``. A
+stock apt install uses peer authentication instead, where root reaches the
+``postgres`` role only if ``pg_hba.conf`` allows it (or the inventory
+privilege sets ``sudo_user="postgres"``). Point ``INVENTORY_PATH`` at your
+own PostgreSQL machines to run live.
 
 The path is resolved from ``__file__``, so the example works from any
 working directory; point ``INVENTORY_PATH`` at your own file (or edit
@@ -99,15 +100,15 @@ def load_inventory(path: Path) -> list[dict[str, Any]]:
     return inventory
 
 
-def is_centos(host: Host) -> bool:
-    """``when`` guard: the host belongs to the inventory group ``"centos"``.
+def is_ubuntu(host: Host) -> bool:
+    """``when`` guard: the host belongs to the inventory group ``"ubuntu"``.
 
     Reads only static inventory data (``host.group``, set by the ``"group"``
     key of the inventory entry), never a mutable fact, and stays a stable
     module-level function -- the two rules every ``when`` predicate follows
     so both deploy phases reach the same eligibility decision.
     """
-    return host.group == "centos"
+    return host.group == "ubuntu"
 
 
 async def main() -> None:
@@ -125,10 +126,10 @@ async def main() -> None:
         # predicate is the equivalent of the driver skipping a guarded
         # request on ineligible hosts -- the skipped hosts are never
         # connected, exactly as a skipped request is never materialized.
-        hosts = [host for host in all_hosts if is_centos(host)]
+        hosts = [host for host in all_hosts if is_ubuntu(host)]
         skipped = [host.name for host in all_hosts if host not in hosts]
         if skipped:
-            print("\n== Skipped (when guard is_centos): " + ", ".join(skipped) + " ==")
+            print("\n== Skipped (when guard is_ubuntu): " + ", ".join(skipped) + " ==")
         # Gather the fact across the guarded hosts concurrently: gather_fact
         # fans PostgresqlConnections.process out with asyncio.gather and
         # returns a host-name-keyed mapping, so both SSH round-trips overlap

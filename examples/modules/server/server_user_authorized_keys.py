@@ -35,8 +35,11 @@ plan:
 ``public_keys`` is a tuple: every ``op()`` argument must stay hashable for
 ``compose(dedupe=True)``, so a list would be rejected with
 ``UnhashableArgumentError``. Here the keys are managed for the login user
-themselves, so no elevation is needed -- writing into ``~/.ssh`` under your
-own home is unprivileged. Managing keys for *another* user is the mirror
+themselves -- the name is read from the inventory entry's static
+``connection`` data (the ``username`` key, or its ``user`` alias), never
+hard-coded, so the example follows whatever user each host logs in as --
+and no elevation is needed: writing into ``~/.ssh`` under your own home is
+unprivileged. Managing keys for *another* user is the mirror
 case: flag the request ``sudo=True``, since the directory and file sit in
 that user's home. The baseline's ``delete_keys`` option is supported as well --
 a whole-file rewrite to exactly the requested keys, riding the same
@@ -51,7 +54,8 @@ key file's text for real, and runs the setup and spool-and-install commands
 where they differ.
 
 Every failure mode of the run -- an unreachable host, a rejected elevation,
-an ``OperationError`` for a path that exists as the wrong type (an
+an ``OperationError`` for a user the host does not know (no home directory
+to resolve) or a path that exists as the wrong type (an
 ``authorized_keys`` that is a directory, say), or a command that exits
 non-zero -- reaches ``main`` as a typed error whose message already names the
 host, so ``main`` catches them and prints one line each instead of a
@@ -83,6 +87,7 @@ Run it with::
 """
 
 import asyncio
+import getpass
 import json
 import sys
 from collections.abc import Generator
@@ -150,6 +155,17 @@ def deploy(host: Host) -> Generator[OperationRequest]:
     already exist is decided inside the operation against the freshly
     gathered facts, per phase.
     """
+    # The managed user is the login user themselves, read from the entry's
+    # static ``connection`` data (the ``username`` key or its ``user``
+    # alias) -- a hard-coded name would not exist on hosts that log in as
+    # somebody else, and the operation rejects an unknown user. With no
+    # username in the connection asyncssh falls back to the local user, so
+    # this does too. Static data: the same name in both deploy phases.
+    user = (
+        host.connection.get("username")
+        or host.connection.get("user")
+        or getpass.getuser()
+    )
     # First request: create ``~/.ssh`` (mode 700) and ``authorized_keys``
     # (mode 600) if they are missing, then append both keys. For the login
     # user's own home no elevation is needed; managing another user's keys
@@ -157,7 +173,7 @@ def deploy(host: Host) -> Generator[OperationRequest]:
     yield op(
         server.user_authorized_keys,
         name="Authorise the desktop and laptop keys",
-        user="kjarvis",
+        user=user,
         public_keys=(DESKTOP_KEY, LAPTOP_KEY),
         when=is_centos,
     )
@@ -168,7 +184,7 @@ def deploy(host: Host) -> Generator[OperationRequest]:
     yield op(
         server.user_authorized_keys,
         name="Re-authorise the same keys (idempotence check)",
-        user="kjarvis",
+        user=user,
         public_keys=(DESKTOP_KEY, LAPTOP_KEY),
         when=is_centos,
     )
@@ -214,9 +230,11 @@ async def main() -> None:
         print(f"\nERROR: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     except OperationError as exc:
-        # The ``.ssh`` path or the key file already exists as the wrong type
-        # (an ``authorized_keys`` that is a directory, say). The prepare phase
-        # aborted before anything was sent; the message names host and path.
+        # The managed user does not exist on the host (no home directory to
+        # resolve), or the ``.ssh`` path or the key file already exists as
+        # the wrong type (an ``authorized_keys`` that is a directory, say).
+        # The prepare phase aborted before anything was sent; the message
+        # names the host and the user or path.
         print(f"\nERROR: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     except PrivilegeError as exc:

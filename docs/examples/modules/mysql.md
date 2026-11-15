@@ -10,10 +10,12 @@ client connects as `root` through unix-socket authentication — no
 password travels through operation arguments, plans or logs (the baseline's
 `mysql_password` option is deliberately dropped namespace-wide, and
 `mysql.user`'s `password` parameter is replaced by the comparable
-`auth_plugin`). The read-only fact scripts gather as the login user, so
-that user needs a host-side `~/.my.cnf` (or pass `mysql_defaults_file` /
-`mysql_user` / `mysql_host` to `gather_fact` for a TCP login backed by an
-option file).
+`auth_plugin`). The read-only fact scripts gather as the login user
+first; a read the server denies is re-read elevated with `sudo` (the
+`FileContents` fallback precedent), so the login OS user needs no MySQL
+account of its own. Alternatively keep credentials in a host-side
+`~/.my.cnf` (or pass `mysql_defaults_file` / `mysql_user` / `mysql_host`
+to `gather_fact` for a TCP login backed by an option file).
 
 The read-only fact-gathering examples (`mysql_mysql_databases.py`
 reading `MysqlDatabases`, `mysql_mysql_users.py` reading `MysqlUsers`,

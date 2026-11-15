@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Kim Jarvis.
 # SPDX-License-Identifier: EPL-2.0
 
-"""Example: ensure a role and its membership on real CentOS hosts.
+"""Example: ensure a role and its membership on real Ubuntu hosts.
 
 This is a *usage* example, not part of the library. It drives reemote's
 two-phase execution model end to end over a **real SSH transport**
@@ -39,22 +39,22 @@ first CREATE ROLE and GRANT and reports the role and membership already
 exist.
 
 **Host prerequisite.** This example needs a running MySQL server. The demo
-CentOS hosts install and start it fine (``sudo dnf install -y mysql-server``,
-``sudo systemctl start mysqld``), but their ``staff_t``-confined client
-cannot reach the unix socket ``/var/lib/mysql/mysql.sock`` (``ERROR 2002
-... (13)`` -- SELinux denies ``staff_t`` the ``mysqld_db_t`` socket the
-no-password design needs). Compile-checked and exercised by the offline
-harness, not run against shared hosts; relax the demo hosts' sudo or point
-``INVENTORY_PATH`` at your own MySQL machines to run live.
+Ubuntu host runs MySQL 8.4.10 as a snap whose ``root@localhost`` account uses
+``auth_socket``, so the ``sudo=True`` operations connect through the unix
+socket as root without a password. Fact reads ride the login user first
+and are re-read elevated with ``sudo`` when the server denies them (the
+``FileContents`` fallback precedent), so the login OS user needs no MySQL
+account of its own. Point ``INVENTORY_PATH`` at your own MySQL machines to
+run live.
 
-Every request carries ``when=is_centos``, the declarative eligibility
+Every request carries ``when=is_ubuntu``, the declarative eligibility
 guard: the predicate reads only **static** inventory data --
 ``host.group``, set by the ``"group"`` key of the inventory entry -- and
 is a stable module-level function, so the prepare and apply phases reach
 the same skip decision. The driver skips a rejected request without
-materializing it, so on hosts outside the ``"centos"`` group neither the
+materializing it, so on hosts outside the ``"ubuntu"`` group neither the
 commands nor the facts behind them run, and plan and log render the step
-as ``[skipped: when guard is_centos]`` in its lockstep slot. The path is
+as ``[skipped: when guard is_ubuntu]`` in its lockstep slot. The path is
 resolved from ``__file__``, so the example works from any working
 directory; point ``INVENTORY_PATH`` at your own file to target your
 machines.
@@ -106,15 +106,15 @@ def load_inventory(path: Path) -> list[dict[str, Any]]:
     return inventory
 
 
-def is_centos(host: Host) -> bool:
-    """``when`` guard: the host belongs to the inventory group ``"centos"``.
+def is_ubuntu(host: Host) -> bool:
+    """``when`` guard: the host belongs to the inventory group ``"ubuntu"``.
 
     Reads only static inventory data (``host.group``, set by the ``"group"``
     key of the inventory entry), never a mutable fact, and stays a stable
     module-level function -- the two rules every ``when`` predicate follows
     so both deploy phases reach the same eligibility decision.
     """
-    return host.group == "centos"
+    return host.group == "ubuntu"
 
 
 def deploy(host: Host) -> Generator[OperationRequest]:
@@ -133,7 +133,7 @@ def deploy(host: Host) -> Generator[OperationRequest]:
         role="shop_readonly",
         members=("shop_app@localhost",),
         sudo=True,
-        when=is_centos,
+        when=is_ubuntu,
     )
     yield op(
         mysql.role,
@@ -141,7 +141,7 @@ def deploy(host: Host) -> Generator[OperationRequest]:
         role="shop_readonly",
         members=("shop_app@localhost",),
         sudo=True,
-        when=is_centos,
+        when=is_ubuntu,
     )
 
 

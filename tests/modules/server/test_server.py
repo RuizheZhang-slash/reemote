@@ -5909,9 +5909,22 @@ async def test_user_authorized_keys_raises_on_wrong_typed_file():
         )
 
 
+async def test_user_authorized_keys_raises_on_unknown_user():
+    # The Home fact answers None for a user the host does not know: the
+    # operation refuses it up front instead of building a literal
+    # "None/.ssh" path that would mkdir/chmod a junk directory and only
+    # fail later at chown.
+    host = SimulatedHost(name="h")
+    with pytest.raises(OperationError, match="cannot resolve a home directory"):
+        await materialize(
+            host, op(server.user_authorized_keys, user=UA_USER, public_keys=UA_KEY_A)
+        )
+
+
 async def test_user_authorized_keys_honours_custom_directory_and_filename():
     # The two directory/filename options bypass the Home read entirely,
-    # so an unseeded home_directories seam never causes a "None/.ssh" path.
+    # so an unseeded home_directories seam (an unknown user) never even
+    # reaches the home-directory guard.
     host = SimulatedHost(name="h")
     ctx, commands = await materialize(
         host,

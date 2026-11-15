@@ -108,13 +108,16 @@ class SnapPackage:
     # via the narrowed capture groups.
     #
     # Two deliberate design choices. Rather than gating on ``snap``
-    # existing, the command is wrapped in ``2>/dev/null || true``: an absent
-    # package -- or a host without ``snap``
-    # -- prints nothing to stdout (the ``error: no snap found ...`` line goes
-    # to stderr, suppressed) and exits non-zero, so the guard reads as empty
-    # output rather than raising ``CommandNotFoundError``. Instead of an
-    # empty-dict default (``{}``), reemote reports ``None`` -- the
-    # ``ApkPackage``/``DebPackage``/``RpmPackage``
+    # existing, the command is wrapped in ``2>/dev/null || true``: a snap
+    # absent from the store -- or a host without ``snap`` -- prints nothing to
+    # stdout (the ``error: no snap found ...`` line goes to stderr, suppressed)
+    # and exits non-zero, so the guard reads as empty output rather than
+    # raising ``CommandNotFoundError``. A snap that exists in the store but is
+    # NOT installed still prints its store metadata (name/publisher/snap-id and
+    # the channels table) and exits zero, so presence cannot be keyed on empty
+    # output: ``parse`` keys it on the ``installed:`` row, which only an
+    # installed snap carries. Instead of an empty-dict default (``{}``),
+    # reemote reports ``None`` -- the ``ApkPackage``/``DebPackage``/``RpmPackage``
     # None-on-absent convention, so a caller tests ``info is not None``. A
     # present package whose optional field is simply absent reads that field
     # as its empty-string default, keeping the entry's five keys always
@@ -139,9 +142,11 @@ class SnapPackage:
 
         ``snap info <package>`` prints the package's labelled field rows. The
         ``package`` argument is ``shlex``-quoted, and the ``2>/dev/null ||
-        true`` tail swallows the non-zero exit an absent package (or a host
-        without ``snap``) produces, so nothing reaches stdout and ``process``
-        reports ``None`` -- the ``DebPackage`` tolerance rather than a
+        true`` tail swallows the non-zero exit a snap absent from the store (or
+        a host without ``snap``) produces, so nothing reaches stdout. A snap
+        that exists in the store but is not installed still prints its store
+        metadata, so ``process`` keys presence on the ``installed:`` row rather
+        than on empty output -- the ``DebPackage`` tolerance rather than a
         command-existence gate and an empty-dict answer.
         """
         return f"snap info {shlex.quote(package)} 2>/dev/null || true"
@@ -154,9 +159,13 @@ class SnapPackage:
         its capture group into the corresponding field (the ``channel`` and
         ``version`` groups are the narrowed ``<track>/<risk>`` and version
         tokens, the others the whole rest of the line). Fields never matched
-        keep their empty-string default. Returns ``None`` when no tracked row
-        matched at all -- an absent package printed nothing (the command's
-        ``|| true`` guard). Pure and testable.
+        keep their empty-string default. Returns ``None`` unless the
+        ``installed:`` row matched -- the presence marker. ``snap info``
+        prints store metadata (``name``/``publisher``/``snap-id`` and the
+        ``channels`` table) for any snap in the store, installed or not, so
+        only the ``installed:`` row separates an installed snap from a
+        store-only one; a snap absent from the store prints nothing (the
+        command's ``|| true`` guard). Pure and testable.
         """
         data: SnapPackageInfo = {
             "name": "",
@@ -165,13 +174,18 @@ class SnapPackage:
             "channel": "",
             "version": "",
         }
-        found = False
+        # Presence is the ``installed:`` row (the ``version`` field), not "any
+        # tracked row matched": a store-only snap prints name/publisher/snap-id
+        # but no ``installed:`` row, and must read as None so snap.package
+        # installs it rather than refreshing a snap that is not there.
+        installed = False
         for line in output:
             for key, regex in cls.FIELD_REGEXES.items():
                 if match := regex.match(line):
                     data[key] = match.group(1)  # type: ignore[literal-required]
-                    found = True
-        if not found:
+                    if key == "version":
+                        installed = True
+        if not installed:
             return None
         return data
 

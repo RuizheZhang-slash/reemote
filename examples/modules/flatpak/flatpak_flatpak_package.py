@@ -61,6 +61,16 @@ Every host's connection is closed with ``aclose`` once the facts are gathered.
 ``gather_fact`` and ``process`` are coroutines, so ``main`` is async and driven
 by ``asyncio.run``.
 
+flatpak is *not* set up out of the box on Ubuntu -- Ubuntu ships snap, not
+flatpak -- so this example provisions the tool itself before gathering:
+``main`` first awaits ``provision_flatpak`` from the sibling ``install.py``,
+which installs the ``flatpak`` package with ``apt.packages`` and adds the
+``flathub`` remote. The fact therefore reads on a host where flatpak was never
+installed. Provisioning installs only the tool and the remote, not any
+application, so the ``org.videolan.VLC`` ID this example inspects still reads
+as ``None`` unless it was installed beforehand -- run ``flatpak_packages.py``
+(which installs and then removes VLC) to see a present package's metadata.
+
 Run it with::
 
     uv run python examples/modules/flatpak/flatpak_flatpak_package.py
@@ -78,9 +88,18 @@ from reemote import (
     Host,
     HostConnectionError,
     InventoryError,
+    PrivilegeError,
     gather_fact,
     validate_inventory,
 )
+
+# The flatpak provisioning helper sits beside this script; add its directory
+# to sys.path so ``import install`` resolves whether the example is run by
+# path or imported by the offline example harness.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+from install import provision_flatpak
 
 # examples/modules/flatpak/flatpak_flatpak_package.py -> the project root, so
 # the inventory is found whatever the current working directory is.
@@ -107,13 +126,14 @@ def load_inventory(path: Path) -> list[dict[str, Any]]:
 
 
 def is_ubuntu(host: Host) -> bool:
-    """``when`` guard: the host belongs to the inventory group ``"ubuntu"".
+    """``when`` guard: the host belongs to the inventory group ``"ubuntu"``.
 
     Reads only static inventory data (``host.group``, set by the ``"group"``
     key of the inventory entry), never a mutable fact, and stays a stable
     module-level function -- the two rules every ``when`` predicate follows
-    so both deploy phases reach the same eligibility decision. flatpak is set
-    up out of the box on Ubuntu, so the gather is guarded to that group.
+    so both deploy phases reach the same eligibility decision. The Ubuntu demo
+    host is the one ``install.py`` provisions with flatpak before this gather
+    (see the module docstring), so the gather is guarded to that group.
     """
     return host.group == "ubuntu"
 
@@ -124,6 +144,12 @@ async def main() -> None:
         inventory = load_inventory(INVENTORY_PATH)
         print(f"== Inventory loaded from {INVENTORY_PATH} ==")
         print(", ".join(entry["host"] for entry in inventory))
+
+        # Provision flatpak + the flathub remote on the Ubuntu hosts before
+        # the fact is gathered, so the example reads even on a host where
+        # flatpak was never installed (see install.py).
+        print("\n== Provisioning flatpak (install.py) ==")
+        await provision_flatpak(inventory)
 
         # Materialize every inventory entry up front, then guard the gather
         # below -- a skipped host never reaches the fan-out at all.
@@ -156,11 +182,13 @@ async def main() -> None:
         # whole report -- and it fails before any host is materialized.
         print(f"\nERROR: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
-    except (CommandError, HostConnectionError) as exc:
-        # The library reports an unreachable host or a failed fact command as a
-        # typed error whose message already names the host. The info gather
-        # itself tolerates an absent package (the command ends in ``|| true``),
-        # so a CommandError here means the connection broke. Print that message
+    except (CommandError, HostConnectionError, PrivilegeError) as exc:
+        # The library reports an unreachable host, a failed fact command or a
+        # rejected sudo credential as a typed error whose message already names
+        # the host. The info gather itself tolerates an absent package (the
+        # command ends in ``|| true``), so a CommandError here means the
+        # connection broke or provisioning's remote-add failed; PrivilegeError
+        # means the elevated provisioning step was rejected. Print that message
         # -- no traceback -- and exit non-zero so the failure stays script-visible.
         print(f"\nERROR: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

@@ -56,13 +56,24 @@ org.videolan.VLC``).
 Installing and removing both write system state, so the requests are flagged
 ``sudo=True`` and the driver elevates their commands; the ``flatpak list``
 fact read is unprivileged. Like the other flatpak examples, every request
-carries ``when=is_ubuntu``: flatpak is set up out of the box on Ubuntu, and
-on a host outside that group the driver skips each request without
-materializing it -- neither the ``flatpak`` commands nor the ``FlatpakPackages``
-fact behind them runs -- so plan and log render
+carries ``when=is_ubuntu``: the Ubuntu demo host is the one provisioned with
+flatpak, and on a host outside that group the driver skips each request
+without materializing it -- neither the ``flatpak`` commands nor the
+``FlatpakPackages`` fact behind them runs -- so plan and log render
 ``[skipped: when guard is_ubuntu]``. The shared ``inventory.json`` holds one
 host in the ``"ubuntu"`` group alongside hosts in other groups, so each run
 installs and removes on the Ubuntu host and skips every other one.
+
+flatpak is *not* set up out of the box on Ubuntu -- Ubuntu ships snap, not
+flatpak -- so this example provisions it itself before deploying: ``main``
+first awaits ``provision_flatpak`` from the sibling ``install.py``, which
+installs the ``flatpak`` package with ``apt.packages`` and adds the ``flathub``
+remote the install resolves ``org.videolan.VLC`` against. The example therefore
+runs even on a host where flatpak was never installed. Without that step the
+``FlatpakPackages`` fact read would silently read as ``[]`` (its
+``2>/dev/null || true`` guard swallows the missing command) and the elevated
+``sudo flatpak install`` would fail with ``command not found``; without the
+remote the install could not resolve the application ID.
 
 Run it with::
 
@@ -90,6 +101,14 @@ from reemote import (
     run,
     validate_inventory,
 )
+
+# The flatpak provisioning helper sits beside this script; add its directory
+# to sys.path so ``import install`` resolves whether the example is run by
+# path or imported by the offline example harness.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+from install import provision_flatpak
 
 # examples/modules/flatpak/flatpak_packages.py -> the project root, so the
 # inventory is found whatever the current working directory is.
@@ -128,10 +147,11 @@ def is_ubuntu(host: Host) -> bool:
     key of the inventory entry), never a mutable fact, and stays a stable
     module-level function -- the two rules every ``when`` predicate follows
     so both deploy phases reach the same eligibility decision and the
-    determinism guard holds. flatpak is set up out of the box on Ubuntu, so
-    the install/removal is guarded to that group; on a host without the
-    ``flatpak`` binary every request below would fail before doing anything,
-    so the driver skips them all instead.
+    determinism guard holds. The Ubuntu demo host is the one ``install.py``
+    provisions with flatpak before this example deploys (see the module
+    docstring), so the install/removal is guarded to that group; on a host
+    outside it every request below would fail before doing anything, so the
+    driver skips them all instead.
     """
     return host.group == "ubuntu"
 
@@ -191,6 +211,12 @@ async def main() -> None:
         inventory = load_inventory(INVENTORY_PATH)
         print(f"== Inventory loaded from {INVENTORY_PATH} ==")
         print(", ".join(entry["host"] for entry in inventory))
+
+        # Provision flatpak + the flathub remote on the Ubuntu hosts before
+        # anything below reads or mutates flatpak state, so the example runs
+        # even on a host where flatpak was never installed (see install.py).
+        print("\n== Provisioning flatpak (install.py) ==")
+        await provision_flatpak(inventory)
 
         # --dry: prepare phase only. Facts are still gathered over SSH (the
         # flatpak list read is read-only) so the plan reflects each host's

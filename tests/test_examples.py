@@ -174,6 +174,19 @@ SNAPSHOT_ARGS = {
         "examples/roles/ansible-role-docker/ansible-role-docker.py",
         "build_setup",
     ): lambda name: {name: "noble"},
+    # The Java role migration: one factory closing over the frozen plan
+    # main() builds from LinuxDistribution -- the vars-table package list,
+    # the >= 18 man1 gate and the rendered JAVA_HOME profile content.
+    (
+        "examples/roles/ansible-role-java/ansible-role-java.py",
+        "build_java",
+    ): lambda name: {
+        name: {
+            "packages": ("openjdk-21-jdk",),
+            "man_dir": True,
+            "java_home_content": "export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64\n",
+        }
+    },
     # The nginx role migration: two factories. build_install closes over the
     # frozen PPA-changed host set (empty on the default path); build_configure
     # closes over the frozen plan main() renders between its runs (nginx.conf
@@ -197,6 +210,50 @@ SNAPSHOT_ARGS = {
             "conf_file_path": "/etc/nginx/nginx.conf",
             "state": "started",
             "enabled": True,
+        }
+    },
+    # The PHP role migration: two factories. build_install closes over the
+    # frozen package plan (the version table already resolved); build_configure
+    # closes over the frozen configure plan main() builds between its runs --
+    # every template rendered to a str, the stray sweeps already filtered, the
+    # pool-dir existence and the FPM service state already decided.
+    (
+        "examples/roles/ansible-role-php/ansible-role-php.py",
+        "build_install",
+    ): lambda name: {
+        name: {
+            "packages": ("php8.3-cli", "php8.3-fpm"),
+            "present": True,
+            "latest": False,
+            "no_recommends": False,
+        }
+    },
+    (
+        "examples/roles/ansible-role-php/ansible-role-php.py",
+        "build_configure",
+    ): lambda name: {
+        name: {
+            "directories": ("/etc/php/8.3/cli", "/etc/php/8.3/cli/conf.d"),
+            "php_ini": (("/etc/php/8.3/cli/php.ini", "[PHP]\nmemory_limit = 256M\n"),),
+            "stray_apcu": (),
+            "stray_opcache": (),
+            "apc_installs": (("/etc/php/8.3/cli/conf.d/20-apcu.ini", "extension=apcu.so\n"),),
+            "apc_removals": (),
+            "opcache_installs": (
+                ("/etc/php/8.3/cli/conf.d/10-opcache.ini", "zend_extension=opcache.so\n"),
+            ),
+            "opcache_removals": (),
+            "pool_dir": "/etc/php/8.3/fpm/pool.d",
+            "pool_user": "www-data",
+            "pool_group": "www-data",
+            "pools": (("/etc/php/8.3/fpm/pool.d/www.conf", "[www]\nlisten = 127.0.0.1:9000\n"),),
+            "fpm_service": {
+                "service": "php8.3-fpm",
+                "running": True,
+                "restarted": False,
+                "reloaded": False,
+                "enabled": True,
+            },
         }
     },
 }

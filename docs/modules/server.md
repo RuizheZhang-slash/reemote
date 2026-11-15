@@ -562,6 +562,11 @@ directory is `mkdir -p`'d, chmod'd and chown'd (reusing
 that pair has no twin for); a wrong mode or owner re-runs just that half; a
 path that exists as the wrong type raises
 [`OperationError`][reemote.core.OperationError] during the prepare phase.
+A `user` the host does not know raises the same error before any command is
+planned: the `Home` fact answers `None` for an unexpanded `~user`, and the
+operation refuses it rather than building a literal `None/.ssh` path — the
+baseline would create the junk directory and only fail later at `chown`.
+An explicit `authorized_key_directory` bypasses the `Home` read entirely.
 These state verbs stay in-place shell commands — only the key file's *text*
 is spooled.
 
