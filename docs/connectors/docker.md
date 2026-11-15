@@ -60,7 +60,7 @@ forbidden SSH options.
 | Option | Purpose |
 |---|---|
 | `connector` | Must be `"docker"` to select this connector |
-| `identifier` | Required: an image name or an existing container ID (the baseline's `docker_identifier`) |
+| `identifier` | Required: an image name, or an existing container ID/name (the baseline's `docker_identifier`) |
 | `user` | The `docker exec --user` identity for every command, facts included (the baseline's `docker_user`) |
 | `platform` | `docker run --platform`, e.g. `linux/amd64` (the baseline's `docker_platform`) |
 | `docker_cmd` | Required: the CLI binary to invoke, `docker` or `podman` — no default |
@@ -86,6 +86,27 @@ the baseline's `docker_architecture` is deliberately dropped: `--arch` is not a
   running** on close: never committed, never removed. (the baseline removes a
   stopped container it started itself; reemote deliberately does not touch
   containers it did not create.)
+
+A bare identifier that is **neither** — a named container that was never
+created, or has since been removed — cannot be told apart from an image name by
+syntax alone, so the image attempt still runs (which keeps pulling a
+not-yet-local image working). When that attempt fails, the
+[`HostConnectionError`][reemote.hosts.HostConnectionError] message spells out
+the remedy instead of leaving the CLI's own short-name lookup error as the only
+explanation:
+
+```text
+docker connectivity error on 1 host: beta (beta)
+'beta' is neither an existing container nor an image podman could start. If it names a container you meant to attach to, create it first, for example:
+    podman run -d --name beta ubuntu:24.04 tail -f /dev/null
+To build from an image instead, give an image reference such as 'ubuntu:24.04'.
+```
+
+The guidance is connector-authored and credential-free — it is appended to the
+report as a `hint`, never scraped from the command's stderr, and survives
+aggregation across the inventory deduplicated. An identifier carrying a tag, a
+registry path or a digest (`alpine:3.20`) cannot be a container name, so it gets
+no container advice: the CLI's own stderr stays the diagnosis.
 
 !!! note "Dry runs still start (and commit) a container"
 

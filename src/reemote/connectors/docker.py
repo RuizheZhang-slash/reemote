@@ -24,6 +24,14 @@ An inventory entry selects it with ``connection.connector``::
   close: an existing container is NEVER committed or removed. (reemote
   deliberately does not touch containers it did not create.)
 
+A bare identifier that is *neither* -- a named container that was never
+created, or has since been removed -- cannot be told apart from an image name
+by syntax alone, so the image attempt still runs (which keeps pulling a
+not-yet-local image working). When that attempt fails the
+``HostConnectionError`` carries a ``hint`` spelling out the container-creation
+command, instead of leaving the CLI's own short-name lookup error as the only
+explanation of why the target was unreachable.
+
 Every call shells out to the CLI on the *control machine* via
 ``asyncio.create_subprocess_exec`` -- there is no docker SDK dependency, but
 the ``docker`` binary (and a reachable daemon, usually the local socket or
@@ -97,6 +105,41 @@ def validate_docker_connection(conn: dict[str, Any]) -> None:
         )
 
 
+# An identifier carrying any of these is an image reference and cannot be a
+# container name: Docker/Podman restrict container names to
+# ``[a-zA-Z0-9][a-zA-Z0-9_.-]*``, so a tag, a registry/repository path or a
+# digest unambiguously marks the image-build workflow. A bare name is the
+# ambiguous case -- it can name either a container or an image.
+_IMAGE_REFERENCE_MARKERS = (":", "/", "@")
+
+
+def _unresolved_identifier_hint(cli: str, identifier: str) -> str | None:
+    """Guidance for an identifier that is neither a container nor an image.
+
+    A failed ``container inspect`` only proves the identifier is not an
+    existing container; ``connect`` then tries the image workflow, which is
+    right for an image reference but leaves a *missing named container* (the
+    website tutorial's ``beta``) dying on the CLI's own short-name lookup
+    error. So when that run fails and the identifier is a bare name -- meaning
+    it could have named a container -- return the creation command the user
+    needs, built from the same CLI binary and identifier the inventory gave.
+
+    An image reference returns None: it cannot be a container name, so the
+    CLI's stderr (an unreachable daemon, an unknown tag) is already the right
+    diagnosis and container advice would only mislead.
+    """
+    if any(marker in identifier for marker in _IMAGE_REFERENCE_MARKERS):
+        return None
+    return (
+        f"{identifier!r} is neither an existing container nor an image {cli} "
+        f"could start. If it names a container you meant to attach to, create "
+        f"it first, for example:\n"
+        f"    {cli} run -d --name {identifier} ubuntu:24.04 tail -f /dev/null\n"
+        f"To build from an image instead, give an image reference such as "
+        f"'ubuntu:24.04'."
+    )
+
+
 @dataclass
 class DockerHost(Host):
     """One container target, driven through the local docker/podman CLI.
@@ -120,6 +163,15 @@ class DockerHost(Host):
     ``docker exec --user`` identity applied to every command, including
     fact gathering. Transfers (``docker cp``) are unprivileged, exactly like
     the scp seams they replace.
+
+    A ``connect`` failure for a *bare* identifier that is neither an existing
+    container nor an image the CLI could start reports the remedy in the
+    ``HostConnectionError`` message -- the ``run -d --name <identifier> ...``
+    command that would create the container -- because a named container that
+    does not exist cannot be told apart from an image name until the image
+    attempt fails. An image reference (a tag, a registry path or a digest)
+    gets no such advice: it cannot be a container name, so the CLI's own
+    stderr remains the diagnosis.
 
     Docker daemon-level failures (``docker exec`` exit 125) surface as
     ordinary non-zero exits: ``CommandError`` on the apply path, tolerated
@@ -169,14 +221,18 @@ class DockerHost(Host):
             stderr=stderr.decode("utf-8"),
         )
 
-    async def _checked_local(self, argv: list[str], identifier: str) -> SimpleNamespace:
+    async def _checked_local(
+        self, argv: list[str], identifier: str, *, hint: str | None = None
+    ) -> SimpleNamespace:
         """Run a lifecycle CLI command, wrapping a non-zero exit as a failure.
 
         Used by ``connect`` for ``container start`` and ``run``: a non-zero
         exit becomes a ``HostConnectionError`` whose cause is the
         ``CommandError`` carrying the command text, exit status and stderr,
         so the aggregate report names the host while the detail stays
-        reachable for diagnosis.
+        reachable for diagnosis. ``hint`` is optional connector-authored
+        guidance appended to that report (see ``_unresolved_identifier_hint``);
+        it never carries anything read out of the command's stderr.
         """
         result = await self._run_local(argv)
         if result.exit_status != 0:
@@ -184,7 +240,7 @@ class DockerHost(Host):
                 self.name, shlex.join(argv), result.exit_status, result.stderr
             )
             raise HostConnectionError(
-                [(self.name, identifier, failure)], transport="docker"
+                [(self.name, identifier, failure)], transport="docker", hint=hint
             ) from failure
         return result
 
@@ -200,6 +256,11 @@ class DockerHost(Host):
         start/run is wrapped in ``HostConnectionError`` (labelled ``docker``)
         so ``run_prepare`` aggregates unreachable container targets exactly
         like unreachable SSH hosts.
+
+        A failed run for a *bare* identifier additionally carries a ``hint``
+        naming the ``run -d --name <identifier> ...`` command that would create
+        the container, because a named container that does not exist is
+        indistinguishable from an image name until the image attempt fails.
         """
         container_id = getattr(self, "_container_id", None)
         if container_id is not None:
@@ -223,7 +284,11 @@ class DockerHost(Host):
                 if platform:
                     argv += ["--platform", platform]
                 argv += [identifier, "tail", "-f", "/dev/null"]
-                started = await self._checked_local(argv, identifier)
+                started = await self._checked_local(
+                    argv,
+                    identifier,
+                    hint=_unresolved_identifier_hint(cli, identifier),
+                )
                 lines = started.stdout.splitlines()
                 if not lines or not lines[-1].strip():
                     failure = RuntimeError(

@@ -389,10 +389,16 @@ class HostConnectionError(RuntimeError):
     callers never have to catch asyncssh internals. ``DockerHost.connect``
     reuses it for container targets (a missing CLI binary, a failed
     ``run``/``start``), labelling the message with ``transport="docker"``
-    instead of the default ``"SSH"``. The message stays generic:
-    it names the unreachable host(s) and nothing else, while the original
-    exception is preserved as ``__cause__`` (and per host in ``failures``) for
-    diagnosis. ``drivers.run_prepare`` merges the per-host failures from a
+    instead of the default ``"SSH"``. The message names the unreachable
+    host(s) and never copies detail out of the underlying exception, which is
+    preserved as ``__cause__`` (and per host in ``failures``) for diagnosis --
+    so a transport's own prose cannot become the user-facing error by accident.
+    A transport may optionally supply ``hint``: explicit, credential-free
+    guidance authored by the connector rather than scraped from stderr, which
+    is appended to the message so the caller learns what to *do* about the
+    failure. ``DockerHost.connect`` uses it to explain an identifier that is
+    neither an existing container nor an image the CLI could start.
+    ``drivers.run_prepare`` merges the per-host failures from a
     concurrent inventory into one aggregate via ``aggregate``, so every
     unreachable host is reported at once instead of only the first to fail.
 
@@ -404,14 +410,19 @@ class HostConnectionError(RuntimeError):
         failures: Iterable[tuple[str, str, BaseException]],
         *,
         transport: str = "SSH",
+        hint: str | None = None,
     ) -> None:
         self.failures: tuple[tuple[str, str, BaseException], ...] = tuple(failures)
         self.transport = transport
+        self.hint = hint
         hosts = ", ".join(f"{name} ({address})" for name, address, _ in self.failures)
         label = "host" if len(self.failures) == 1 else "hosts"
-        super().__init__(
+        message = (
             f"{transport} connectivity error on {len(self.failures)} {label}: {hosts}"
         )
+        if hint:
+            message = f"{message}\n{hint}"
+        super().__init__(message)
 
     @property
     def host_names(self) -> tuple[str, ...]:
@@ -422,12 +433,19 @@ class HostConnectionError(RuntimeError):
     def aggregate(
         cls, errors: Iterable["HostConnectionError"]
     ) -> "HostConnectionError":
-        """Merge several per-host errors into one naming every failed host."""
+        """Merge several per-host errors into one naming every failed host.
+
+        The distinct ``hint`` guidance survives the merge in first-seen order,
+        deduplicated, so several hosts missing the same container explain the
+        remedy once instead of repeating it per host.
+        """
         collected = list(errors)
         failures = [failure for error in collected for failure in error.failures]
+        hints = list(dict.fromkeys(error.hint for error in collected if error.hint))
         merged = cls(
             failures,
             transport=collected[0].transport if collected else "SSH",
+            hint="\n".join(hints) if hints else None,
         )
         # Keep the first underlying transport error reachable for diagnosis.
         if failures:

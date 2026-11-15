@@ -280,6 +280,30 @@ async def test_connect_runs_an_image_with_platform():
     ]
 
 
+async def test_connect_builds_from_a_bare_image_name():
+    # A bare name is ambiguous (container or image), so the image workflow must
+    # still work for it: no extra probe and no hint, just inspect then run.
+    host, cli = make_host({"identifier": "alpine"}, container_id="feedface1234")
+
+    assert await host.connect() == "feedface1234"
+    assert cli.subcommands() == [
+        ("container", "inspect", "alpine"),
+        ("run", "-d", "alpine", "tail", "-f", "/dev/null"),
+    ]
+
+
+async def test_connect_attaches_to_an_existing_named_container():
+    host, cli = make_host({"identifier": "beta", "docker_cmd": "podman"}, existing=True)
+
+    assert await host.connect() == "beta"
+    assert cli.subcommands() == [("container", "inspect", "beta")]
+
+    # An existing container is left running: never committed, never removed.
+    await host.aclose()
+    assert host.image_id is None
+    assert cli.subcommands() == [("container", "inspect", "beta")]
+
+
 async def test_connect_wraps_a_missing_cli_binary():
     host, cli = make_host()
     cli.missing_binary = True
@@ -304,6 +328,53 @@ async def test_connect_wraps_a_failed_run():
     assert isinstance(cause, CommandError)
     assert cause.exit_status == 125
     assert "daemon not running" in cause.stderr
+
+
+async def test_connect_missing_named_container_names_the_creation_command():
+    # The website tutorial's failure: ``beta`` was never created (or has since
+    # been removed), so inspect fails and the image attempt dies on the CLI's
+    # short-name lookup. The report must say how to create the container.
+    host, cli = make_host({"identifier": "beta", "docker_cmd": "podman"})
+    cli.run_result = _result(
+        125, stderr='Error: short-name "beta" did not resolve to an alias'
+    )
+
+    with pytest.raises(HostConnectionError) as excinfo:
+        await host.connect()
+
+    err = excinfo.value
+    assert "docker connectivity error on 1 host: build1 (beta)" in str(err)
+    assert "neither an existing container nor an image podman could start" in str(err)
+    assert "podman run -d --name beta ubuntu:24.04 tail -f /dev/null" in str(err)
+    # The CLI's own failure stays chained for diagnosis.
+    cause = err.__cause__
+    assert isinstance(cause, CommandError)
+    assert "did not resolve to an alias" in cause.stderr
+
+
+async def test_missing_container_hint_uses_the_configured_cli():
+    host, cli = make_host({"identifier": "beta"})  # docker_cmd stays "docker"
+    cli.run_result = _result(125, stderr="Unable to find image 'beta:latest'")
+
+    with pytest.raises(HostConnectionError) as excinfo:
+        await host.connect()
+
+    assert "docker run -d --name beta ubuntu:24.04 tail -f /dev/null" in str(
+        excinfo.value
+    )
+
+
+async def test_connect_image_reference_failure_gets_no_container_advice():
+    # 'alpine:3.20' cannot be a container name, so the daemon's own stderr is
+    # already the right diagnosis -- container-creation advice would mislead.
+    host, cli = make_host()
+    cli.run_result = _result(125, stderr="daemon not running")
+
+    with pytest.raises(HostConnectionError) as excinfo:
+        await host.connect()
+
+    assert excinfo.value.hint is None
+    assert "run -d --name" not in str(excinfo.value)
 
 
 async def test_connect_wraps_a_failed_start():
@@ -341,6 +412,52 @@ async def test_run_prepare_aggregates_docker_connection_errors():
     err = excinfo.value
     assert err.host_names == ("build1", "build2")
     assert "docker connectivity error on 2 hosts" in str(err)
+
+
+async def test_run_prepare_surfaces_the_container_creation_hint():
+    def deploy(host: Host) -> Generator[OperationRequest]:
+        yield op(files.file, path="/etc/motd")
+
+    cli = FakeDockerCli()
+    cli.run_result = _result(
+        125, stderr='Error: short-name "beta" did not resolve to an alias'
+    )
+    host = DockerHost(
+        name="beta",
+        connection={
+            "connector": "docker",
+            "identifier": "beta",
+            "docker_cmd": "podman",
+        },
+    )
+    host._run_local = cli.run
+
+    with pytest.raises(HostConnectionError) as excinfo:
+        await run_prepare([host], deploy)
+
+    # This is the string an example prints, so the guidance must reach it
+    # through the driver's aggregation rather than staying on the cause.
+    assert "podman run -d --name beta ubuntu:24.04 tail -f /dev/null" in str(
+        excinfo.value
+    )
+
+
+async def test_missing_container_hint_survives_aggregation_once():
+    errors = []
+    for name in ("build1", "build2"):
+        host, cli = make_host({"identifier": "beta", "docker_cmd": "podman"})
+        host.name = name
+        cli.run_result = _result(125, stderr="short-name did not resolve")
+        with pytest.raises(HostConnectionError) as excinfo:
+            await host.connect()
+        errors.append(excinfo.value)
+
+    merged = HostConnectionError.aggregate(errors)
+
+    assert merged.host_names == ("build1", "build2")
+    assert "docker connectivity error on 2 hosts" in str(merged)
+    # The same container is missing on both hosts: explain the remedy once.
+    assert str(merged).count("podman run -d --name beta") == 1
 
 
 # --- _run_shell: exec wrapping and failure classification -----------------------

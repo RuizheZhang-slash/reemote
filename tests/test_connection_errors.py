@@ -154,3 +154,38 @@ async def test_run_surfaces_the_aggregate_and_still_closes_hosts():
         await run(inventory, deploy, host_factory=unreachable_factory)
 
     assert excinfo.value.host_names == ("web1", "web2")
+
+
+# --- The optional hint channel -------------------------------------------------
+
+
+def test_default_message_is_unchanged_and_a_hint_is_appended():
+    cause = ConnectionResetError(104, "Connection reset by peer")
+    failures = [("web1", "10.0.0.1", cause)]
+
+    plain = HostConnectionError(failures)
+    assert plain.hint is None
+    assert str(plain) == "SSH connectivity error on 1 host: web1 (10.0.0.1)"
+
+    hinted = HostConnectionError(failures, hint="create the container first")
+    assert str(hinted) == (
+        "SSH connectivity error on 1 host: web1 (10.0.0.1)\ncreate the container first"
+    )
+    # A hint is connector-authored guidance, never detail scraped from the cause.
+    assert "Connection reset by peer" not in str(hinted)
+
+
+def test_aggregate_keeps_distinct_hints_and_deduplicates():
+    cause = ConnectionResetError(104, "Connection reset by peer")
+    first = HostConnectionError([("web1", "10.0.0.1", cause)], hint="alpha")
+    second = HostConnectionError([("web2", "10.0.0.2", cause)], hint="alpha")
+    third = HostConnectionError([("web3", "10.0.0.3", cause)], hint="beta")
+    plain = HostConnectionError([("web4", "10.0.0.4", cause)])
+
+    merged = HostConnectionError.aggregate([first, second, third, plain])
+
+    assert merged.hint == "alpha\nbeta"
+    assert str(merged).count("alpha") == 1
+    assert merged.host_names == ("web1", "web2", "web3", "web4")
+    # An inventory with no guidance at all keeps the bare generic message.
+    assert HostConnectionError.aggregate([plain]).hint is None
