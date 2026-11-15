@@ -151,10 +151,14 @@ class DockerHost(Host):
         the same shape ``run_shell`` already consumes). The argv list is
         executed directly, without a local shell, so nothing here needs
         shell-quoting; the container-side command travels as one argv
-        element to ``sh -c``.
+        element to ``sh -c``. stdin is ``DEVNULL`` -- the mirror of the SSH
+        channel closure in ``Host._run_shell`` -- so a CLI (or, through
+        ``exec -i``, a container command) that reads stdin sees EOF instead
+        of blocking on the control machine's terminal.
         """
         proc = await asyncio.create_subprocess_exec(
             *argv,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

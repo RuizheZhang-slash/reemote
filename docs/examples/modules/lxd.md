@@ -203,12 +203,16 @@ The alias operation: `lxd.image_alias` reads
 already targeting the desired fingerprint is a no-op; one targeting a
 DIFFERENT fingerprint is deleted and recreated (the CLI has no
 alias-repoint verb). `present=False` removes the alias only — the image
-itself stays cached. The script's `FINGERPRINT` constant is a
-placeholder: replace it with a cached image's fingerprint (inspect the
-store with `lxd_lxd_images.py` first). It yields the same create request
-twice — the second is a guaranteed no-op in the apply phase, because the
-first alias is visible to it through the fresh per-step fact cache (in
-the prepare phase, where nothing is sent, both plan as changes).
+itself stays cached. The daemon rejects an unknown fingerprint, so the
+script reads a real one with the gather → snapshot → factory split
+(`two_deploy_split.py`'s shape): run 1 caches `ubuntu/24.04` with
+`lxd.image`, `gather_fact` freezes each ubuntu host's `LxdImages`
+fingerprint between the runs, and a factory closing over that frozen
+dict builds the alias deploy once for both phases. It yields the same
+create request twice — the second is a guaranteed no-op in the apply
+phase, because the first alias is visible to it through the fresh
+per-step fact cache (in the prepare phase, where nothing is sent, both
+plan as changes).
 
 ::: lxd_image_alias
     options:

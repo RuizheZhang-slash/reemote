@@ -830,9 +830,18 @@ class Host:
         exit: fact gathering tolerates it (except exit 127, a missing command),
         the apply path raises ``CommandError``. The result carries
         ``exit_status``, ``stdout`` and ``stderr``.
+
+        The channel's stdin is closed (``DEVNULL``): a non-interactive shell
+        must never leave it an open pipe, or a command that reads stdin --
+        ``lxc profile create``, ``lxc launch``, ``lxc snapshot`` -- blocks
+        forever waiting for input that never comes. ``input=""`` is not a
+        substitute: asyncssh only writes EOF for a *truthy* input, so the
+        empty string leaves the pipe open too.
         """
+        import asyncssh  # lazy, like connect(): already imported by the time we run
+
         conn = await self.connect()
-        return await conn.run(shell, check=False)
+        return await conn.run(shell, check=False, stdin=asyncssh.DEVNULL)
 
     async def run_shell(self, shell: str, *, check: bool = False) -> str:
         """Run one shell command over SSH and return its stdout as text.
@@ -1201,12 +1210,19 @@ class Host:
         self._askpass_path = None
         self._su_askpass_path = None
         if conn is not None:
+            import asyncssh  # lazy, like connect(): already imported by now
+
             for path in helpers:
                 if not path:
                     continue
                 # Best-effort cleanup: a dropped connection must not fail teardown.
+                # stdin closed like every other channel (see ``_run_shell``).
                 with contextlib.suppress(Exception):
-                    await conn.run(f"rm -f {shlex.quote(path)}", check=False)
+                    await conn.run(
+                        f"rm -f {shlex.quote(path)}",
+                        check=False,
+                        stdin=asyncssh.DEVNULL,
+                    )
         if conn is None:
             return
         self._conn = None

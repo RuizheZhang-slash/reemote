@@ -77,6 +77,12 @@ SNAPSHOT_ARGS = {
         "examples/modules/server/server_kill.py",
         "build_kill",
     ): lambda name: {name: {4321: {"command": "nginx"}}},
+    # The lxd alias example freezes one cached-image fingerprint per host
+    # between its runs; a 64-char hex str is the shape main() selects.
+    (
+        "examples/modules/lxd/lxd_image_alias.py",
+        "build_alias_image",
+    ): lambda name: {name: "0" * 64},
     # The DataDog role migration: five factories, each closing over the
     # frozen reads its deploy branches on. The payloads are plain
     # bytes/str/tuple/frozenset -- the shapes main() freezes between runs.

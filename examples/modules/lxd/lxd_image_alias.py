@@ -5,29 +5,37 @@
 
 This is a *usage* example, not part of the library. It drives reemote's
 two-phase execution model end to end over a **real SSH transport**
-(asyncssh):
-
-1. Read ``inventory.json`` in the project root and parse it as JSON
-   -- an inventory is just a list of dictionaries, which is exactly what
-   JSON expresses -- then validate it up front with ``validate_inventory``
-   so a malformed file fails with an ``InventoryError`` naming the
-   offending entry, *before* any host is materialized or connected.
-2. Build the deploy script as a generator yielding ``OperationRequest``
-   objects. Every request is flagged ``sudo=True``, so the ``lxc`` client
-   talks to the LXD daemon socket as root -- no password travels through
-   operation arguments, plans or logs.
-3. Run the prepare phase to get a plan, and the apply phase to execute it.
+(asyncssh): the inventory is read from the project root's
+``inventory.json`` and validated up front with ``validate_inventory``,
+so a malformed file fails with an ``InventoryError`` naming the
+offending entry before any host is materialized or connected.
 
 ``lxd.image_alias`` reads the ``LxdImageAliases`` fact: an alias already
 targeting ``fingerprint`` is a no-op, one pointing elsewhere is REPOINTED
 (delete then create), an absent one is created, and ``present=False``
 deletes it. Creating or repointing without a ``fingerprint`` raises
-``ValueError``. The ``FINGERPRINT`` constant below is a placeholder:
-replace it with a cached image's fingerprint (inspect the store with
-``lxd_lxd_images.py`` first) -- the daemon rejects an unknown fingerprint
-at apply time.
+``ValueError`` -- and the daemon rejects an *unknown* fingerprint at
+apply time, so a placeholder never works: the target must be the real
+fingerprint of a cached image.
 
-The deploy yields the same create request twice: the second is a
+That fingerprint is a mutable fact, and a deploy generator runs twice
+(prepare against pre-deployment state, apply against live state), so
+reading it inside the generator is the phase-dependent argument the
+determinism guard forbids. The script uses the sanctioned gather ->
+snapshot -> factory split (the shape ``two_deploy_split.py`` teaches):
+
+1. Run 1 caches the image (``lxd.image``, branch-free): afterwards an
+   image aliased ``ubuntu/24.04`` is guaranteed on every eligible host.
+2. A fact SNAPSHOT between the runs: ``gather_fact`` fans the
+   ``LxdImages`` read out across the ubuntu hosts and the script freezes
+   each host's ``ubuntu/24.04`` fingerprint into a plain dict.
+3. ``build_alias_image(fingerprints)`` -- a factory closing over that
+   frozen dict -- returns the alias deploy, built ONCE before both of
+   its phases. Every request is flagged ``sudo=True``, so the ``lxc``
+   client talks to the LXD daemon socket as root -- no password travels
+   through operation arguments, plans or logs.
+
+The alias deploy yields the same create request twice: the second is a
 guaranteed no-op in the apply phase, because the first alias is visible
 to it through the fresh per-step fact cache (in the prepare phase, where
 nothing is sent, both plan as changes).
@@ -35,10 +43,9 @@ nothing is sent, both plan as changes).
 **Host prerequisite.** This example needs the ``lxc`` CLI and a running,
 initialized LXD daemon (login user in the ``lxd`` group for fact reads;
 operations ride ``sudo=True``). The demo Ubuntu host has LXD snap-installed
-and the login user in the ``lxd`` group, but its daemon is not initialized
-(no storage pool), so run ``sudo lxd init`` there before creating anything.
-Compile-checked and exercised by the offline harness; point
-``INVENTORY_PATH`` at LXD-enabled machines to run live.
+and initialized with a ``default`` storage pool; on a fresh machine run
+``sudo lxd init`` there first. Compile-checked and exercised by the offline
+harness; point ``INVENTORY_PATH`` at LXD-enabled machines to run live.
 
 Every request carries ``when=is_ubuntu``, the declarative eligibility
 guard: the predicate reads only **static** inventory data --
@@ -47,10 +54,12 @@ is a stable module-level function, so the prepare and apply phases reach
 the same skip decision. The driver skips a rejected request without
 materializing it, so on hosts outside the ``"ubuntu"`` group neither the
 commands nor the facts behind them run, and plan and log render the step
-as ``[skipped: when guard is_ubuntu]`` in its lockstep slot. The path is
-resolved from ``__file__``, so the example works from any working
-directory; point ``INVENTORY_PATH`` at your own file to target your
-machines.
+as ``[skipped: when guard is_ubuntu]`` in its lockstep slot. The snapshot
+is guarded the same way: ``gather_fact`` takes no ``when`` parameter, so
+the script filters the host list to the ``ubuntu`` group before the
+fan-out. The path is resolved from ``__file__``, so the example works
+from any working directory; point ``INVENTORY_PATH`` at your own file to
+target your machines.
 
 Run it with::
 
@@ -60,7 +69,7 @@ Run it with::
 import asyncio
 import json
 import sys
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any
 
@@ -73,15 +82,18 @@ from reemote import (
     PrivilegeError,
     format_log,
     format_plan,
+    gather_fact,
     lxd,
     op,
     run,
     validate_inventory,
 )
 
-# Placeholder fingerprint: replace with a cached image's 64-character hex
-# fingerprint -- see lxd_lxd_images.py to inspect the image store.
-FINGERPRINT = "0" * 64
+# The image run 1 caches, and the local alias the snapshot selects it by:
+# the ubuntu: remote serves the container images, and lxd.image copies the
+# reference under this alias (an already-cached image is a no-op).
+CACHED_IMAGE = "ubuntu/24.04"
+IMAGE_SOURCE = "ubuntu:24.04"
 
 # examples/modules/lxd/lxd_image_alias.py -> the project root, so the inventory
 # is found whatever the current working directory is.
@@ -109,36 +121,66 @@ def is_ubuntu(host: Host) -> bool:
     Reads only static inventory data (``host.group``, set by the ``"group"``
     key of the inventory entry), never a mutable fact, and stays a stable
     module-level function -- the two rules every ``when`` predicate follows
-    so both deploy phases reach the same eligibility decision.
+    so both deploy phases reach the same eligibility decision. It guards both
+    the requests and (as a host-list filter) the ``LxdImages`` snapshot,
+    keeping the ``lxc`` work off the hosts without LXD.
     """
     return host.group == "ubuntu"
 
 
-def deploy(host: Host) -> Generator[OperationRequest]:
-    """Ensure the ubuntu-noble alias targets FINGERPRINT, twice.
+def cache_image(host: Host) -> Generator[OperationRequest]:
+    """Deploy 1: cache the image only, branch-free, one request per phase.
 
-    Branch-free, so the request sequence is identical in the prepare and
-    apply phases (a branch on a mutable fact would raise DeterminismError).
-
-    Aliasing an image needs the LXD daemon socket, so every request is
-    flagged ``sudo=True`` and rides under root.
+    Caching needs the LXD daemon socket, so the request is flagged
+    ``sudo=True`` and rides under root.
     """
     yield op(
-        lxd.image_alias,
-        name="Point ubuntu-noble at the cached image",
-        alias="ubuntu-noble",
-        fingerprint=FINGERPRINT,
+        lxd.image,
+        name=f"Cache the {CACHED_IMAGE} image",
+        image=CACHED_IMAGE,
+        source=IMAGE_SOURCE,
         sudo=True,
         when=is_ubuntu,
     )
-    yield op(
-        lxd.image_alias,
-        name="Point ubuntu-noble at the cached image (again)",
-        alias="ubuntu-noble",
-        fingerprint=FINGERPRINT,
-        sudo=True,
-        when=is_ubuntu,
-    )
+
+
+def build_alias_image(
+    fingerprints: dict[str, str],
+) -> Callable[[Host], Generator[OperationRequest]]:
+    """Deploy 2 factory: close over the frozen post-cache fingerprints.
+
+    The returned generator looks up ``fingerprints.get(host.name)`` -- a
+    plain dict lookup on a snapshot taken BEFORE this deploy's prepare
+    phase -- so both phases resolve the same fingerprint and the
+    determinism guard holds. Reading the live ``LxdImages`` fact here
+    instead would re-introduce the phase-dependent argument. The snapshot
+    only covers the ubuntu hosts (the gather was filtered by
+    ``is_ubuntu``), so the lookup returns None for the others and their
+    request stream is empty; the requests also carry ``when=is_ubuntu``.
+    """
+
+    def alias_image(host: Host) -> Generator[OperationRequest]:
+        fingerprint = fingerprints.get(host.name)
+        if fingerprint is None:
+            return
+        yield op(
+            lxd.image_alias,
+            name="Point ubuntu-noble at the cached image",
+            alias="ubuntu-noble",
+            fingerprint=fingerprint,
+            sudo=True,
+            when=is_ubuntu,
+        )
+        yield op(
+            lxd.image_alias,
+            name="Point ubuntu-noble at the cached image (again)",
+            alias="ubuntu-noble",
+            fingerprint=fingerprint,
+            sudo=True,
+            when=is_ubuntu,
+        )
+
+    return alias_image
 
 
 async def main() -> None:
@@ -147,16 +189,66 @@ async def main() -> None:
         print(f"== Inventory loaded from {INVENTORY_PATH} ==")
         print(", ".join(entry["host"] for entry in inventory))
 
-        # --dry: prepare phase only. Facts are still gathered over SSH (read-only)
-        # so the plan reflects each host's real pre-deployment state; no command
-        # that mutates a host is sent.
-        plans, _, _hosts = await run(inventory, deploy, dry=True)
-        print("== Plan (prepare phase, --dry) ==")
+        # Run 1: prepare + apply the image cache. Its apply-phase join is
+        # the barrier guaranteeing every host finished before the snapshot
+        # below. The when=is_ubuntu guard skips the non-Ubuntu hosts.
+        plans, report, hosts = await run(inventory, cache_image)
+        print("\n== Deploy 1: cache the image ==")
+        print(format_plan(plans))
+        assert report is not None
+        print(format_log(report))
+
+        # The snapshot: one concurrent read of the real post-cache image
+        # store, keyed by host name. gather_fact has no ``when`` parameter,
+        # so the is_ubuntu predicate filters the host list before the
+        # fan-out -- the LxdImages read would fail on hosts without lxc.
+        # run closed these hosts, but connect is lazy, so gather_fact
+        # re-opens the eligible ones; close them all again when done.
+        ubuntu_hosts = [host for host in hosts if is_ubuntu(host)]
+        try:
+            snapshot = await gather_fact(ubuntu_hosts, lxd.LxdImages)
+        finally:
+            for host in hosts:
+                await host.aclose()
+
+        # Freeze the fingerprint of the image run 1 guaranteed: the entry
+        # carrying the CACHED_IMAGE alias. A plain str per host -- hashable
+        # and value-comparable, so both phases build identical requests.
+        fingerprints: dict[str, str] = {}
+        for name, images in snapshot.items():
+            entry = next(
+                (
+                    image
+                    for image in images
+                    if any(
+                        alias.get("name") == CACHED_IMAGE
+                        for alias in image.get("aliases") or []
+                    )
+                ),
+                None,
+            )
+            assert entry is not None, (
+                f"{name}: run 1 left no image aliased {CACHED_IMAGE!r}"
+            )
+            fingerprints[name] = entry["fingerprint"]
+        print("\n== Post-cache snapshot (LxdImages) ==")
+        for name, fingerprint in fingerprints.items():
+            print(f"{name}: {CACHED_IMAGE} -> {fingerprint}")
+
+        # Build deploy 2 ONCE, before either of its phases: both the dry
+        # run and the real run use the very same callable closing over the
+        # same frozen dict -- determinism by construction.
+        alias_deploy = build_alias_image(fingerprints)
+
+        # --dry for deploy 2: the plan is honest because the fingerprint
+        # consults the post-cache snapshot, not pre-deployment state.
+        plans, _, _hosts = await run(inventory, alias_deploy, dry=True)
+        print("\n== Deploy 2 plan (prepare phase, --dry) ==")
         print(format_plan(plans))
 
-        # Real run: prepare, then apply in lockstep across hosts over SSH.
-        plans, report, _hosts = await run(inventory, deploy)
-        print("\n== Run log (apply phase) ==")
+        # Real run 2: point the alias at the cached image, twice.
+        plans, report, _hosts = await run(inventory, alias_deploy)
+        print("\n== Deploy 2 run log (apply phase) ==")
         assert report is not None
         print(format_log(report))
     except (OSError, json.JSONDecodeError) as exc:
@@ -173,8 +265,7 @@ async def main() -> None:
         raise SystemExit(1) from exc
     except (CommandError, HostConnectionError, PrivilegeError) as exc:
         # The library already reports every host-level failure as a typed error
-        # whose message names the host and the failing command -- including the
-        # CLI's rejection of an unknown fingerprint at apply time. Print that
+        # whose message names the host and the failing command. Print that
         # message -- no traceback -- and exit non-zero so the failure stays
         # script-visible.
         print(f"\nERROR: {exc}", file=sys.stderr)
