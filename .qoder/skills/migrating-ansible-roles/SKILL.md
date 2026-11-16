@@ -267,7 +267,12 @@ Offline first (no real hosts, no approval needed):
     to `existing_files` (the `FileExists` seam), so a directory created in
     pass 1 and gated on `FileExists` in pass 2 needs the two stores synced
     by hand (`existing_files |= directory_stats.keys()`) or its create
-    request re-fires. A package *install* needs no bridge: the seam applies
+    request re-fires. `put_file` writes only `remote_files` — no
+    `file_stats` row, no `existing_files` entry — so a `files.put`-based
+    spool workaround reads as absent to `File`/`FileExists` in the next
+    pass until those stores are seeded by hand (the spool-and-install
+    family's `install_file` seam writes all three for you). A package
+    *install* needs no bridge: the seam applies
     a pending upgrade's candidate and retires its `apt_upgradable` entry (a
     pin retires it only when it matches the candidate). Re-derive the
     `find`/`grep` answers from the simulated filesystem after every pass,

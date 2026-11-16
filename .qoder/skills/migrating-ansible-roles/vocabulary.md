@@ -41,7 +41,7 @@ run via `gather_action` **outside** deploys.
 | `flatpak` | `flatpak.packages` | |
 | `pip` | **GAP** | no pip module; stopgap: install `python3-pip` via package module + `Shell` action, or extend the library |
 | `pacman` / `zypper` / `pkgng` / `openbsd_pkg` | **GAP** | no modules (Arch/SUSE/BSD) |
-| `npm` / `yarn` / `gem` / `composer` | **GAP** | language package managers unshipped |
+| `npm` / `yarn` / `gem` / `composer` | **GAP** | language package managers unshipped; a CLI task (e.g. `composer require`) migrates as a `Shell` action *between* deploys (the build-from-source recipe), never an in-deploy operation |
 
 ## Files
 

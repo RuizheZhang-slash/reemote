@@ -290,8 +290,12 @@ Offline first (no real hosts, no approval needed):
     content-hash stub that will not match a pinned `keyid`);
     `systemd_unit_files` is never reconciled with the simulated filesystem,
     so a unit whose file was removed must be forgotten by hand (what
-    `daemon-reload` does for real); retire the installed package's
-    `apt_upgradable` entry. Re-derive the `find`/`grep` answers from the
+    `daemon-reload` does for real); `put_file` writes only `remote_files`
+    (no `file_stats` row, no `existing_files` entry), so a `files.put`-based
+    spool workaround needs those stores seeded by hand before the next
+    pass's `File`/`FileExists` reads (the spool-and-install family's
+    `install_file` seam writes all three for you); retire the installed
+    package's `apt_upgradable` entry. Re-derive the `find`/`grep` answers from the
     simulated filesystem after every pass, or pass 2 reads a stale fixture.
     Each bridge is a *simulation* limit, not a library bug — say so in the
     test docstring.
