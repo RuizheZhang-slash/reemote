@@ -410,4 +410,11 @@ For a second worked example that *does* exercise those — a whole multi-file
 role, seven deploys, PyYAML rendering and a play-wide handler union — read
 [examples/roles/ansible-datadog/ansible-datadog.py](https://github.com/kimjarvis/reemote/blob/main/examples/roles/ansible-datadog/ansible-datadog.py)
 with its [companion doc](https://reemote.org/examples/roles/ansible-datadog/)
-(coverage table, gap register, deviations).
+(coverage table, gap register, deviations). For a third — the Ubuntu
+php-xdebug role, build-from-source as the **default** path:
+`files.unarchive` tarball source (#21 closed), a sudo `Shell` build action,
+a versioned `files.copy` install of the built `.so` (#22 closed) and chained
+webserver/FPM restart handlers — read
+[examples/roles/ansible-role-php-xdebug/ansible-role-php-xdebug.py](https://github.com/kimjarvis/reemote/blob/main/examples/roles/ansible-role-php-xdebug/ansible-role-php-xdebug.py)
+with its
+[companion doc](https://reemote.org/examples/roles/ansible-role-php-xdebug/).

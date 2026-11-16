@@ -409,4 +409,11 @@ role, five deploys, a codename snapshot and the deb822 `signed_by` key URL
 (#17 closed) — read
 `examples/roles/ansible-role-docker/ansible-role-docker.py` with its doc
 `docs/examples/roles/ansible-role-docker.md`
-and `tests/test_roles_ansible_role_docker.py`.
+and `tests/test_roles_ansible_role_docker.py`. For a fourth — the Ubuntu
+php-xdebug role, build-from-source as the **default** path:
+`files.unarchive` tarball source (#21 closed), a sudo `Shell` build action,
+a versioned `files.copy` install of the built `.so` (#22 closed) and chained
+webserver/FPM restart handlers — read
+`examples/roles/ansible-role-php-xdebug/ansible-role-php-xdebug.py` with its
+doc `docs/examples/roles/ansible-role-php-xdebug.md` and
+`tests/test_roles_ansible_role_php_xdebug.py`.

@@ -981,7 +981,7 @@ signature: an *unprivileged* scp transfer plus an *elevated* `sh -c` install.
 | `get_url: {mode, owner, group}` | `files.download(mode=..., user=..., group=...)` — forwarded to the install |
 | `get_url: {checksum: "sha256:<hex>"}` | `files.download(checksum="sha256:<hex>")` — the same spelling, verified before the write |
 | `get_url: {validate: ...}` | `files.download(validate=...)` — the atomic validate-then-install hook |
-| `get_url` of a **binary** (a `.rpm`, a tarball) | not `files.download` (text only) — fetch control-side into an `io.BytesIO` and [`files.put`][reemote.modules.files.files.put] it into a login-writable path, or use the package module ([`dnf.rpm`][reemote.modules.dnf.dnf.rpm]) |
+| `get_url` of a **binary** (a `.rpm`, a tarball) | not `files.download` (text only) — fetch control-side into an `io.BytesIO` and [`files.put`][reemote.modules.files.files.put] it into a login-writable path, or use the package module ([`dnf.rpm`][reemote.modules.dnf.dnf.rpm]); a tarball **to extract** is [`files.unarchive(src=<url>, dest=...)`][reemote.modules.files.files.unarchive] — it fetches the binary control-side itself |
 | `rpm_key: {key: <url or path>}` (import into the keyring) | a separate [`dnf.key`][reemote.modules.dnf.dnf.key] request — it takes the key *content* as a control-side IO stream (`src=io.BytesIO(...)`), **not** the downloaded path (`dnf.key` rejects a filename/URL `src`). `files.download` places the key *file* a `.repo`'s `gpgkey=file://` references; `dnf.key` does the `rpm --import` |
 | the module's own privilege escalation | `sudo=True` on the [`op(...)`][reemote.core.op]: the spool transfer stays unprivileged, only the install elevates |
 
@@ -1064,7 +1064,11 @@ program* rather than installed at a path (Ansible's `uri` with
   `files.install`, which takes `content: str`. A binary response (a `.rpm`, a
   tarball) raises `ValueError` — fetch it control-side into an `io.BytesIO` and
   [`files.put`][reemote.modules.files.files.put] it into a login-writable path,
-  or use the package module ([`dnf.rpm`][reemote.modules.dnf.dnf.rpm]).
+  or use the package module ([`dnf.rpm`][reemote.modules.dnf.dnf.rpm]). A
+  tarball destined for **extraction** is
+  [`files.unarchive`][reemote.modules.files.files.unarchive] — it fetches the
+  binary control-side, spools it unprivileged and extracts on the host, all
+  in-operation.
 - **`url` must be `http(s)`.** A `file:`/`ftp:` scheme raises `ValueError` before
   any fetch.
 - **A file the login user cannot read is re-read elevated.** Idempotence is
@@ -1209,7 +1213,10 @@ Some roles install software the package managers do not carry: they clone an
 upstream tree (`git:`), then compile and install it with a `command:`/`shell:`
 sequence — `./buildconf --force`, `./configure --prefix=/usr/local`, `make`,
 `make install` — before wiring the result into place with a symlink
-(`file: state=link`) and a config or unit file (`copy:`/`template:`). The build
+(`file: state=link`) and a config or unit file (`copy:`/`template:`). The
+source may also arrive as a tarball (`unarchive:` with a URL `src`) rather
+than a clone, and the install may be a remote copy under a new name
+(`copy: {remote_src: true}`) rather than `make install`. The build
 is usually an **opt-in path, default off**, guarded by a `when:` flag and a
 `creates:`/`stat:` check so the expensive compile runs only when the tree is
 fresh or the binary is missing.
@@ -1241,9 +1248,11 @@ config that depend on the built binary.
 | Ansible | reemote |
 | --- | --- |
 | `git: {repo, dest, version}` clone the source | [`git.repo(src=..., dest=..., branch=...)`][reemote.modules.git.git.repo] — inside a deploy |
+| `unarchive: {src: <url>, dest, creates}` fetch + extract a tarball source | [`files.unarchive(src=..., dest=..., creates=...)`][reemote.modules.files.files.unarchive] — inside a deploy; the URL is fetched control-side as binary and the `creates` gate is **in-operation** (a converged tree fetches nothing) |
 | `command: ./buildconf --force` / `./configure …` / `make` / `make install` | [`gather_action(hosts, Shell, command="…")`](guide.md#actions) — **outside** any deploy, one action per step (or a staged build script run by [`Script`][reemote.actions.Script]) |
 | `file: {src, dest, state: link}` symlink the binary | [`files.link(path=..., target=...)`][reemote.modules.files.files.link] — inside a deploy |
 | `copy:`/`template:` a config or unit file | [`files.install(content=..., dest=...)`][reemote.modules.files.files.install] — inside a deploy (pre-render a template control-side, see the [Jinja2 migration](#migrating-jinja2-templates)) |
+| `copy: {src: <built binary>, dest, remote_src: true, mode}` install the artifact | [`files.copy(src=..., dest=..., mode=..., overwrite=True)`][reemote.modules.files.files.copy] — inside the **post-build** deploy; `dest` auto-detects (existing directory → copy inside, else rename), sha1-gated so a converged install no-ops |
 | `when: build_from_source` (opt-in, default off) | a Python `if`/`when=` guard on static inventory data (`host.extra`, `host.group`, `host.tags`) — never on a fact read inside the deploy |
 | `creates: /usr/local/bin/foo` (skip if already built) | gather the built state *between* deploys — a fact, or a `Shell` probe whose [`Result`][reemote.actions.Result] you freeze — and gate the build action on it |
 | `register: build` + `failed_when` | read `result["exit_status"]`/`result["stdout"]` from the frozen `Result` dict; an action interprets nothing, so *you* decide what a non-zero build exit means |
@@ -1251,8 +1260,13 @@ config that depend on the built binary.
 ### The process
 
 1. **Deploy the source tree.** One deploy yields the
-   [`git.repo`][reemote.modules.git.git.repo] clone (and any config/unit write
-   that does not depend on the built binary). Keep it branch-free so both of its
+   [`git.repo`][reemote.modules.git.git.repo] clone — or the
+   [`files.unarchive`][reemote.modules.files.files.unarchive] extraction of a
+   tarball source, whose `creates` gate is in-operation, so the extraction
+   needs no between-deploys probe of its own — plus any config/unit write
+   that does not depend on the built binary, and any
+   [`files.directory`][reemote.modules.files.files.directory] the install
+   step's `dest` parent needs. Keep it branch-free so both of its
    phases agree; the opt-in flag is static inventory data (`host.extra`), so a
    `when=` guard may read it.
 2. **Read the built state between deploys.** To make the compile run only when
@@ -1270,7 +1284,12 @@ config that depend on the built binary.
    `Shell` command.
 4. **Deploy what depends on the build.** A second deploy yields the
    [`files.link`][reemote.modules.files.files.link] symlinks and any config that
-   references the installed binary. Build it from a factory closing over the
+   references the installed binary. When the role installs the built artifact
+   under a new name instead of `make install` (Ansible
+   `copy: {src: <built binary>, dest, remote_src: true, mode, owner}`), yield
+   [`files.copy(src=..., dest=..., mode=..., user=..., group=..., overwrite=True, sudo=True)`][reemote.modules.files.files.copy]
+   here — the remote-to-remote copy is sha1-gated, so an already-installed
+   artifact is a no-op. Build it from a factory closing over the
    frozen snapshot when the link/config depends on what step 2 or 3 observed.
 5. **Sequence it all in `main()`.** Deploy → gather → action → deploy, each an
    awaited barrier. Close the gather's hosts yourself (`gather_fact` does not);
@@ -1350,7 +1369,10 @@ bespoke `Shell` probe between the two, then a factory-built second deploy that
 closes over the frozen `Result` dict — is the runnable
 [`deploy_action_deploy` example](examples/actions.md#deploy-action-deploy);
 swap its `nginx -v` probe for your compile step and its configure deploy for the
-links.
+links. A whole role migrated on this shape — build-from-source as the
+**default** path, a tarball source via `files.unarchive`, and a versioned
+`files.copy` install of the built extension — is the
+[php-xdebug role migration](examples/roles/ansible-role-php-xdebug.md).
 
 ### What to watch
 
@@ -1380,3 +1402,12 @@ links.
   open-ended compile is an action. Resist the temptation to drag the whole role
   into one big `Shell` command; split it and each half keeps the guarantees its
   model makes.
+- **The post-build `files.copy` must follow the build barrier.**
+  [`files.copy`][reemote.modules.files.files.copy] validates `src` in **both**
+  phases (prepare reads pre-state), so a "build then copy" flow cannot share
+  one deploy — the copy belongs in the deploy *after* the build action. Its
+  rename `dest` needs an existing parent (create it with
+  [`files.directory`][reemote.modules.files.files.directory] in deploy 1), and
+  `overwrite=True` is sha1-gated: drift is overwritten (Ansible's
+  `force: yes`), equal content no-ops, and `mode`/`user`/`group` converge in
+  the same request — no separate `files.file` pass.

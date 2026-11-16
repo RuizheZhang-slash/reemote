@@ -13,8 +13,13 @@ end-to-end by the DataDog role migration
 `tests/test_roles_ansible_datadog.py`) and, for 12c, the Docker role migration
 (`examples/roles/ansible-role-docker/ansible-role-docker.py` +
 `tests/test_roles_ansible_role_docker.py`); 11 is the one open-gap workaround
-(#13's dnf half). Each names its issue; re-prove the absence before relying
-on it — see [gap-analysis.md](gap-analysis.md).
+(#13's dnf half). The files gaps **#21 (`files.unarchive`) and #22
+(`files.copy` remote-src parity) are closed** and reflected in recipes 7–8,
+proven end-to-end by the php-xdebug role migration
+(`examples/roles/ansible-role-php-xdebug/ansible-role-php-xdebug.py` +
+`tests/test_roles_ansible_role_php_xdebug.py`). Each names its issue;
+re-prove the absence before relying on it — see
+[gap-analysis.md](gap-analysis.md).
 
 The universal principle: **a deploy cannot observe facts or its own outcomes
 while running** (it executes twice; divergent sequences raise
@@ -223,7 +228,10 @@ install identical bytes. Text only (UTF-8); delegates to `files.install`
 
 Watch: binary bodies (`.rpm`, tarballs) raise `ValueError` — fetch
 control-side into `io.BytesIO` and `files.put` to a login-writable path, or
-use `dnf.rpm`/`apt.deb`. `http(s)` only. `rpm_key` import is a **separate**
+use `dnf.rpm`/`apt.deb`. A tarball **to extract** is
+`files.unarchive(src=<url>, dest=…, creates=…)` — the binary fetch, spool
+and extraction are all in-operation (#21 closed). `http(s)` only. `rpm_key`
+import is a **separate**
 `dnf.key(src=io.BytesIO(key_bytes))` request — it takes key *content*, never
 the downloaded path (and its import direction is non-idempotent; rpm
 dedupes). `dnf.repo`/`apt.deb`/`dnf.rpm` still reject URL `src` by design.
@@ -238,8 +246,12 @@ Guide: `docs/migrating.md#migrating-a-build-from-source-role` · Example:
 
 Shape: **split declarative from imperative** — deploy → gather → action →
 deploy, sequenced in `main()`:
-1. Deploy 1: `git.repo(src=…, dest=…, branch=…)` (+ config not depending on
-   the binary). Opt-in flag is static `host.extra` → `when` guard is legal.
+1. Deploy 1: `git.repo(src=…, dest=…, branch=…)` — or a tarball source via
+   `files.unarchive(src=<url>, dest=…, creates=…)` (#21 closed: the
+   `creates` gate is in-operation, so a converged tree fetches nothing) —
+   plus config not depending on the binary and any `files.directory` the
+   install step needs. Opt-in flag is static `host.extra` → `when` guard is
+   legal.
 2. Gather built state *after* deploy 1's apply join (a fact, or a `Shell`
    probe whose `Result` you freeze) — the `creates:`/`stat:` idempotence.
 3. `await gather_action(hosts, Shell, command="cd … && ./configure … && make
@@ -247,11 +259,22 @@ deploy, sequenced in `main()`:
    (or `group=`/`tags=`). Long builds: stage a script in deploy 1, run
    `Script`. Check `result["exit_status"]` yourself and raise — an action
    interprets nothing (`failed_when` is your code).
-4. Deploy 2: `files.link` + config referencing the built binary.
+4. Deploy 2: `files.link` + config referencing the built binary. When the
+   role installs the artifact under a new name instead of `make install`
+   (Ansible `copy: {remote_src: true, mode, owner}`), yield
+   `files.copy(src=<built binary>, dest=<versioned target>, mode=…,
+   user=…, group=…, overwrite=True, sudo=True)` — full remote-src parity
+   (#22 closed).
 
 Watch: `op(Shell, …)` is refused; `gather_action` inside a deploy raises
 `ActionInDeployError`. `gather_action` closes its own hosts (do not aclose
 after). Keep clone/symlink/config in deploys — only the compile is an action.
+`files.copy` validates `src` in **both** phases, so the install must follow
+the build barrier — never share deploy 1 with the build; its rename `dest`
+parent must already exist (`files.directory` in deploy 1), and
+`overwrite=True` is sha1-gated, so a converged install no-ops. Proven
+end-to-end by the php-xdebug migration
+(`examples/roles/ansible-role-php-xdebug/ansible-role-php-xdebug.py`).
 
 ## 9. Service-owned `0640` config — the read-back is elevated
 
@@ -478,6 +501,8 @@ Watch:
 | `template` | pre-render in `main()` + `files.install` (recipe 4); jinja2 **or PyYAML** is your dependency, declared in the `dev` group for a repo example |
 | `to_nice_yaml` filter | `yaml.safe_dump(..., default_flow_style=False, allow_unicode=True, indent=4, sort_keys=True, width=80)` (recipe 4) |
 | `file mode=0640 owner=svc` | `files.install`/`transform` directly — the two-tier elevated read-back keeps content idempotence (#12 closed, recipe 9) |
+| `unarchive` (extract) | `files.unarchive(src, dest, creates=…, checksum=…)` — URL fetched binary control-side, `creates` gated in-operation (#21 closed, recipes 7–8) |
+| `copy remote_src=yes` (rename/mode) | `files.copy(src, dest, overwrite=True, mode=…, user=…, group=…)` — sha1-gated remote-to-remote parity (#22 closed, recipe 8) |
 | `apt state=latest` / `yum state=latest` | apt: `latest=True` directly (fact-gated, #13 closed); dnf: recipe 11 — gate `latest=` on a check-update snapshot; the bare keyword always reports changed |
 | `apt_repository update_cache=yes` | `apt.repo(update_cache=True)` — the refresh rides the op on a real change (#14 closed, recipe 12a) |
 | `apt_repository state=absent` (global) | `apt.repo(present=False)` — provenance-driven global removal (#15 closed, recipe 12b) |

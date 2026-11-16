@@ -95,7 +95,7 @@ Every proven gap gets exactly one class:
 | --- | --- | --- | --- |
 | **Deliberate boundary** | the library refuses by design; docs/article say so | URL/filename `src` on key/deb/rpm ops; no `files.template`; no shell inside deploys; no per-request `become_user`; transfers never elevate; `backup:` dropped as non-deterministic | reshape per the recipe; **never propose eroding it** |
 | **Workaroundable** | composable from existing primitives, with a deviation | cron → `/etc/cron.d` drop-in; assemble → concat + install; serial → batch slicing; reboot → Shell + WaitForConnection; uri → control-side HTTP | implement the workaround, record the deviation |
-| **Genuine library gap** | no faithful composition exists | pip, unarchive, acl, docker_* management | rank it; propose an extension (user-approved workstream) |
+| **Genuine library gap** | no faithful composition exists | pip, acl, docker_* management | rank it; propose an extension (user-approved workstream) |
 | **Out of scope** | the target platform/OS is unshipped | pacman/zypper/pkgng (Arch/SUSE/BSD), Windows | a Phase 0 scope decision, not a library bug |
 
 Classification can move after proof: "no cron module" looks genuine until
@@ -114,7 +114,7 @@ Update this table when a gap closes; never copy it into a report unverified.
 | Packages | `npm` / `yarn` / `gem` / `composer` | genuine | `Shell` actions; or extend |
 | Packages | `pacman` / `zypper` / `pkgng` / `openbsd_pkg` | out of scope | no Arch/SUSE/BSD modules — fix the target OS in Phase 0 |
 | Packages | dnf `state=latest` **idempotence** | genuine (workaroundable) | the keyword exists but upgrades without checking for a pending upgrade, and no upgradable fact ships — gate `latest` on a `Shell(command="dnf check-update")` snapshot (recipe 11). apt's equivalent was closed by #13 |
-| Files | `unarchive` / `archive` | genuine | extract control-side + `files.put` per file, or a `Shell` tar action outside deploys |
+| Files | `archive` (compression) | genuine | no compression operation — extraction is covered by `files.unarchive` (#21 closed); create archives control-side or via a `Shell` tar action outside deploys |
 | Files | `synchronize` (rsync) | genuine | per-file `files.put`, or a `Shell` rsync action |
 | Files | `patch` | workaroundable | a pure `files.transform`, or a `Shell` action |
 | Files | `acl` (setfacl) | genuine | no ACL primitive; `Shell` action stopgap |
@@ -153,6 +153,8 @@ Each of these was reported missing by an earlier audit and **now exists**
 | `gpg.import_key` into a named keyring (#11) | `gpg.import_key(src, keyid=…, dest=…)` imports **additively** into one keyring file (`--no-default-keyring --keyring`, parent created, chmod `0644`); `keyid` idempotence reads the `GpgKeyrings` entry scoped to `dest`. `secret=True` + `dest` raises `ValueError`. Recipe 10's control-side bundle is retired |
 | offline `Shell`/`Script` gathers (#16) | `SimulatedHost` overrides `_run_shell`: `gather_action`'s `Shell`/`Script` fan-out answers from the seeded `shell_results` map (exact shell string → a `Result` record; unseeded → hard `UnseededShellResult`) and records every shell in `ran_shells`; proven in `tests/test_simulated_host.py`. The per-test `ActionHost`-pattern `_run_shell` shim is retired |
 | simulated removals leaving stale content (#18) | `SimulatedHost.remove_file`/`remove_link` pop `remote_files` first (mirroring `remove_tree`), so `FileContents`/`RemoteFileSha1` stop answering for a removed path and an equal-content `files.install` after a removal still installs; removal assertions can read `remote_files` directly. Proven in `tests/test_simulated_host.py`; the nginx migration's second pass retired its `file_stats`-only workaround |
+| `unarchive` extraction (#21) | `files.unarchive(src, dest, creates=…, extra_opts=…, user=…, group=…, checksum=…)` extracts **in-deploy**: an http(s) `src` is fetched control-side as **binary** (checksum-verified before staging, spooled unprivileged, tar/unzip on the host, spool removed); a remote-path `src` is validated via the `File` fact in both phases. `creates` gates via `FileExists` **in-operation before any fetch** — a converged host reports no change with zero commands; without `creates` it is stateless (pyinfra parity). `dest` is auto-created; `user`/`group` chown recursively. The fetch/put + `Shell` tar stopgap is retired — proven by the php-xdebug migration |
+| `copy remote_src=yes` parity (#22) | `files.copy(src, dest, overwrite=…, mode=…, user=…, group=…)` is full remote-to-remote parity: `dest` auto-detects (existing directory → `dest/basename(src)`, else a **rename** whose parent is validated via the `Directory` fact in both phases); sha1-gated in both overwrite modes — equal content no-ops (only differing metadata commands run), drift + `overwrite=False` raises `ValueError`, `overwrite=True` is Ansible's `force: yes`; `mode`/`user`/`group` ride the same request (chown before chmod). `files.move` gained the same dest/metadata forms but stays **stateless**. The staging-`cp` action + separate `files.file` metadata pass is retired; `src` is validated in prepare, so a create-then-copy flow cannot share one deploy (recipe 8) |
 | `find contains=` | `FindInFiles` / `FindInFile` facts |
 | /etc/hosts line edits | `server.etc_hosts` operation |
 

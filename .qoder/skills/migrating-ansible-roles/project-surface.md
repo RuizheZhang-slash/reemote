@@ -13,8 +13,9 @@ map. Paths are relative to the repo root `/home/kim/reemote`.
 - `docs/` — MkDocs site source. `guide.md` (narrative), `core.md`,
   `drivers.md`, `hosts.md`, `handlers.md`, `commands.md`, `exceptions.md`,
   `actions/actions.md`, `modules/<mod>.md` (rendered API per module),
-  `examples/…` (rendered example docstrings; `examples/roles/<role>.md` are
-  the per-role migration docs, wired into the Examples → Roles nav),
+  `examples/…` (rendered example docstrings; `docs/examples/roles/<role>.md`
+  are the per-role migration docs, wired into the Examples → Roles nav in
+  `mkdocs.yml`),
   `migrating.md` (the migration
   guide), `articles/migrating.md` (the Ansible→Python thesis).
 - `examples/` — runnable scripts (they connect for real): `modules/<mod>/`,
@@ -183,7 +184,7 @@ are facts, lower-case functions are operations.
 | `dnf` | packages, repo, key, rpm, module, update, makecache, clean |
 | `snap` | package |
 | `flatpak` | packages |
-| `files` | file, directory, link, copy, move, put, get, install, transform, download, edit, flags |
+| `files` | file, directory, link, copy, move, put, get, install, transform, download, edit, flags, unarchive |
 | `git` | repo, config, worktree |
 | `systemd` | service, daemon_reload, mask, reset_failed, dropin, tmpfiles, sysusers, preset |
 | `openrc` | service, runlevel, custom_runlevel, config |
@@ -240,6 +241,13 @@ http(s) key URL** — the URL form fetches the armored key control-side and
 installs `/etc/apt/keyrings/<filename>.asc` itself (#17 closed — recipe 12c).
 `files.download` is **control-side
 fetch, text only**, checksum-pinnable, delegating to `files.install`;
+`files.unarchive(src, dest, creates=…, checksum=…)` extracts in-deploy — an
+http(s) `src` is fetched control-side as **binary**, and `creates` gates
+in-operation before any fetch (#21 closed); `files.copy` is full Ansible
+`remote_src` parity — dest auto-detect (existing directory → copy inside,
+else rename with the parent validated in both phases), sha1-gated
+`overwrite`, `mode`/`user`/`group` in the same request (#22 closed);
+`files.move` shares the forms but stays **stateless**.
 `dnf.repo`/`dnf.key`/`apt.key`/`gpg.key` **reject URL/filename `src`** — key
 content arrives as a control-side IO stream. `apt.key(src, dest)` writes any
 keyring path but is **stateless** (always changed);
@@ -309,6 +317,16 @@ fail-fast) · `CommandNotFoundError` (127) · `HostConnectionError` ·
   inheritance, and a restart/reload handler compose. Its offline test
   (`tests/test_roles_ansible_role_nginx.py`) asserts removals against
   `remote_files` directly — the #18 workaround is retired.
+- `roles/ansible-role-php-xdebug/ansible-role-php-xdebug.py` (doc:
+  `docs/examples/roles/ansible-role-php-xdebug.md`) — the Ubuntu
+  php-xdebug role with build-from-source as the **default** path: three
+  deploys around a sudo `Shell` build action, `files.unarchive` with a
+  `creates` gate for the tarball source (#21 closed), a versioned
+  `files.copy` install of the built `.so` (#22 closed), and chained
+  webserver/FPM restart handlers inherited from geerlingguy.php. Its
+  offline test (`tests/test_roles_ansible_role_php_xdebug.py`)
+  monkeypatches `files._fetch_url_bytes`, seeds `archive_members` +
+  `shell_results`, and bridges the built `.so` between passes.
 
 ## Environment and gates
 

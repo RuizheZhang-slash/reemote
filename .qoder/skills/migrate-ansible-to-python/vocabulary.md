@@ -57,7 +57,7 @@ run via `gather_action` **outside** deploys.
 | --- | --- | --- |
 | `copy content=…` | `files.install(content=…, dest=…)` | spool-and-install; `sudo=True` for root-owned |
 | `copy src=<file>` | read control-side → `files.install(content=text)`; binary → `files.put(src=io stream)` | no controller paths in requests |
-| `copy remote_src=yes` | `files.copy` | remote-to-remote |
+| `copy remote_src=yes` | `files.copy` | full parity (#22 closed): existing-dir `dest` → copy inside, else **rename** (parent validated in both phases); `mode`/`user`/`group` in the same request; sha1-gated — equal content no-ops, drift needs `overwrite=True` (Ansible `force: yes`). `files.move` takes the same forms but is **stateless** |
 | `template` | pre-render in `main()` + `files.install` | recipe 4; jinja2 **or PyYAML** (`to_nice_yaml`) is your dependency |
 | `copy/template validate:` | `files.install(validate="cmd {spool}")` | recipe 5; atomic |
 | `lineinfile` / `replace` / `blockinfile` | `files.transform` (+ `block_transform` factory) | recipe 6; pure fixpoint transform |
@@ -67,14 +67,15 @@ run via `gather_action` **outside** deploys.
 | `file state=link/hard` | `files.link` | |
 | `file attributes=…` (chattr) | `files.flags` | immutable etc. |
 | `get_url` (text) | `files.download` | recipe 7; control-side fetch, checksum-pin |
-| `get_url` (binary) | control-side fetch → `io.BytesIO` → `files.put` | or `dnf.rpm`/`apt.deb` |
+| `get_url` (binary) | control-side fetch → `io.BytesIO` → `files.put` | or `dnf.rpm`/`apt.deb`; a tarball **to extract** → `files.unarchive(src=<url>)` (#21 closed) |
 | `fetch` | `files.get(src=…, dest=<per-host IO sink>)` | remote→control |
 | `stat` | `files.File`, `FileExists`, `FileLink`, `Md5File`/`Sha256File`/`Sha384File` | via `gather_fact` |
 | `slurp` | `files.FileContents` (gather) or `files.get` | |
 | `find` (name/size/type) | `FindFiles`, `FindDirectories`, `FindLinks` | |
 | `find contains=…` | `FindInFiles` (recursive grep), `FindInFile` (one file) | exists — do not report as gap |
 | `assemble` | workaround: concatenate control-side → `files.install` | |
-| `unarchive` / `archive` | **GAP** | stopgap: fetch/put + `Shell` tar action outside deploys |
+| `unarchive` | `files.unarchive(src, dest, creates=…, checksum=…, user=…, group=…)` | **#21 closed**: http(s) `src` fetched control-side as binary, spooled + extracted in-operation; `creates` gates before any fetch (converged → no change, zero commands); without `creates` stateless |
+| `archive` (compression) | **GAP** | create the archive control-side, or a `Shell` tar action outside deploys |
 | `synchronize` (rsync) | **GAP** | no rsync operation |
 | `patch` | **GAP** | `Shell` action or a transform |
 | `acl` (setfacl) | **GAP** | no ACL operation |
