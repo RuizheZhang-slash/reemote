@@ -13,8 +13,9 @@ end-to-end by the DataDog role migration
 `tests/test_roles_ansible_datadog.py`) and, for 12c, the Docker role migration
 (`examples/roles/ansible-role-docker/ansible-role-docker.py` +
 `tests/test_roles_ansible_role_docker.py`); 11 is the one open-gap workaround
-(#13's dnf half). The files gaps **#21 (`files.unarchive`) and #22
-(`files.copy` remote-src parity) are closed** and reflected in recipes 7–8,
+(#13's dnf half). The files gaps **#21 (`files.unarchive`), #22
+(`files.copy` remote-src parity) and #23 (`get_url` binary parity —
+`files.install(content=<bytes>)`) are closed** and reflected in recipes 7–8,
 proven end-to-end by the php-xdebug role migration
 (`examples/roles/ansible-role-php-xdebug/ansible-role-php-xdebug.py` +
 `tests/test_roles_ansible_role_php_xdebug.py`). Each names its issue;
@@ -223,12 +224,17 @@ Shape: `files.download(url=…, dest=…, mode=…, checksum="sha256:<hex>",
 sudo=True)`. The fetch is **control-side** (opposite of Ansible's on-target
 fetch): works when only the controller has egress; the body is fetched once
 per phase (twice per host) — **pin `checksum` in production** so both phases
-install identical bytes. Text only (UTF-8); delegates to `files.install`
+install identical bytes. Text **or binary**: a UTF-8 body installs as text;
+a non-UTF-8 body (a launcher `.phar`, an executable) installs the raw bytes
+via `files.install(content=<bytes>)`, sha1-idempotent (#23 closed — the drush
+launcher shape: `dest="/usr/local/bin/drush"`, `mode="0755"`). Both delegate
+to `files.install`
 (content-only idempotence, spool, owner/mode, validate).
 
-Watch: binary bodies (`.rpm`, tarballs) raise `ValueError` — fetch
-control-side into `io.BytesIO` and `files.put` to a login-writable path, or
-use `dnf.rpm`/`apt.deb`. A tarball **to extract** is
+Watch: a binary install's `RemoteFileSha1` read-back stays **unprivileged** —
+give the dest a login-readable mode (`0755`) or it re-installs every deploy.
+A `.rpm`/`.deb` **to install as a package** is `dnf.rpm`/`apt.deb`. A tarball
+**to extract** is
 `files.unarchive(src=<url>, dest=…, creates=…)` — the binary fetch, spool
 and extraction are all in-operation (#21 closed). `http(s)` only. `rpm_key`
 import is a **separate**
@@ -326,9 +332,10 @@ Ansible: `get_url` each key, then `apt_key` / `gpg --no-default-keyring
 already in the file stay.
 
 Shape: **one import request per key, fingerprint-pinned.**
-1. In `main()`: fetch each key's bytes control-side (`files.download` is
-   text-only — for armored/binary key bodies use plain
-   `urllib.request.urlopen(url, timeout=…).read()`), keeping the bodies
+1. In `main()`: fetch each key's bytes control-side (you need the key *bytes
+   as a stream*, not a file installed at a path — use plain
+   `urllib.request.urlopen(url, timeout=…).read()`; `files.fetch_url` is
+   text-only and `files.download` installs), keeping the bodies
    **separate**, one per key.
 2. Freeze the per-host `io.BytesIO` streams **in the factory body, outside
    the inner generator**: a stream is hashable but compared by *identity*,

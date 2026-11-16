@@ -116,7 +116,8 @@ installed — exits zero through the `|| true` guard and reads as `None`.
 repository/keyring verification recipes compare; `Md5File` is for legacy
 checksum manifests, not a security boundary. `RemoteFileSha1` predates the
 family and deliberately keeps its simpler `sha1sum <path>` probe: it backs
-the `files.put`/`files.get` idempotence contract.
+the `files.put`/`files.get` idempotence contract and `files.install`'s binary
+bytes path.
 
 `FindFiles`, `FindDirectories` and `FindLinks` mirror the baseline's find-path
 family — the enumeration facts the stat-only `File`/`Directory` metadata
@@ -280,20 +281,30 @@ such as `/etc/hosts` must be transformed into a writable path and moved into
 place with `files.move` flagged `sudo=True` — or written in one deploy with
 `files.install` below.
 
-`files.install` is a reemote original: the generic "write text content to a
-root-owned path" operation the namespace-specific spool-and-install operations
+`files.install` is a reemote original: the generic "write text or binary
+content to a root-owned path" operation the namespace-specific
+spool-and-install operations
 (`apt.sources_file`, `dnf.repo`, `systemd.dropin`) each spell out for their own
-config paths. It reads the destination's current text with `FileContents` and,
+config paths. It reads the destination's current content — `FileContents` for
+a `str`, the binary-safe `RemoteFileSha1` for `bytes` (issue #23) — and,
 only when it differs from the desired `content`, yields two descriptors from
-one request — an `InstallSpoolCommand` transfer spooling the text to a
+one request — an `InstallSpoolCommand` (text) or `InstallBinarySpoolCommand`
+(bytes) transfer spooling the content to a
 dest-derived `/tmp` path over unprivileged scp, then an `InstallCommand` shell
 running the elevated `mkdir -p`/`cp`/optional `chown`/`chmod`/`rm -f` install
 wrapped in `sh -c`
 (so a `sudo=True` request elevates every step, not just the chain head). Because
 both descriptors ride one request, the whole write fits a single deploy —
 unlike the put-then-`files.move` recipe, which spans two runs. `content` is a
-plain `str` (text is what `FileContents` compares; binary content stays
-`files.put`'s job), so no identity-stable stream is needed at the call site.
+plain `str` or `bytes` — both hashable and equal across phases, so no
+identity-stable stream is needed at the call site. The bytes path is the
+binary spool-and-install `files.unarchive`'s `UnarchiveSpoolCommand`
+pioneered, generalized from "extract an archive" to "install a file": a
+`.phar` launcher lands at `/usr/local/bin/drush` in one `sudo=True` request,
+idempotent on the sha1 digest (no UTF-8 decode, so any bytes work). The sha1
+read-back is unprivileged, so give a binary install a login-readable mode
+(the `0755` launcher shape) — a login-unreadable binary destination reads as
+absent and re-installs every deploy.
 The spool name is the destination's sha1 prefix — deterministic across phases
 and collision-free between different targets, though predictable on
 world-writable `/tmp` (collision avoidance, not a security boundary). `mode`
@@ -321,7 +332,7 @@ become-scoped `validate` and letting a checker read every file the staged
 config references. It is the narrow, safe slice of "a command inside a
 deploy": scoped to validating the content being installed at one well-defined
 injection point, not a generic shell operation, so the action/deploy boundary
-stays intact. The read-back is two-tier: `FileContents` cats unprivileged
+stays intact. The text read-back is two-tier: `FileContents` cats unprivileged
 first and, when the login user cannot read the file (a `0640` service-account
 config), re-reads it elevated with `sudo` — so content idempotence holds for
 restrictive modes too, and the re-read's run-as user and any password come
@@ -371,25 +382,31 @@ install a host-side binary file, not because reemote cannot download). The fetch
 opens the connection (`urllib` in a worker thread), not the target host, so the
 download works when only the control side has internet egress and the host never
 needs `curl`/`wget` (the opposite of Ansible's `get_url`, which fetches on the
-target). The body delegates the fetch to `files.fetch_url` below (which
-verifies the optional checksum and decodes the bytes to text) and the write to
+target). The body shares the scheme guard and checksum contract with
+`files.fetch_url` below through the `_fetch_url_verified` seam, decodes a
+UTF-8 body to text (a binary body rides install's bytes path as raw bytes)
+and delegates the write to
 `files.install` above, so a download inherits install's content-only idempotence
 (a converged file yields zero commands), its dest-derived `/tmp` spool, its
 owner/mode handling, its optional `validate` hook and its two-privilege-level
-signature (unprivileged scp transfer + elevated `sh -c` install) with no new
-command descriptor. The optional `checksum` is Ansible's `get_url` spelling —
+signature (unprivileged scp transfer + elevated `sh -c` install). The optional
+`checksum` is Ansible's `get_url` spelling —
 `"<algorithm>:<hexdigest>"` (eg `"sha256:9f2c..."`) — verified against the
 fetched bytes before anything is written; pinning it is also what makes the
 two-phase fetch deterministic, because the body runs once per phase (prepare,
 then apply, so the URL is fetched twice per host) and both phases verify the
-same digest and so install byte-identical content. Text only: `install` takes
-`content: str`, so a binary body (a `.rpm`, a tarball) raises `ValueError`
-rather than corrupting the write — a binary download stays `files.put`'s job
-(fetch control-side into an `io.BytesIO`, put into a login-writable path).
+same digest and so install byte-identical content. Text or binary (issue #23,
+full `get_url` parity): a text body installs through `FileContents`
+idempotence, a binary body (a `.phar` launcher, a `.rpm`) through the
+binary-safe `RemoteFileSha1` idempotence — never the text-decode `ValueError`.
+The canonical binary case is the geerlingguy.drush launcher:
+`files.download(url=<drush.phar URL>, dest="/usr/local/bin/drush", mode="0755",
+sudo=True)`.
 `mode`/`user`/`group`/`validate` forward straight to the install, `url` must be
 `http(s)` (a `file:`/`ftp:` scheme raises `ValueError` before any fetch), and
-idempotence and the two-tier read-back (a file the login user cannot read is
-re-read elevated) are install's. Downloading
+idempotence and the two-tier text read-back (a file the login user cannot read is
+re-read elevated) are install's; a binary install's sha1 read-back is
+unprivileged, so give it a login-readable mode. Downloading
 under `/etc` needs root, so flag the request `sudo=True`; the spool transfer
 stays unprivileged regardless. See
 [Migrating a URL download](../migrating.md#migrating-a-url-download-get_url)
@@ -444,11 +461,14 @@ control-side code), so the determinism recipe is to fetch once and freeze the
 returned text into the per-host plan the deploy consumes — the composer
 installer-signature shape, where a fetched sha384 digest becomes
 `files.download(checksum=f"sha384:{signature}")`'s pin. `files.download`
-delegates its fetch half here, so the two share one scheme guard (a
-`file:`/`ftp:` scheme raises `ValueError` before any fetch), one Ansible-style
+shares the fetch seam (`_fetch_url_verified`), so the two share one scheme
+guard (a
+`file:`/`ftp:` scheme raises `ValueError` before any fetch) and one
+Ansible-style
 `checksum` contract (an optional `"<algorithm>:<hexdigest>"` verified against
-the raw bytes before the caller sees the content) and one text-only decode (a
-binary body raises `ValueError` and stays `files.put`'s job). On-target HTTP —
+the raw bytes before the caller sees the content); this helper alone applies
+the text-only decode (a binary body raises `ValueError` — installing one at a
+path is `files.download`'s or `files.install(content=<bytes>)`'s job). On-target HTTP —
 a POST, a webhook, anything that must run on the host — stays a `Shell`
 action outside the deploy. See
 [Migrating a content-returning GET](../migrating.md#migrating-a-content-returning-get-uri)

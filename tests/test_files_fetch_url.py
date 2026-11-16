@@ -10,8 +10,9 @@ touches a host. The *control* machine opens the connection (the same
 ``_fetch_url_bytes`` seam ``files.download`` rides), the optional Ansible-style
 ``"<algorithm>:<hexdigest>"`` checksum is verified against the raw bytes before
 the caller sees the content, and the body is decoded as UTF-8 -- a binary
-response raises ``ValueError``. ``files.download`` delegates its fetch half
-here, so the scheme guard, checksum contract and text-only decode are shared.
+response raises ``ValueError``. ``files.download`` shares the scheme guard
+and checksum contract through ``_fetch_url_verified``; unlike this helper it
+also installs a binary body (issue #23).
 
 The single network read (``_fetch_url_bytes``) is monkeypatched to a canned-bytes
 stub so every test stays offline (the ``tests/test_files_download.py``
@@ -19,7 +20,7 @@ precedent). Covers the content-returning contract (verbatim text, once per
 call), the http(s) scheme guard and malformed/unknown checksum rejection before
 any fetch, checksum match/mismatch, the binary-body rejection, error
 propagation, the keyword-only ``checksum`` signature, the package export and
-the download delegation.
+the shared download fetch seam.
 """
 
 import hashlib
@@ -164,7 +165,8 @@ async def test_checksum_is_keyword_only(canned_fetch):
 
 async def test_fetch_url_rejects_a_binary_body(monkeypatch):
     """The helper returns text only -- a non-UTF-8 response raises rather than
-    handing back mojibake; a binary download stays ``files.put``'s job."""
+    handing back mojibake; installing a binary body at a path is
+    ``files.download``'s or ``files.install(content=<bytes>)``'s job."""
     monkeypatch.setattr(
         files_module, "_fetch_url_bytes", lambda url: b"\xff\xfe\x00\x01binary"
     )
@@ -184,7 +186,7 @@ async def test_fetch_url_propagates_a_urlerror(monkeypatch):
         await files.fetch_url(URL)
 
 
-# --- The package export and the download delegation ----------------------------
+# --- The package export and the shared download fetch --------------------------
 
 
 def test_fetch_url_is_exported_from_the_package():
@@ -193,16 +195,19 @@ def test_fetch_url_is_exported_from_the_package():
     assert "fetch_url" in files_module.__all__
 
 
-async def test_download_delegates_its_fetch_to_fetch_url(monkeypatch):
-    """``files.download`` calls the public helper for its fetch half, so the
-    scheme guard, checksum contract and decode are shared, not duplicated."""
+async def test_download_shares_the_verified_fetch_seam(monkeypatch):
+    """``files.download`` rides the same ``_fetch_url_verified`` helper for its
+    fetch half, so the scheme guard and checksum contract are shared, not
+    duplicated -- but it keeps the raw bytes, so a binary body can install."""
     calls: list[tuple[str, str | None]] = []
+    real_verified = files_module._fetch_url_verified
 
-    async def fake_fetch_url(url: str, *, checksum: str | None = None) -> str:
+    async def spy(url: str, checksum: str | None) -> bytes:
         calls.append((url, checksum))
-        return CONTENT
+        return await real_verified(url, checksum)
 
-    monkeypatch.setattr(files_module, "fetch_url", fake_fetch_url)
+    monkeypatch.setattr(files_module, "_fetch_url_verified", spy)
+    monkeypatch.setattr(files_module, "_fetch_url_bytes", lambda url: DATA)
     host = SimulatedHost(name="h")
     ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
     commands = [

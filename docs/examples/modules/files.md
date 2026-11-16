@@ -279,13 +279,17 @@ and `chmod` are unprivileged in `/tmp`.
 
 `files.install` (a reemote original) is the one-deploy answer to a
 root-owned content write that a `files.edit` + `files.move` recipe would
-need two runs for: it reads the
+need two runs for: for text `content` it reads the
 destination's text with `FileContents` and, only when it differs from the
 desired `content`, yields an unprivileged `InstallSpoolCommand` scp transfer
 to a dest-derived `/tmp` spool path followed by an elevated `InstallCommand`
 (`mkdir -p`/`cp`/optional `chown`/`chmod`/`rm -rf` wrapped in `sh -c`) — both
 from one request, so prepare records them and apply runs them in order.
-`content` is a plain `str`, hashable and equal across phases, so no
+`content` also takes **bytes** (issue #23): a binary body — a launcher
+`.phar`, an executable — is never decoded; it spools through an
+`InstallBinarySpoolCommand` transfer into the same elevated install chain,
+idempotent on the destination's `RemoteFileSha1` instead of `FileContents`.
+Both `str` and `bytes` are hashable and equal across phases, so no
 identity-stable stream is needed; the spool name is the destination's sha1
 prefix, so two installs never clobber one spool file. The optional
 `user`/`group` parameters add a `chown` step inside the elevated chain (before
@@ -303,10 +307,14 @@ can read every file the config references). The
 example first provisions the `www` group and system user (the account the
 sibling `files_op_file.py` uses), then installs a plain demo config and an
 owned `www:www` variant under `/etc` with `sudo=True` (the transfer stays
-unprivileged regardless), and runs the same deploy again to show every
+unprivileged regardless), plus a demo **binary** at
+`/usr/local/bin/reemote-install-demo-bin` with `mode="0755"` — the drush
+launcher shape — and runs the same deploy again to show every
 request reporting no change. The owned variant uses the login-readable
 `0644` mode; a restrictive `0640` service-account mode stays idempotent too —
 `FileContents` re-reads a file the login user cannot read elevated with `sudo`.
+The binary install's `RemoteFileSha1` read-back has no elevated fallback, so
+it needs a login-readable mode (the `0755` here) to stay a no-op on rerun.
 
 ::: files_install
     options:
@@ -350,8 +358,9 @@ body at a root-owned `dest` in one `sudo=True` request, retiring the hand-rolled
 force (each *rejects* a URL `src`). The fetch is *control-side* — the control
 machine opens the connection (`urllib` in a worker thread), not the target host,
 so the download works when only the control side has internet egress and the host
-never needs `curl`/`wget`. The body delegates the fetch to `files.fetch_url`
-(which verifies the optional checksum and decodes the bytes to text) and the
+never needs `curl`/`wget`. The body rides the shared `_fetch_url_verified`
+seam (scheme guard + optional checksum verification, the same one
+`files.fetch_url` uses) and delegates the
 write to `files.install`, so a download inherits install's
 content-only idempotence, its dest-derived `/tmp` spool, its owner/mode handling,
 its optional `validate` hook and its two-privilege-level signature (unprivileged
@@ -359,8 +368,10 @@ scp transfer + elevated `sh -c` install). The optional `checksum` is Ansible's
 `get_url` spelling (`"sha256:<hexdigest>"`), verified before anything is written
 and what makes the two-phase fetch deterministic — the body runs once per phase,
 so the URL is fetched twice per host, and both phases install byte-identical
-content. Text only: a binary body (a `.rpm`, a tarball) raises `ValueError` and
-stays `files.put`'s job. The example pulls the two Docker CE artifacts the role
+content. Text or binary: a UTF-8 body installs as text; a non-UTF-8 body (a
+launcher `.phar`, an executable) installs the raw bytes through
+`files.install(content=<bytes>)`, sha1-idempotent — full `get_url` binary
+parity. The example pulls the two Docker CE artifacts the role
 hits the gap twice for — the `docker-ce.repo` stanza to
 `/etc/yum.repos.d/docker-ce.repo` and the ASCII-armored GPG key to
 `/etc/pki/rpm-gpg/RPM-GPG-KEY-DOCKER` (the file the downloaded `.repo`'s
@@ -381,7 +392,8 @@ for the `get_url`/`rpm_key` mapping.
 `files.fetch_url` (a reemote original) is the control-side GET helper —
 Ansible's `uri` with `return_content: true` mapped to a plain coroutine: it
 fetches an `http(s)` URL on the *control* machine (`urllib` in a worker
-thread, the same seam `files.download` rides) and hands the response body
+thread, the same `_fetch_url_verified` seam `files.download` rides) and hands
+the response body
 back to the program as UTF-8 text, instead of installing it at a remote path.
 It is **not an operation** — no `OpContext`, never `op()` — so the
 determinism recipe is to await it once in `main()` and freeze the returned
@@ -395,7 +407,8 @@ at `/tmp/composer-installer.php` with `mode="0755"` and
 byte-identical content. `/tmp` is login-writable, so no `sudo` is needed. The
 optional `checksum` is verified before the caller sees the content, a
 `file:`/`ftp:` scheme raises before any fetch, and a binary body raises
-`ValueError` (text only — a binary download stays `files.put`'s job). The
+`ValueError` (the helper stays text only — installing a binary body at a path
+is `files.download`'s or `files.install(content=<bytes>)`'s job). The
 script runs the same deploy twice to show the second reporting no change.
 Unlike the `files_download` sibling it passes a live checksum: the fetched
 signature *is* the pin. On-target HTTP —

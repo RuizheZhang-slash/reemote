@@ -160,6 +160,7 @@ Each of these was reported missing by an earlier audit and **now exists**
 | service *reload* handlers | `reload_handler`, `service_handler(action="reloaded")` |
 | `ansible_os_family` dispatch | `server.LinuxDistribution` — `family` key |
 | text `get_url` | `files.download` (control-side fetch, checksum-pin) |
+| binary `get_url` to a root-owned path (#23) | `files.install(content=<bytes>)` spools binary over unprivileged scp (`InstallBinarySpoolCommand`) into the same elevated install chain, idempotent on `RemoteFileSha1`; `files.download` installs a non-UTF-8 body through it (the drush launcher `.phar` shape — one `sudo=True` request, second run a no-op). The sha1 read-back is unprivileged, so the dest needs a login-readable mode (`0755`). The `io.BytesIO` + `files.put` stopgap is retired (recipe 7) |
 | yum version pins / enablerepo / disablerepo / update_cache | `dnf.packages` `pkg=version`, `allow_downgrade`, `repos`, `disable_repos`, `update_cache` |
 | apt `default_release` / `install_recommends=no` | `apt.packages(default_release=…, no_recommends=…)` |
 | apt `cache_valid_time` / "no cache-age fact" | the `AptUpdateStamp` fact (mtime of `/var/lib/apt/periodic/update-success-stamp`); **both** `apt.update(cache_valid_time=N)` and `apt.packages(update=True, cache_valid_time=N)` gate on it and report no change inside the window. Only the baseline's `cache_time` alias is still absorbed by `**kwargs` |

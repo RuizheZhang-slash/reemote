@@ -8,8 +8,8 @@ control-side GET helper -- Ansible's ``uri`` with ``return_content: true``
 mapped to a plain coroutine: it fetches an ``http(s)`` URL on the *control*
 machine and hands the response body back to the program as text, instead of
 installing it at a remote path (that is its sibling ``files.download``'s job,
-and download delegates its fetch half to this helper, so the two share one
-scheme guard, one checksum contract and one text-only decode).
+which shares the scheme guard and checksum contract through the same
+verified-fetch seam -- and, unlike this helper, also installs a binary body).
 
 The geerlingguy.composer role is the canonical case: a ``uri`` task fetches
 the Composer installer's SHA-384 signature from ``composer.github.io`` and
@@ -41,8 +41,8 @@ How it works -- and why the fetch lives in ``main()``, not in the deploy:
   each target (here the controller fetches for all targets -- the same HTTPS
   trust model), and Ansible re-fetches per host per run (here once per run).
 * **Text only.** The body is decoded as UTF-8; a binary response raises
-  ``ValueError`` and stays ``files.put``'s job (fetch it control-side into an
-  ``io.BytesIO`` and put it into a login-writable path). A ``file:``/``ftp:``
+  ``ValueError`` -- installing one at a path is ``files.download``'s or
+  ``files.install(content=<bytes>)``'s job. A ``file:``/``ftp:``
   scheme raises before any fetch, and an optional Ansible-style
   ``checksum="<algorithm>:<hexdigest>"`` is verified before the caller sees
   the content.

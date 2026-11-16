@@ -32,17 +32,22 @@ How it works -- and why it is one request, not two runs:
   ``curl``/``wget``. The cost is that the operation body runs once per phase
   (prepare, then apply), so the URL is fetched twice per host -- harmless for
   these small text artifacts.
-* **Delegated write.** The body decodes the fetched bytes to text and hands the
-  string to ``files.install``, so a download inherits install's content-only
+* **Delegated write.** A UTF-8 body is decoded to text and handed to
+  ``files.install``; a binary body rides install's bytes path as raw bytes
+  (issue #23). Either way a download inherits install's content-only
   idempotence (a converged file yields zero commands), its dest-derived ``/tmp``
   spool, its owner/mode handling, its optional ``validate`` hook and its
   two-privilege-level signature: an *unprivileged* scp transfer of the spool
   plus an *elevated* ``sh -c`` install (``mkdir -p``/``cp``/optional
   ``chown``/``chmod``/``rm -rf``). ``sudo=True`` elevates only the install half.
-* **Text only.** ``install`` takes ``content: str`` and ``FileContents`` compares
-  text, so a binary body (a ``.rpm``, a tarball) raises ``ValueError`` rather
-  than corrupting the write. A binary download stays ``files.put``'s job: fetch
-  it control-side into an ``io.BytesIO`` and put it into a login-writable path.
+* **Text or binary.** A text body installs through ``FileContents``
+  idempotence; a binary body (a ``.phar`` launcher, a ``.rpm``) installs
+  through the binary-safe ``RemoteFileSha1`` idempotence -- never the
+  text-decode ``ValueError`` -- so Ansible's ``get_url`` maps to one
+  ``files.download`` request for both kinds. The canonical binary case is
+  the geerlingguy.drush launcher: ``files.download(url=<drush.phar URL>,
+  dest="/usr/local/bin/drush", mode="0755", sudo=True)``. Give a binary
+  install a login-readable mode: the sha1 read-back runs unprivileged.
 
 Reproducibility: pass ``checksum="sha256:<hexdigest>"`` (Ansible's ``get_url``
 spelling) to verify the fetched bytes before anything is written. Pinning it is
@@ -53,7 +58,7 @@ digest that would rot; add it in production from the vendor's published value.
 
 The script downloads both artifacts, then runs the very same deploy a second
 time: the first run writes, the second reports no change on every host (the
-fetched text now equals what ``FileContents`` reads back).
+fetched content now equals what ``FileContents`` reads back).
 
 Every request carries ``when=is_centos``, the declarative eligibility guard: the
 predicate reads only **static** inventory data -- ``host.group``, set by the

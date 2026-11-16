@@ -246,6 +246,7 @@ from reemote.modules.files.files import (
     FileCommand,
     FoundFile,
     GetCommand,
+    InstallBinarySpoolCommand,
     InstallCommand,
     InstallSpoolCommand,
     InstallValidateCommand,
@@ -2088,6 +2089,8 @@ class SimulatedHost(Host):
                 self.get_file(src, dest)
             case InstallSpoolCommand(content=content, dest=dest):
                 self.put_file(io.BytesIO(content.encode()), dest)
+            case InstallBinarySpoolCommand(content=content, dest=dest):
+                self.put_file(io.BytesIO(content), dest)
             case InstallValidateCommand(validate=validate, spool=spool):
                 # The atomic validate-then-install step. A real validator exits
                 # non-zero on a bad config and send_command's fail-fast aborts
@@ -4304,10 +4307,12 @@ class SimulatedHost(Host):
         """Record a simulated ``files.install``: install the spooled content.
 
         The elevated second half of ``files.install``: the paired
-        ``InstallSpoolCommand`` spools the content into ``remote_files``
-        (through ``put_file``), then this install pops the spool and stores
-        the bytes at ``dest`` -- the same store ``FileContents`` reads back
-        -- so a repeat with identical content is a no-op. Mirrors
+        ``InstallSpoolCommand`` (text) or ``InstallBinarySpoolCommand``
+        (bytes) spools the content into ``remote_files`` (through
+        ``put_file``), then this install pops the spool and stores
+        the bytes at ``dest`` -- the same store ``FileContents`` and
+        ``RemoteFileSha1`` read back -- so a repeat with identical content
+        is a no-op for either content kind. Mirrors
         ``install_systemd_conf_file`` with the caller-chosen mode: the path
         is added to ``existing_files`` plus a ``file_stats`` row carrying
         the operation's canonical octal-digit mode (the real command's

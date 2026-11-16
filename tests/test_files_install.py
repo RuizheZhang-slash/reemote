@@ -5,9 +5,11 @@
 
 ``files.install`` is a reemote original closing the root-owned-write gap:
 ``files.put``/``files.edit`` ride unprivileged scp, and the put-then-move
-recipe spans two runs. This operation reads the destination's text with the
-``FileContents`` fact and, only when it differs from the desired ``content``,
-yields an unprivileged ``InstallSpoolCommand`` transfer to a dest-derived
+recipe spans two runs. This operation reads the destination's content --
+``FileContents`` for a ``str``, the binary-safe ``RemoteFileSha1`` for
+``bytes`` (issue #23) -- and, only when it differs from the desired
+``content``, yields an unprivileged ``InstallSpoolCommand`` (text) or
+``InstallBinarySpoolCommand`` (bytes) transfer to a dest-derived
 ``/tmp`` spool path followed by an elevated ``InstallCommand`` shell
 (``mkdir -p``/``cp``/optional ``chown``/``chmod``/``rm`` wrapped in
 ``sh -c``) -- both from ONE request, so the whole write fits a single deploy.
@@ -18,10 +20,12 @@ install half, the never-elevated transfer half and the optional
 naming, the content-equality idempotence (install, rewrite, no-op,
 empty-content boundary), mode validation, the fact read over the real
 transport, the ``SimulatedHost`` seam dispatch and state mutation
-(including the installed owner), and end-to-end ``run``/plan/log behaviour
-including the second-install no-op and the spool cleanup.
+(including the installed owner), end-to-end ``run``/plan/log behaviour
+including the second-install no-op and the spool cleanup, and the binary
+``bytes`` path (sha1 idempotence, the two-pass no-op, the validate hook).
 """
 
+import hashlib
 import shlex
 from collections.abc import Generator
 
@@ -40,6 +44,7 @@ from reemote.hosts import CommandError, Host
 from reemote.modules import files
 from reemote.modules.files.files import (
     FileContents,
+    InstallBinarySpoolCommand,
     InstallCommand,
     InstallSpoolCommand,
     InstallValidateCommand,
@@ -812,3 +817,220 @@ async def test_unreadable_install_is_idempotent_across_deploys():
     assert not second.log[0].changed
     assert second.log[0].reason == f"content already up to date ({DEST})"
     assert changed_hosts(second, {"Install service config"}) == frozenset()
+
+
+# --- The binary bytes path (issue #23) -----------------------------------------
+
+
+BINARY_DEST = "/usr/local/bin/reemote-demo-bin"
+BINARY_CONTENT = b"\xff\xfe\x00\x01phar"  # never valid UTF-8
+BINARY_SPOOL = _install_spool_path(BINARY_DEST)
+BINARY_SHA1 = hashlib.sha1(BINARY_CONTENT).hexdigest()
+
+
+def test_install_binary_spool_command_renders_as_a_transfer():
+    """The binary spool half is non-shell like the text one, and a sudo-flagged
+    request never elevates it -- the transfers-never-elevate boundary holds."""
+    cmd = InstallBinarySpoolCommand(content=BINARY_CONTENT, dest=BINARY_SPOOL)
+    assert str(cmd) == f"scp <files install> -> {BINARY_SPOOL}"
+    assert not hasattr(cmd, "shell")
+    assert command_shell(cmd, sudo=True) == str(cmd)
+
+
+async def test_install_binary_creates_an_absent_file():
+    """Bytes ride the binary spool descriptor and the shared elevated install;
+    a non-UTF-8 body never raises the text-decode ValueError."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        cmd async for cmd in files.install(ctx, BINARY_CONTENT, BINARY_DEST)
+    ]
+
+    assert ctx.changed
+    assert ctx.reason == f"content {BINARY_DEST} is absent, will install"
+    spool_cmd, install_cmd = commands
+    assert isinstance(spool_cmd, InstallBinarySpoolCommand)
+    assert spool_cmd.content == BINARY_CONTENT
+    assert spool_cmd.dest == BINARY_SPOOL
+    assert isinstance(install_cmd, InstallCommand)
+    assert install_cmd.spool == BINARY_SPOOL
+    assert install_cmd.dest == BINARY_DEST
+    assert install_cmd.mode == 644
+
+
+async def test_install_binary_is_a_no_op_when_the_sha1_matches():
+    """The binary idempotence compares RemoteFileSha1 against the content's
+    control-side sha1 -- no decode, so any bytes converge."""
+    host = SimulatedHost(name="h", remote_files={BINARY_DEST: BINARY_CONTENT})
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        cmd async for cmd in files.install(ctx, BINARY_CONTENT, BINARY_DEST)
+    ]
+
+    assert not ctx.changed
+    assert ctx.reason == f"content already up to date ({BINARY_DEST})"
+    assert commands == []
+
+
+async def test_install_binary_rewrites_when_the_content_differs():
+    host = SimulatedHost(name="h", remote_files={BINARY_DEST: b"stale binary"})
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        cmd async for cmd in files.install(ctx, BINARY_CONTENT, BINARY_DEST)
+    ]
+
+    assert ctx.changed
+    assert ctx.reason == f"content {BINARY_DEST} differs, will install"
+    assert len(commands) == 2
+
+
+async def test_install_binary_empty_content_boundary():
+    """Absence (None) and empty bytes (b"") stay distinguishable, exactly as
+    the text path's None/"" boundary."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [cmd async for cmd in files.install(ctx, b"", BINARY_DEST)]
+    assert ctx.changed
+    assert len(commands) == 2
+
+    host.remote_files[BINARY_DEST] = b""
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [cmd async for cmd in files.install(ctx, b"", BINARY_DEST)]
+    assert not ctx.changed
+    assert commands == []
+
+
+async def test_install_binary_mode_user_and_group_reach_the_install():
+    """The launcher shape: mode 0755 with an explicit root:root owner rides
+    the same elevated install chain the text path uses."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        cmd
+        async for cmd in files.install(
+            ctx, BINARY_CONTENT, BINARY_DEST, mode="0755", user="root", group="root"
+        )
+    ]
+    _, install_cmd = commands
+    assert install_cmd.mode == 755
+    assert "chmod 755 " in install_cmd.shell()
+    assert f"chown root:root {BINARY_DEST}" in install_cmd.shell()
+
+
+async def test_install_binary_yields_validate_between_spool_and_install():
+    """The validate hook works on the binary spool too -- the bytes checked
+    are the very bytes the install is about to cp into place."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        cmd
+        async for cmd in files.install(
+            ctx, BINARY_CONTENT, BINARY_DEST, validate="test -s {spool}"
+        )
+    ]
+    assert [type(cmd) for cmd in commands] == [
+        InstallBinarySpoolCommand,
+        InstallValidateCommand,
+        InstallCommand,
+    ]
+
+
+async def test_install_binary_reads_the_sha1_over_the_real_transport():
+    """Without the simulated seam the idempotence read is RemoteFileSha1's
+    sha1sum probe: a matching digest no-ops, a different one re-installs."""
+    host = CannedShellHost(f"{BINARY_SHA1}  {BINARY_DEST}\n")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        cmd async for cmd in files.install(ctx, BINARY_CONTENT, BINARY_DEST)
+    ]
+    assert not ctx.changed
+    assert commands == []
+
+    host = CannedShellHost(f"{'0' * 40}  {BINARY_DEST}\n")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        cmd async for cmd in files.install(ctx, BINARY_CONTENT, BINARY_DEST)
+    ]
+    assert ctx.changed
+    assert len(commands) == 2
+
+
+async def test_send_command_dispatches_the_binary_spool_and_install():
+    """The seam stores the raw bytes (no encode round-trip) and the shared
+    install arm lands them with the requested mode row."""
+    host = SimulatedHost.from_inventory(INVENTORY[0])
+    await send_command(
+        host, InstallBinarySpoolCommand(content=BINARY_CONTENT, dest=BINARY_SPOOL)
+    )
+    assert host.remote_files == {BINARY_SPOOL: BINARY_CONTENT}
+
+    await send_command(
+        host,
+        InstallCommand(spool=BINARY_SPOOL, dest=BINARY_DEST, mode=755),
+    )
+    assert host.remote_files == {BINARY_DEST: BINARY_CONTENT}
+    assert BINARY_DEST in host.existing_files
+    assert BINARY_SPOOL not in host.existing_files
+    assert host.file_stats[BINARY_DEST] == {
+        "user": "root",
+        "group": "root",
+        "mode": 755,
+        "size": len(BINARY_CONTENT),
+    }
+    assert "/usr/local/bin" in host.directory_stats
+
+
+async def test_install_binary_end_to_end_plan_log_and_second_no_op():
+    """One sudo=True request spools and installs the bytes in a single deploy;
+    the second install in the same deploy reads the sha1 back as a no-op, and
+    a second full run over the same host state is a no-op too -- the issue's
+    plan -> apply -> second-apply acceptance with no spool-stat bridge."""
+
+    def deploy(host: Host) -> Generator[OperationRequest]:
+        yield op(
+            files.install,
+            name="Install launcher",
+            content=BINARY_CONTENT,
+            dest=BINARY_DEST,
+            mode="0755",
+            sudo=True,
+        )
+        yield op(
+            files.install,
+            name="Re-install launcher",
+            content=BINARY_CONTENT,
+            dest=BINARY_DEST,
+            mode="0755",
+            sudo=True,
+        )
+
+    plans, report, hosts = await run(
+        INVENTORY, deploy, host_factory=SimulatedHost.from_inventory
+    )
+
+    first, second = plans["web1"]
+    assert first.changed
+    assert second.changed  # prepare never sends: the file was absent for both
+
+    assert report is not None
+    entries = {entry.name: entry for entry in report.log}
+    assert entries["Install launcher"].changed
+    assert not entries["Re-install launcher"].changed
+    assert entries["Re-install launcher"].reason == (
+        f"content already up to date ({BINARY_DEST})"
+    )
+
+    host = hosts[0]
+    assert host.remote_files == {BINARY_DEST: BINARY_CONTENT}
+
+    log = format_log(report)
+    assert f"$ scp <files install> -> {BINARY_SPOOL}" in log
+    assert "$ sudo sh -c 'mkdir -p /usr/local/bin && cp" in log
+
+    # A second full run over run 1's host state: both requests no-op.
+    _plans, again, _hosts = await run(
+        INVENTORY, deploy, host_factory=lambda entry: host
+    )
+    assert again is not None
+    assert not again.log[0].changed
+    assert not again.log[1].changed

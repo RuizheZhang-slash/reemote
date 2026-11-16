@@ -2461,9 +2461,10 @@ async def put(ctx: OpContext, src: IO[Any], dest: str) -> AsyncGenerator[Command
     #
     # The transfer is unprivileged: it rides the connection's scp channel as
     # the login user, so the ``sudo``/``su`` escalation flags do not apply to
-    # it and ``dest`` must be writable by that user (put into a writable path
-    # first and move it with ``files.move`` flagged ``sudo=True`` when it must
-    # end up root-owned).
+    # it and ``dest`` must be writable by that user (a root-owned target is
+    # ``files.install``'s job -- it takes binary ``content`` as bytes and
+    # spools-and-installs in one deploy -- or ``files.download``'s for a URL
+    # source).
     local_sha1 = await asyncio.to_thread(_sha1_of_source, src)
     remote_sha1 = await ctx.facts.get(RemoteFileSha1, dest)
 
@@ -2676,6 +2677,39 @@ class InstallSpoolCommand(TransferCommand):
 
 
 @dataclass(frozen=True)
+class InstallBinarySpoolCommand(TransferCommand):
+    """Spool ``files.install``'s binary content to a ``/tmp`` path on the target.
+
+    The binary sibling of ``InstallSpoolCommand`` (issue #23) and a *non-shell*
+    descriptor: it copies the content over the connection's scp channel via
+    ``Host.upload_file`` rather than running shell text, so it has no
+    ``shell()`` and its loggable form is the ``__str__`` rendering
+    ``command_shell`` falls back to. The content is raw ``bytes`` -- hashable
+    and equal across phases, the ``UnarchiveSpoolCommand`` pattern -- wrapped
+    in a fresh ``io.BytesIO`` only at transfer time, so no identity-stable
+    stream is needed at the call site. The copy rides as the login user
+    (transfers are unprivileged, so the request's ``sudo`` does not apply to
+    it), which is why the spool path is world-writable ``/tmp`` rather than
+    the root-owned destination directory; the paired ``InstallCommand`` is
+    the same elevated install the text path uses.
+    """
+
+    content: bytes  # the binary files.install writes (never decoded)
+    dest: str  # spool file path on the target host (inside a sha1-derived /tmp dir)
+
+    def __str__(self) -> str:
+        return f"scp <files install> -> {self.dest}"
+
+    async def transfer(self, host: Host) -> None:
+        # scp does not create parent directories, and the spool lives inside
+        # a sha1-derived /tmp directory, so mkdir -p it first -- unprivileged,
+        # exactly as the text InstallSpoolCommand does.
+        parent = shlex.quote(str(PurePosixPath(self.dest).parent))
+        await host.run_shell(f"mkdir -p {parent}")
+        await host.upload_file(io.BytesIO(self.content), self.dest)
+
+
+@dataclass(frozen=True)
 class InstallValidateCommand(Command):
     """Validate the spooled file before the elevated install lands it.
 
@@ -2772,7 +2806,7 @@ class InstallCommand(Command):
 
 async def install(
     ctx: OpContext,
-    content: str,
+    content: str | bytes,
     dest: str,
     mode: str = "0644",
     user: str | None = None,
@@ -2780,11 +2814,13 @@ async def install(
     validate: str | None = None,
     **kwargs: Any,
 ) -> AsyncGenerator[Command]:
-    """Install text content at a root-owned path via spool-and-install.
+    """Install text or binary content at a root-owned path via spool-and-install.
 
     Args:
         ctx (OpContext): Execution context for the operation.
-        content (str): The desired text content of the file.
+        content (str | bytes): The desired content of the file: ``str`` for
+            text (compared against ``FileContents``) or ``bytes`` for binary
+            (compared against ``RemoteFileSha1``, no UTF-8 decode).
         dest (str): The remote path to install the content at.
         mode (str, optional): The installed file's permissions as
             octal-digit text (``"0644"``, ``"600"``). Defaults to "0644".
@@ -2826,25 +2862,35 @@ async def install(
     # request -- prepare records both, apply runs them in order -- so the
     # whole write fits a single deploy.
     #
-    # Idempotent on ``FileContents``: when the destination already holds
+    # Idempotent on content: ``FileContents`` for a ``str``, the binary-safe
+    # ``RemoteFileSha1`` for ``bytes``. When the destination already holds
     # exactly ``content`` nothing is yielded; otherwise an
-    # ``InstallSpoolCommand`` transfer spools the text to a dest-derived
-    # ``/tmp`` path over scp (unprivileged regardless of the request's
-    # ``sudo``), then an ``InstallCommand`` runs the elevated
+    # ``InstallSpoolCommand`` (text) or ``InstallBinarySpoolCommand`` (bytes)
+    # transfer spools the content to a dest-derived ``/tmp`` path over scp
+    # (unprivileged regardless of the request's ``sudo``), then an
+    # ``InstallCommand`` runs the elevated
     # ``mkdir -p``/``cp``/``chmod``/``rm`` install. Installing under
     # ``/etc`` needs root, so flag the request ``sudo=True`` (or
     # ``su=True``); the run-as user and any password come from the
     # inventory ``privilege`` data, never the operation.
     #
-    # ``content`` is a plain ``str``, not an IO stream (the
-    # ``systemd.dropin`` shape, developer-chosen): text is what
-    # ``FileContents`` compares, a str is hashable and equal across
-    # phases, and no identity-stable module-level stream is needed. Binary
-    # content stays ``files.put``'s job (into a login-user-writable path).
-    # The spool name is the destination's sha1 prefix, so different targets
-    # never collide on one spool file while the name stays deterministic
-    # across phases; it is collision avoidance, not a security boundary
-    # (the name is predictable on world-writable ``/tmp``).
+    # ``content`` is a plain ``str`` or ``bytes``, not an IO stream (the
+    # ``systemd.dropin`` shape, developer-chosen): both are hashable and
+    # equal across phases, so no identity-stable module-level stream is
+    # needed. The bytes path (issue #23) is the binary spool-and-install
+    # ``files.unarchive``'s ``UnarchiveSpoolCommand`` pioneered, generalized
+    # from "extract an archive" to "install a file": a ``.phar`` launcher
+    # lands at ``/usr/local/bin`` in ONE request exactly as a text config
+    # lands under ``/etc``, idempotent on the sha1 digest ``files.put``
+    # already compares -- no UTF-8 decode, so any bytes work. The sha1
+    # read-back is unprivileged (``sha1sum`` as the login user), so a
+    # login-unreadable binary destination reads as absent and re-installs
+    # every deploy -- give a binary install a login-readable mode (the
+    # ``0755`` launcher shape). The spool name is the destination's sha1
+    # prefix, so different targets never collide on one spool file while
+    # the name stays deterministic across phases; it is collision
+    # avoidance, not a security boundary (the name is predictable on
+    # world-writable ``/tmp``).
     #
     # ``mode`` accepts octal-digit text only (``"0644"``, ``"600"``);
     # a symbolic mode raises ``ValueError`` -- ``files.file``/``chmod``
@@ -2878,15 +2924,15 @@ async def install(
     # elevated (as root), matching Ansible's become-scoped ``validate`` and
     # letting a checker like ``nginx -t`` read every file the config
     # references. An empty/whitespace-only template raises ``ValueError``.
-    # The read-back is two-tier: ``FileContents`` cats unprivileged first and,
-    # when the login user cannot read the file (eg a ``0640`` config owned by
-    # a service account), re-reads it elevated with ``sudo`` -- so content
-    # idempotence holds for restrictive modes too, and the re-read's run-as
-    # user and any password come from the inventory ``privilege`` data.
-    # There is deliberately no ``present=False`` removal branch --
-    # ``files.file(present=False)`` already owns removal. ``**kwargs``
-    # absorbs any further global arguments (``op()`` already strips
-    # ``name``/``sudo``/``su``).
+    # The text read-back is two-tier: ``FileContents`` cats unprivileged
+    # first and, when the login user cannot read the file (eg a ``0640``
+    # config owned by a service account), re-reads it elevated with ``sudo``
+    # -- so content idempotence holds for restrictive modes too, and the
+    # re-read's run-as user and any password come from the inventory
+    # ``privilege`` data. There is deliberately no ``present=False`` removal
+    # branch -- ``files.file(present=False)`` already owns removal.
+    # ``**kwargs`` absorbs any further global arguments (``op()`` already
+    # strips ``name``/``sudo``/``su``).
     if not mode or any(c not in "01234567" for c in mode):
         raise ValueError(
             f"Invalid file mode: {mode!r} expected octal digits "
@@ -2896,19 +2942,35 @@ async def install(
     if validate is not None and not validate.strip():
         raise ValueError("validate must be a non-empty command template")
 
-    current = await ctx.facts.get(FileContents, dest)
-    if current == content:
-        ctx.reason = f"content already up to date ({dest})"
-        return
-
-    ctx.changed = True
-    ctx.reason = (
-        f"content {dest} differs, will install"
-        if current is not None
-        else f"content {dest} is absent, will install"
-    )
     spool = _install_spool_path(dest)
-    yield InstallSpoolCommand(content=content, dest=spool)
+    if isinstance(content, bytes):
+        # The binary path: compare the content's sha1 (a plain control-side
+        # hashlib call, the files.put precedent) against the remote file's
+        # binary-safe digest -- never a UTF-8 decode.
+        local_sha1 = hashlib.sha1(content).hexdigest()
+        current_sha1 = await ctx.facts.get(RemoteFileSha1, dest)
+        if current_sha1 == local_sha1:
+            ctx.reason = f"content already up to date ({dest})"
+            return
+        ctx.changed = True
+        ctx.reason = (
+            f"content {dest} differs, will install"
+            if current_sha1 is not None
+            else f"content {dest} is absent, will install"
+        )
+        yield InstallBinarySpoolCommand(content=content, dest=spool)
+    else:
+        current = await ctx.facts.get(FileContents, dest)
+        if current == content:
+            ctx.reason = f"content already up to date ({dest})"
+            return
+        ctx.changed = True
+        ctx.reason = (
+            f"content {dest} differs, will install"
+            if current is not None
+            else f"content {dest} is absent, will install"
+        )
+        yield InstallSpoolCommand(content=content, dest=spool)
     if validate is not None:
         yield InstallValidateCommand(validate=validate, spool=spool, dest=dest)
     yield InstallCommand(
@@ -3063,6 +3125,33 @@ def _parse_checksum(checksum: str) -> tuple[str, str]:
     return algorithm, expected
 
 
+async def _fetch_url_verified(url: str, checksum: str | None) -> bytes:
+    """Scheme-guarded, checksum-verified control-side fetch of a URL's bytes.
+
+    The shared fetch half of ``files.fetch_url`` and ``files.download``:
+    reject a non-http(s) scheme and parse the optional checksum *before* any
+    fetch, so a typo fails fast at the call line rather than after a network
+    round-trip, then verify the digest against the raw bytes. The body is
+    returned undecoded -- ``fetch_url`` applies its text-only UTF-8 decode on
+    top, while ``download`` falls back to install's binary path when the
+    decode fails. Tests replace ``_fetch_url_bytes`` to stay offline.
+    """
+    if not url.startswith(("http://", "https://")):
+        raise ValueError(f"url must be an http(s) URL, got: {url!r}")
+    expected = _parse_checksum(checksum) if checksum is not None else None
+
+    data = await asyncio.to_thread(_fetch_url_bytes, url)
+    if expected is not None:
+        algorithm, digest = expected
+        actual = hashlib.new(algorithm, data).hexdigest().lower()
+        if actual != digest:
+            raise ValueError(
+                f"checksum mismatch for {url}: expected {algorithm} {digest}, "
+                f"got {actual}"
+            )
+    return data
+
+
 async def fetch_url(url: str, *, checksum: str | None = None) -> str:
     """Fetch an ``http(s)`` URL control-side and return its body as text.
 
@@ -3072,8 +3161,9 @@ async def fetch_url(url: str, *, checksum: str | None = None) -> str:
     freeze the returned text into the per-host plan the deploy consumes --
     the fetch-once-then-freeze recipe that keeps both deploy phases
     deterministic. ``files.download`` is the install-at-a-path sibling and
-    delegates its fetch half here, so the two share one scheme guard, one
-    checksum contract and one text-only decode.
+    shares the scheme guard and checksum contract through
+    ``_fetch_url_verified``; unlike this helper it also installs a binary
+    body (issue #23), so a binary URL belongs there, not here.
 
     Args:
         url (str): The ``http(s)`` URL to fetch control-side.
@@ -3106,37 +3196,26 @@ async def fetch_url(url: str, *, checksum: str | None = None) -> str:
     # pin then makes any per-phase re-fetch byte-identical). On-target HTTP
     # stays a ``Shell`` action: no command execution inside deploys.
     #
-    # The guard order is download's: reject a non-http(s) scheme and parse the
-    # optional checksum *before* any fetch, so a typo fails fast at the call
-    # line rather than after a network round-trip; verify the digest against
-    # the raw bytes before decoding, so a mismatch raises before the caller
-    # sees the content. Text only -- a binary body (a ``.rpm``, a tarball)
-    # raises ``ValueError`` and stays ``files.put``'s job (fetch it
-    # control-side into an ``io.BytesIO`` and put it into a login-writable
-    # path). An unreachable URL or a non-2xx response raises
+    # The guard order is download's, shared through ``_fetch_url_verified``:
+    # reject a non-http(s) scheme and parse the optional checksum *before*
+    # any fetch, so a typo fails fast at the call line rather than after a
+    # network round-trip; verify the digest against the raw bytes before
+    # decoding, so a mismatch raises before the caller sees the content.
+    # This helper stays text only -- a binary body (a ``.phar``, a ``.rpm``,
+    # a tarball) raises ``ValueError``; installing one at a path is
+    # ``files.download``'s or ``files.install(content=<bytes>)``'s job
+    # (issue #23). An unreachable URL or a non-2xx response raises
     # ``urllib.error.URLError``/``HTTPError`` (both ``OSError`` subclasses).
     # Tests replace ``_fetch_url_bytes`` to stay offline.
-    if not url.startswith(("http://", "https://")):
-        raise ValueError(f"url must be an http(s) URL, got: {url!r}")
-    expected = _parse_checksum(checksum) if checksum is not None else None
-
-    data = await asyncio.to_thread(_fetch_url_bytes, url)
-    if expected is not None:
-        algorithm, digest = expected
-        actual = hashlib.new(algorithm, data).hexdigest().lower()
-        if actual != digest:
-            raise ValueError(
-                f"checksum mismatch for {url}: expected {algorithm} {digest}, "
-                f"got {actual}"
-            )
+    data = await _fetch_url_verified(url, checksum)
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError(
-            f"{url} is not valid UTF-8 text; files.fetch_url and files.download "
-            "return text content only (a binary body -- a .rpm, a tarball -- "
-            "stays files.put's job: fetch it control-side into an io.BytesIO "
-            "and put it into a login-writable path)"
+            f"{url} is not valid UTF-8 text; files.fetch_url returns text "
+            "content only (a binary body -- a .phar, a .rpm, a tarball -- "
+            "installs through files.download or files.install with bytes "
+            "content)"
         ) from exc
 
 
@@ -3151,12 +3230,12 @@ async def download(
     validate: str | None = None,
     **kwargs: Any,
 ) -> AsyncGenerator[Command]:
-    """Download a text file from a URL to a (root-owned) path.
+    """Download a text or binary file from a URL to a (root-owned) path.
 
     Args:
         ctx (OpContext): Execution context for the operation.
         url (str): The ``http(s)`` URL to fetch control-side.
-        dest (str): The remote path to install the downloaded text at.
+        dest (str): The remote path to install the downloaded content at.
         mode (str, optional): The installed file's permissions as octal-digit
             text (``"0644"``, ``"600"``). Defaults to "0644".
         checksum (str | None, optional): An Ansible-style
@@ -3180,7 +3259,7 @@ async def download(
 
     Yields:
         Command: The spool transfer and the elevated install command, only when
-            the downloaded content differs from the file's current text.
+            the downloaded content differs from the file's current content.
 
     **Raises:**
 
@@ -3205,23 +3284,25 @@ async def download(
     #
     # The write is delegated to ``files.install`` (the project's rule for a
     # derived content-producing files operation) and the fetch half to
-    # ``files.fetch_url`` (the control-side content-returning helper, so the
-    # scheme guard, checksum contract and text-only decode are shared, not
-    # duplicated): fetch_url fetches the URL *control-side*, verifies the
-    # optional checksum, decodes the bytes to text, and download hands the
-    # returned string to install -- which re-reads ``FileContents``
-    # (served from the same phase ``FactCache``, no second host round-trip),
-    # yields nothing when the text already equals the file's content, validates
-    # ``mode`` (raising ``ValueError`` on a non-octal-digit string), derives the
-    # ``/tmp`` spool name from ``dest``, spools over *unprivileged* scp and
-    # installs with an elevated ``sh -c`` (``mkdir -p``/``cp``/optional
-    # ``chown``/``chmod``/``rm -rf``), and applies the optional ``validate``
-    # hook on the staged bytes. So a download inherits install's content-only
-    # idempotence (a converged file yields zero commands), its owner/mode
-    # handling and its two-tier read-back (a file the login user cannot read
-    # is re-read elevated, so a restrictive mode does not re-download every
-    # deploy) -- and needs no new command descriptor, so ``SimulatedHost`` is
-    # unchanged.
+    # ``_fetch_url_verified`` (the scheme guard and checksum contract
+    # ``files.fetch_url`` also rides, so they are shared, not duplicated):
+    # the URL is fetched *control-side*, the optional checksum is verified
+    # against the raw bytes, and the body is decoded to text when it is
+    # UTF-8 -- otherwise the raw bytes ride install's binary path (issue
+    # #23). install re-reads the destination (``FileContents`` for text,
+    # ``RemoteFileSha1`` for bytes -- served from the same phase
+    # ``FactCache``, no second host round-trip), yields nothing when the
+    # content already matches, validates ``mode`` (raising ``ValueError``
+    # on a non-octal-digit string), derives the ``/tmp`` spool name from
+    # ``dest``, spools over *unprivileged* scp and installs with an elevated
+    # ``sh -c`` (``mkdir -p``/``cp``/optional ``chown``/``chmod``/``rm -rf``),
+    # and applies the optional ``validate`` hook on the staged bytes. So a
+    # download inherits install's content-only idempotence (a converged file
+    # yields zero commands), its owner/mode handling and, for text, its
+    # two-tier read-back (a file the login user cannot read is re-read
+    # elevated, so a restrictive mode does not re-download every deploy).
+    # The binary path adds one descriptor (``InstallBinarySpoolCommand``),
+    # handled by the same ``SimulatedHost`` install seam.
     #
     # The fetch is control-side, not host-side: the *control* machine opens the
     # connection (``urllib`` in a worker thread), so the download works when
@@ -3237,17 +3318,25 @@ async def download(
     # pass ``checksum`` to pin it. ``url`` must be ``http(s)`` -- a ``file:``/
     # ``ftp:`` scheme raises ``ValueError`` before any fetch.
     #
-    # Text only: install takes ``content: str`` and ``FileContents`` compares
-    # text, so the body is decoded as UTF-8 and a binary response (a ``.rpm``,
-    # a tarball) raises ``ValueError`` rather than corrupting the install. The
-    # motivating artifacts -- an ASCII-armored GPG key, a ``.repo``/``.sources``/
-    # ``.conf`` file -- are all text; a binary download stays ``files.put``'s
-    # job (fetch control-side into an ``io.BytesIO``, put into a login-writable
-    # path). ``/etc`` targets are root-owned, so flag the request ``sudo=True``
-    # (or ``su=True``); the spool transfer stays unprivileged regardless.
-    # ``**kwargs`` absorbs any further global arguments (``op()`` already strips
+    # Text or binary (issue #23, full Ansible ``get_url`` parity): a UTF-8
+    # body is decoded and rides install's text path (``FileContents``
+    # idempotence); a binary body (a ``.phar`` launcher, a ``.rpm``) is
+    # handed to install as ``bytes`` and rides its binary path
+    # (``RemoteFileSha1`` idempotence, ``InstallBinarySpoolCommand`` spool)
+    # -- never the text-decode ``ValueError``. A binary install's sha1
+    # read-back is unprivileged, so give it a login-readable mode (the
+    # ``0755`` launcher shape). ``/etc`` and ``/usr/local/bin`` targets are
+    # root-owned, so flag the request ``sudo=True`` (or ``su=True``); the
+    # spool transfer stays unprivileged regardless. ``**kwargs`` absorbs
+    # any further global arguments (``op()`` already strips
     # ``name``/``sudo``/``su``).
-    content = await fetch_url(url, checksum=checksum)
+    data = await _fetch_url_verified(url, checksum)
+    try:
+        content: str | bytes = data.decode("utf-8")
+    except UnicodeDecodeError:
+        # A binary body: install's bytes path spools and installs it
+        # without any decode, idempotent on the remote file's sha1.
+        content = data
 
     async for command in install(
         ctx,
@@ -4271,6 +4360,7 @@ __all__ = [
     "FindLinks",
     "FoundFile",
     "GetCommand",
+    "InstallBinarySpoolCommand",
     "InstallCommand",
     "InstallSpoolCommand",
     "InstallValidateCommand",

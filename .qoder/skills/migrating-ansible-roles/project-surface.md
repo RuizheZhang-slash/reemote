@@ -240,7 +240,9 @@ deb822-only match is named in the no-op reason, not edited.
 http(s) key URL** — the URL form fetches the armored key control-side and
 installs `/etc/apt/keyrings/<filename>.asc` itself (#17 closed — recipe 12c).
 `files.download` is **control-side
-fetch, text only**, checksum-pinnable, delegating to `files.install`;
+fetch, text or binary**, checksum-pinnable, delegating to `files.install` (a
+non-UTF-8 body installs the raw bytes, sha1-idempotent — #23 closed;
+`files.install` itself takes `content: str | bytes`);
 `files.unarchive(src, dest, creates=…, checksum=…)` extracts in-deploy — an
 http(s) `src` is fetched control-side as **binary**, and `creates` gates
 in-operation before any fetch (#21 closed); `files.copy` is full Ansible

@@ -1,11 +1,12 @@
 # Copyright (c) 2026 Kim Jarvis.
 # SPDX-License-Identifier: EPL-2.0
 
-"""Example: install text content at a root-owned path with files.install.
+"""Example: install text or binary content at a root-owned path with files.install.
 
 This is a *usage* example, not part of the library. ``files.install`` is the
-generic spool-and-install operation: it writes arbitrary text content to a
-path the login user cannot write directly (anything under ``/etc``), the
+generic spool-and-install operation: it writes arbitrary text or binary
+content to a path the login user cannot write directly (anything under
+``/etc``, a launcher under ``/usr/local/bin``), the
 task the namespace-specific operations (``apt.sources_file``, ``dnf.repo``,
 ``systemd.dropin``) each spell out for their own config paths.
 
@@ -17,10 +18,12 @@ spool file in the prepare phase. ``files.install`` yields the transfer and
 the elevated install from ONE request, so the whole write fits a single
 deploy:
 
-1. Idempotence: the operation reads the destination's current text with the
-   ``FileContents`` fact. When it already equals ``content``, nothing is
+1. Idempotence: the operation reads the destination's current content --
+   the ``FileContents`` fact for a ``str``, the binary-safe ``RemoteFileSha1``
+   fact for ``bytes``. When it already equals ``content``, nothing is
    yielded and the request reports no change.
-2. Spool: an ``InstallSpoolCommand`` transfer copies the content over scp to
+2. Spool: an ``InstallSpoolCommand`` (text) or ``InstallBinarySpoolCommand``
+   (bytes) transfer copies the content over scp to
    a dest-derived ``/tmp`` spool file inside a sha1-named directory
    (``/tmp/reemote-install-<sha1 of dest>/content``) -- unprivileged
    regardless of the request's ``sudo``, and named per destination so two
@@ -41,10 +44,15 @@ deploy:
    ``sudo=True`` elevates every step -- the file lands with the requested
    owner (root when none is named) and mode and the spool directory is cleaned up.
 
-``content`` is a plain ``str`` (text is what ``FileContents`` compares), so
-unlike ``files.put``'s IO source no identity-stable module-level stream is
-needed -- the same string in both phases compares equal. Binary content
-stays ``files.put``'s job, into a login-user-writable path.
+``content`` is a plain ``str`` or ``bytes`` (issue #23), so unlike
+``files.put``'s IO source no identity-stable module-level stream is needed
+-- both are hashable and equal across phases. The bytes path is the binary
+spool-and-install: idempotence switches to ``RemoteFileSha1`` (no UTF-8
+decode, so any bytes work -- a ``.phar`` launcher, a compiled artifact) and
+the spool transfer carries the raw bytes, while the elevated install chain
+is the same one the text path uses. The sha1 read-back is unprivileged, so
+give a binary install a login-readable mode (the ``0755`` launcher shape
+the demo below uses).
 
 Ownership: the optional ``user``/``group`` parameters add a ``chown`` (or
 ``chgrp`` for a group alone) step inside the elevated install chain, before
@@ -60,9 +68,9 @@ with ``sudo`` when the login user cannot read the file (a ``0640``
 service-account config), so a restrictive mode keeps content idempotence
 too -- the owned demo uses the login-readable ``0644``.
 
-The script installs a demo config and an owned demo config, then runs the
-very same deploy a second time: the first run writes, the second reports
-no change on every host.
+The script installs a demo config, an owned demo config and a demo binary,
+then runs the very same deploy a second time: the first run writes, the
+second reports no change on every host.
 
 Every request carries ``when=is_centos``, the declarative eligibility
 guard: the predicate reads only **static** inventory data --
@@ -120,6 +128,13 @@ CONTENT = "# Installed by reemote files.install\nmanaged = true\n"
 OWNED_DEST = "/etc/reemote-install-owned-demo.conf"
 OWNED_CONTENT = "# Installed by reemote files.install, owned by www\nmanaged = true\n"
 
+# The binary variant (issue #23): raw bytes at a root-owned executable path,
+# the drush-launcher shape. The content is deliberately not valid UTF-8 --
+# the bytes path never decodes it. Plain bytes are hashable and equal across
+# phases, so like a str they can be built at module level or inline.
+BINARY_DEST = "/usr/local/bin/reemote-install-demo-bin"
+BINARY_CONTENT = b"\xff\xfe\x00reemote demo binary\n"
+
 # examples/modules/files/files_install.py -> the project root, so the inventory
 # is found whatever the current working directory is.
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -152,7 +167,8 @@ def is_centos(host: Host) -> bool:
 
 
 def deploy(host: Host) -> Generator[OperationRequest]:
-    """Provision the www account, then install the plain and owned configs.
+    """Provision the www account, then install the plain and owned configs
+    and the demo binary.
 
     ``sudo=True`` elevates only the install half -- the scp spool transfer
     always rides as the login user. The mode defaults to "0644"; pass
@@ -204,6 +220,18 @@ def deploy(host: Host) -> Generator[OperationRequest]:
         sudo=True,
         when=is_centos,
     )
+    yield op(
+        files.install,
+        name="Install demo binary",
+        content=BINARY_CONTENT,
+        dest=BINARY_DEST,
+        # A login-readable executable mode: the binary idempotence read
+        # (RemoteFileSha1's sha1sum) runs unprivileged, so a login-unreadable
+        # destination would re-install every deploy.
+        mode="0755",
+        sudo=True,
+        when=is_centos,
+    )
 
 
 async def main() -> None:
@@ -223,8 +251,9 @@ async def main() -> None:
         assert report is not None
         print(format_log(report))
 
-        # Second run of the SAME deploy: FileContents now reads back what the
-        # first run installed, so every request reports no change.
+        # Second run of the SAME deploy: FileContents (text) and
+        # RemoteFileSha1 (binary) now read back what the first run
+        # installed, so every request reports no change.
         plans, report, _hosts = await run(inventory, deploy)
         print("\n== Log: install demo config (second run, no-op) ==")
         assert report is not None

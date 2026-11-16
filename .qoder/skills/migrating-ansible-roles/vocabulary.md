@@ -47,8 +47,8 @@ run via `gather_action` **outside** deploys.
 
 | Ansible | reemote | Notes |
 | --- | --- | --- |
-| `copy content=…` | `files.install(content=…, dest=…)` | spool-and-install; `sudo=True` for root-owned |
-| `copy src=<file>` | read control-side → `files.install(content=text)`; binary → `files.put(src=io stream)` | no controller paths in requests |
+| `copy content=…` | `files.install(content=…, dest=…)` | spool-and-install; `content: str \| bytes` (#23 closed); `sudo=True` for root-owned |
+| `copy src=<file>` | read control-side → `files.install(content=text or bytes)` | no controller paths in requests; a binary body is sha1-idempotent and needs a login-readable mode |
 | `copy remote_src=yes` | `files.copy` | full parity (#22 closed): existing-dir `dest` → copy inside, else **rename** (parent validated in both phases); `mode`/`user`/`group` in the same request; sha1-gated — equal content no-ops, drift needs `overwrite=True` (Ansible `force: yes`). `files.move` takes the same forms but is **stateless** |
 | `template` | pre-render in `main()` + `files.install` | recipe 4; jinja2 **or PyYAML** (`to_nice_yaml`) is your dependency — `dev` group for a repo example |
 | `copy/template validate:` | `files.install(validate="cmd {spool}")` | recipe 5; atomic |
@@ -59,7 +59,7 @@ run via `gather_action` **outside** deploys.
 | `file state=link/hard` | `files.link` | |
 | `file attributes=…` (chattr) | `files.flags` | immutable etc. |
 | `get_url` (text) | `files.download` | recipe 7; control-side fetch, checksum-pin |
-| `get_url` (binary) | control-side fetch → `io.BytesIO` → `files.put` | or `dnf.rpm`/`apt.deb`; a tarball **to extract** → `files.unarchive(src=<url>)` (#21 closed) |
+| `get_url` (binary) | `files.download` | **#23 closed**: a non-UTF-8 body installs the raw bytes via `files.install(content=<bytes>)`, sha1-idempotent (drush launcher: `/usr/local/bin/drush`, `0755`); a `.rpm`/`.deb` **to install as a package** → `dnf.rpm`/`apt.deb`; a tarball **to extract** → `files.unarchive(src=<url>)` (#21 closed) |
 | `fetch` | `files.get(src=…, dest=<per-host IO sink>)` | remote→control |
 | `stat` | `files.File`, `FileExists`, `FileLink`, `Md5File`/`Sha256File`/`Sha384File` | via `gather_fact` |
 | `slurp` | `files.FileContents` (gather) or `files.get` | |

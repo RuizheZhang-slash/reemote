@@ -9,18 +9,19 @@ vendor URL). It retires the hand-rolled ``urllib.request`` + ``io.BytesIO``
 workaround ``dnf.key``/``apt.key``/``gpg.key`` force, since each *rejects* a URL
 ``src``. The body fetches the ``http(s)`` URL on the *control* machine (never the
 target host, so no host-side ``curl``/``wget``), verifies an optional
-Ansible-style ``"<algorithm>:<hexdigest>"`` checksum, decodes the bytes to text,
-and delegates the write to ``files.install`` -- so a download inherits install's
+Ansible-style ``"<algorithm>:<hexdigest>"`` checksum, decodes a UTF-8 body to
+text (a binary body rides install's bytes path instead, issue #23), and
+delegates the write to ``files.install`` -- so a download inherits install's
 content-only idempotence, its dest-derived ``/tmp`` spool, its owner/mode
 handling, its optional ``validate`` hook and its two-privilege-level signature
-(unprivileged scp transfer + elevated ``sh -c`` install) with no new command
-descriptor.
+(unprivileged scp transfer + elevated ``sh -c`` install).
 
 The single network read (``_fetch_url_bytes``) is monkeypatched to a canned-bytes
 stub so every test stays offline. Covers the checksum-spec parser, the http(s)
 scheme guard (rejected before any fetch), the fetch-then-delegate behaviour
 (create, rewrite, converged no-op), checksum match/mismatch, the binary-body
-rejection, the forwarding of ``mode``/``user``/``group``/``validate`` and
+install (sha1 idempotence, the drush-launcher end-to-end shape), the forwarding
+of ``mode``/``user``/``group``/``validate`` and
 ``**kwargs`` to install, the control-side fetch seam, and end-to-end
 ``run``/plan/log behaviour including the once-per-phase fetch, the second-run
 no-op and the dry run.
@@ -37,6 +38,7 @@ from reemote.hosts import Host
 from reemote.modules import files
 from reemote.modules.files import files as files_module
 from reemote.modules.files.files import (
+    InstallBinarySpoolCommand,
     InstallCommand,
     InstallSpoolCommand,
     InstallValidateCommand,
@@ -238,20 +240,101 @@ async def test_download_surfaces_a_malformed_checksum_spec(canned_fetch):
     assert canned_fetch == []
 
 
-# --- The binary-body rejection ------------------------------------------------
+# --- The binary-body install (issue #23) ----------------------------------------
 
 
-async def test_download_rejects_a_binary_body(monkeypatch):
-    """Install takes ``content: str``, so a non-UTF-8 response raises rather
-    than corrupting the write -- a binary download stays ``files.put``'s job."""
-    monkeypatch.setattr(
-        files_module, "_fetch_url_bytes", lambda url: b"\xff\xfe\x00\x01binary"
-    )
+BINARY_DATA = b"\xff\xfe\x00\x01phar"  # never valid UTF-8
+
+
+async def test_download_installs_a_binary_body(monkeypatch):
+    """A non-UTF-8 body rides install's bytes path: an
+    ``InstallBinarySpoolCommand`` spools the raw bytes and the same elevated
+    ``InstallCommand`` lands them -- never the text-decode ``ValueError``."""
+    monkeypatch.setattr(files_module, "_fetch_url_bytes", lambda url: BINARY_DATA)
     host = SimulatedHost(name="h")
     ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
-    with pytest.raises(ValueError, match="not valid UTF-8 text"):
-        [cmd async for cmd in files.download(ctx, URL, DEST)]
-    assert host.remote_files == {}
+    commands = [cmd async for cmd in files.download(ctx, URL, DEST)]
+
+    assert ctx.changed
+    assert ctx.reason == f"content {DEST} is absent, will install"
+    spool_cmd, install_cmd = commands
+    assert isinstance(spool_cmd, InstallBinarySpoolCommand)
+    assert spool_cmd.content == BINARY_DATA
+    assert spool_cmd.dest == SPOOL
+    assert isinstance(install_cmd, InstallCommand)
+    assert install_cmd.dest == DEST
+
+
+async def test_download_binary_is_a_no_op_when_the_sha1_matches(monkeypatch):
+    """The binary idempotence is ``RemoteFileSha1``-based: a converged binary
+    file yields zero commands (but the URL is still fetched to compare)."""
+    monkeypatch.setattr(files_module, "_fetch_url_bytes", lambda url: BINARY_DATA)
+    host = SimulatedHost(name="h", remote_files={DEST: BINARY_DATA})
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [cmd async for cmd in files.download(ctx, URL, DEST)]
+
+    assert not ctx.changed
+    assert ctx.reason == f"content already up to date ({DEST})"
+    assert commands == []
+
+
+async def test_download_binary_rewrites_on_content_drift(monkeypatch):
+    """A drifted binary destination re-installs once -- the sha1 comparison
+    needs no decode, so any bytes converge."""
+    monkeypatch.setattr(files_module, "_fetch_url_bytes", lambda url: BINARY_DATA)
+    host = SimulatedHost(name="h", remote_files={DEST: b"stale binary"})
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [cmd async for cmd in files.download(ctx, URL, DEST)]
+
+    assert ctx.changed
+    assert ctx.reason == f"content {DEST} differs, will install"
+    assert len(commands) == 2
+
+
+async def test_download_binary_end_to_end_second_run_no_op(monkeypatch):
+    """The drush-launcher acceptance shape: a binary ``.phar`` URL installs at
+    a root-owned ``/usr/local/bin`` path in ONE ``sudo=True`` request, and a
+    second full run over the same host state is a no-op (``changed=False``)."""
+    phar_url = "https://github.com/drush-ops/drush-launcher/releases/download/0.10.1/drush.phar"
+    phar_dest = "/usr/local/bin/drush"
+    phar_spool = _install_spool_path(phar_dest)
+    pin = "sha256:" + hashlib.sha256(BINARY_DATA).hexdigest()
+    monkeypatch.setattr(files_module, "_fetch_url_bytes", lambda url: BINARY_DATA)
+
+    def deploy(host: Host) -> Generator[OperationRequest]:
+        yield op(
+            files.download,
+            name="Download Drush launcher",
+            url=phar_url,
+            dest=phar_dest,
+            mode="0755",
+            checksum=pin,
+            sudo=True,
+        )
+
+    _plans, first, hosts = await run(
+        INVENTORY, deploy, host_factory=SimulatedHost.from_inventory
+    )
+    assert first is not None
+    assert first.log[0].changed
+    host = hosts[0]
+    assert host.remote_files == {phar_dest: BINARY_DATA}
+    assert host.file_stats[phar_dest]["mode"] == 755
+    assert host.file_stats[phar_dest]["user"] == "root"
+
+    log = format_log(first)
+    assert f"$ scp <files install> -> {phar_spool}" in log
+    assert "$ sudo sh -c 'mkdir -p /usr/local/bin && cp" in log
+    assert "chmod 755 " in log
+
+    # The second deploy shares run 1's host state: the sha1 read-back matches
+    # and the install is a no-op -- no between-pass spool-stat bridge needed.
+    _plans, second, _hosts = await run(
+        INVENTORY, deploy, host_factory=lambda entry: host
+    )
+    assert second is not None
+    assert not second.log[0].changed
+    assert second.log[0].reason == f"content already up to date ({phar_dest})"
 
 
 # --- Forwarding to install ----------------------------------------------------

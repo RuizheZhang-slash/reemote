@@ -967,8 +967,9 @@ The fetch is **control-side**: the *control* machine opens the connection
 (`urllib` in a worker thread), not the target host. So the download works when
 only the control side has internet egress and the host never needs `curl`/`wget`
 — the opposite of Ansible's `get_url`, which fetches *on the target*. The body
-decodes the fetched bytes to text and delegates the write to
-[`files.install`][reemote.modules.files.files.install], so a download inherits
+delegates the write to
+[`files.install`][reemote.modules.files.files.install] — decoded text when the
+body is UTF-8, the raw bytes otherwise — so a download inherits
 install's content-only idempotence (a converged file yields zero commands), its
 dest-derived `/tmp` spool, its owner/mode handling and its two-privilege-level
 signature: an *unprivileged* scp transfer plus an *elevated* `sh -c` install.
@@ -981,7 +982,8 @@ signature: an *unprivileged* scp transfer plus an *elevated* `sh -c` install.
 | `get_url: {mode, owner, group}` | `files.download(mode=..., user=..., group=...)` — forwarded to the install |
 | `get_url: {checksum: "sha256:<hex>"}` | `files.download(checksum="sha256:<hex>")` — the same spelling, verified before the write |
 | `get_url: {validate: ...}` | `files.download(validate=...)` — the atomic validate-then-install hook |
-| `get_url` of a **binary** (a `.rpm`, a tarball) | not `files.download` (text only) — fetch control-side into an `io.BytesIO` and [`files.put`][reemote.modules.files.files.put] it into a login-writable path, or use the package module ([`dnf.rpm`][reemote.modules.dnf.dnf.rpm]); a tarball **to extract** is [`files.unarchive(src=<url>, dest=...)`][reemote.modules.files.files.unarchive] — it fetches the binary control-side itself |
+| `get_url` of a **binary** (a launcher `.phar`, an executable) | `files.download` installs it directly — a non-UTF-8 body rides `files.install(content=<bytes>)`, sha1-idempotent, in the same one-request `sudo=True` shape (the drush launcher: `dest="/usr/local/bin/drush"`, `mode="0755"`) |
+| `get_url` of a `.rpm`/`.deb` **to install as a package** | the package module ([`dnf.rpm`][reemote.modules.dnf.dnf.rpm], `apt.deb`) — download-then-install is their job; a tarball **to extract** is [`files.unarchive(src=<url>, dest=...)`][reemote.modules.files.files.unarchive] — it fetches the binary control-side itself |
 | `rpm_key: {key: <url or path>}` (import into the keyring) | a separate [`dnf.key`][reemote.modules.dnf.dnf.key] request — it takes the key *content* as a control-side IO stream (`src=io.BytesIO(...)`), **not** the downloaded path (`dnf.key` rejects a filename/URL `src`). `files.download` places the key *file* a `.repo`'s `gpgkey=file://` references; `dnf.key` does the `rpm --import` |
 | the module's own privilege escalation | `sudo=True` on the [`op(...)`][reemote.core.op]: the spool transfer stays unprivileged, only the install elevates |
 
@@ -1060,23 +1062,27 @@ program* rather than installed at a path (Ansible's `uri` with
   internet egress still receive the file, but it means the control side must be
   able to reach the URL, and the body is fetched once per phase (twice per host
   per run). Pass `checksum` to pin it.
-- **Text only.** `files.download` decodes the body as UTF-8 and delegates to
-  `files.install`, which takes `content: str`. A binary response (a `.rpm`, a
-  tarball) raises `ValueError` — fetch it control-side into an `io.BytesIO` and
-  [`files.put`][reemote.modules.files.files.put] it into a login-writable path,
-  or use the package module ([`dnf.rpm`][reemote.modules.dnf.dnf.rpm]). A
-  tarball destined for **extraction** is
-  [`files.unarchive`][reemote.modules.files.files.unarchive] — it fetches the
-  binary control-side, spools it unprivileged and extracts on the host, all
-  in-operation.
+- **Text or binary.** `files.download` decodes the body as UTF-8 when it can
+  and delegates the text to `files.install`; a non-UTF-8 body (a launcher
+  `.phar`, an executable) installs the raw bytes through the same
+  spool-and-install chain, idempotent on the destination's
+  [`RemoteFileSha1`][reemote.modules.files.files.RemoteFileSha1]. A `.rpm`/`.deb`
+  destined for **package installation** still belongs to the package module
+  ([`dnf.rpm`][reemote.modules.dnf.dnf.rpm]); a tarball destined for
+  **extraction** is [`files.unarchive`][reemote.modules.files.files.unarchive]
+  — it fetches the binary control-side, spools it unprivileged and extracts on
+  the host, all in-operation.
 - **`url` must be `http(s)`.** A `file:`/`ftp:` scheme raises `ValueError` before
   any fetch.
-- **A file the login user cannot read is re-read elevated.** Idempotence is
-  `files.install`'s content-equality against the
+- **A text file the login user cannot read is re-read elevated.** Text
+  idempotence is `files.install`'s content-equality against the
   [`FileContents`][reemote.modules.files.files.FileContents] read, which cats
   unprivileged first and re-reads with `sudo` when the login user cannot read
   the target (a `0640` secret) — so a restrictive mode keeps content idempotence
-  instead of re-downloading every deploy.
+  instead of re-downloading every deploy. A **binary** install compares
+  [`RemoteFileSha1`][reemote.modules.files.files.RemoteFileSha1] instead, whose
+  `sha1sum` read-back stays **unprivileged**: give the destination a
+  login-readable mode (a `0755` launcher) or it re-installs every deploy.
 - **`sudo=True` elevates the install, not the transfer.** The scp spool copy
   always rides as the login user into world-writable `/tmp`; only the `sh -c`
   install that overlays the protected file elevates — the same trade-off every
@@ -1097,10 +1103,13 @@ maps to [`files.fetch_url`][reemote.modules.files.files.fetch_url].
 `files.fetch_url(url, *, checksum=None) -> str` is a **control-side helper, not
 an operation**: a plain coroutine you await from `main()` (or any control-side
 code), never through [`op(...)`][reemote.core.op]. It fetches the `http(s)` URL
-on the *control* machine (`urllib` in a worker thread — the same seam
-`files.download` rides, which delegates its fetch half to it), verifies the
+on the *control* machine (`urllib` in a worker thread — both it and
+`files.download` ride the same verified-fetch seam, `_fetch_url_verified`),
+verifies the
 optional Ansible-style `"<algorithm>:<hexdigest>"` checksum against the raw
-bytes, and returns the body decoded as UTF-8. The determinism recipe is
+bytes, and returns the body decoded as UTF-8. It stays **text only** — a
+binary response raises `ValueError`; installing one at a path is
+`files.download`'s or `files.install(content=<bytes>)`'s job. The determinism recipe is
 **fetch once, then freeze**: await it once in `main()` and close the returned
 text into the per-host plan the deploy consumes, so both deploy phases build
 identical requests from the same frozen string.
@@ -1197,10 +1206,11 @@ version — signature fetch, pinned download, second-run no-op — is the
   stay hashable, and a `str` is. On-target HTTP (a POST, a webhook, a GET that
   must run on the host) stays a [`Shell`][reemote.actions.Shell] action driven
   by [`gather_action`](guide.md#actions), outside any deploy.
-- **Text only, `http(s)` only.** A binary body raises `ValueError` (fetch it
-  control-side into an `io.BytesIO` and
-  [`files.put`][reemote.modules.files.files.put] it into a login-writable
-  path); a `file:`/`ftp:` scheme raises before any fetch.
+- **Text only, `http(s)` only.** A binary body raises `ValueError` —
+  installing one at a path is
+  [`files.download`][reemote.modules.files.files.download]'s or
+  [`files.install(content=<bytes>)`][reemote.modules.files.files.install]'s
+  job; a `file:`/`ftp:` scheme raises before any fetch.
 - **The checksum pin is the determinism guarantee.** Without it, a URL whose
   body changes between the fetch and a later re-fetch would feed different
   values to different phases. The composer shape pins the *download* with the

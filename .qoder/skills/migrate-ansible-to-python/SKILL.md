@@ -76,7 +76,7 @@ Full detail in [project-surface.md](project-surface.md).
 3. **No commands inside a deploy.** `command:`/`shell:`/`script:` tasks become
    `Shell`/`Script` actions run via `gather_action` *outside* deploys. The
    boundary is enforced (`ActionInDeployError`), not conventional.
-4. **No controller filesystem paths.** `files.install` takes `content: str`;
+4. **No controller filesystem paths.** `files.install` takes `content: str | bytes`;
    `files.put`/`get` take IO streams you opened; `files.copy`/`move` are
    remote-to-remote. Templates are pre-rendered control-side in `main()`.
 5. **`when` guards read static inventory data only** (`host.group`,
@@ -347,7 +347,7 @@ citations, checking for stale issues first) is in
 | File | Read it when |
 | --- | --- |
 | [project-surface.md](project-surface.md) | You need any API or install detail: installation, repo layout, execution model, `op`/`run`/gather signatures, inventory schema, actions, handlers, the 20-module catalog, errors, docs/examples/tests map |
-| [construct-recipes.md](construct-recipes.md) | A task uses handlers, host_vars, include_vars, templates, validate, lineinfile, get_url, build-from-source, loops, register/when, or any meta construct. Recipes 9–12 cover the tracked-gap shapes: elevated `0640` read-back (#12), multi-key keyrings (#11), `apt_repository`/`deb822_repository` cache, global removal and `signed_by` URL (#14, #15, #17 — all shipped), converging dnf `latest` (the one still-open workaround); recipes 7–8 also carry the files fixes: `unarchive` (#21, closed) and `copy` remote-src parity (#22, closed) |
+| [construct-recipes.md](construct-recipes.md) | A task uses handlers, host_vars, include_vars, templates, validate, lineinfile, get_url, build-from-source, loops, register/when, or any meta construct. Recipes 9–12 cover the tracked-gap shapes: elevated `0640` read-back (#12), multi-key keyrings (#11), `apt_repository`/`deb822_repository` cache, global removal and `signed_by` URL (#14, #15, #17 — all shipped), converging dnf `latest` (the one still-open workaround); recipes 7–8 also carry the files fixes: `get_url` binary parity (#23, closed), `unarchive` (#21, closed) and `copy` remote-src parity (#22, closed) |
 | [vocabulary.md](vocabulary.md) | Mapping an Ansible module to its reemote operation/fact/action (all domains) |
 | [gap-analysis.md](gap-analysis.md) | A task has no obvious mapping: absence proof against docs + source, classification, known open/closed gaps, resolution paths, upstream reporting, report templates |
 | [worked-example.md](worked-example.md) | Designing or writing the program: a complete role→Python migration |
@@ -364,9 +364,12 @@ citations, checking for stale issues first) is in
   `apt.update`, …) always yield when reached — keep them in handler deploys
   or guard them, never in a converged unconditional deploy.
 - `files.install`/`transform`/`download` idempotence is **content-only**,
-  and the read-back is two-tier: `FileContents` cats unprivileged first and
+  and the text read-back is two-tier: `FileContents` cats unprivileged first and
   re-reads elevated with `sudo` when the login user cannot read, so a `0640`
-  service-owned file converges too (upstream issue #12 — recipe 9).
+  service-owned file converges too (upstream issue #12 — recipe 9). A
+  **binary** install (`content: bytes`, #23) compares `RemoteFileSha1`
+  instead — its read-back stays unprivileged, so the dest needs a
+  login-readable mode (`0755`).
   Mode/owner drift still needs `files.file` to converge.
 - reemote is Linux-only, a library not a CLI, has no role ecosystem and no
   OS-name translation — pick the right package module per target yourself.
