@@ -107,31 +107,6 @@ nav:
 #  - Examples:
 #      - Overview: examples.md
 #      - Modules:
-#          - apk: examples/modules/apk.md
-#          - apt: examples/modules/apt.md
-#          - dnf: examples/modules/dnf.md
-#          - files: examples/modules/files.md
-#          - firewalld: examples/modules/firewalld.md
-#          - flatpak: examples/modules/flatpak.md
-#          - git: examples/modules/git.md
-#          - gpg: examples/modules/gpg.md
-#          - hardware: examples/modules/hardware.md
-#          - iptables: examples/modules/iptables.md
-#          - lxd: examples/modules/lxd.md
-#          - mysql: examples/modules/mysql.md
-#          - openrc: examples/modules/openrc.md
-#          - postgresql: examples/modules/postgresql.md
-#          - selinux: examples/modules/selinux.md
-#          - server: examples/modules/server.md
-#          - snap: examples/modules/snap.md
-#          - sysctl: examples/modules/sysctl.md
-#          - systemd: examples/modules/systemd.md
-#          - ufw: examples/modules/ufw.md
-#      - Actions: examples/actions.md
-#      - Demonstrations:
-#          - Composition: examples/demonstrations/composition.md
-#          - Connectors: examples/demonstrations/connectors.md
-#          - Privilege: examples/demonstrations/privilege.md
   - API Reference:
 #      - Drivers: drivers.md
 #      - Core: core.md
@@ -165,5 +140,35 @@ nav:
           - ssh: connectors/ssh.md
       - Handlers: handlers.md
   - Migrating: migrating.md
+  - Examples:
+#      - Overview: examples.md
+      - Modules:
+          - apk: examples/modules/apk.md
+          - apt: examples/modules/apt.md
+          - dnf: examples/modules/dnf.md
+          - files: examples/modules/files.md
+          - firewalld: examples/modules/firewalld.md
+          - flatpak: examples/modules/flatpak.md
+          - git: examples/modules/git.md
+          - gpg: examples/modules/gpg.md
+          - hardware: examples/modules/hardware.md
+          - iptables: examples/modules/iptables.md
+          - lxd: examples/modules/lxd.md
+          - mysql: examples/modules/mysql.md
+          - openrc: examples/modules/openrc.md
+          - postgresql: examples/modules/postgresql.md
+          - selinux: examples/modules/selinux.md
+          - server: examples/modules/server.md
+          - snap: examples/modules/snap.md
+          - sysctl: examples/modules/sysctl.md
+          - systemd: examples/modules/systemd.md
+          - ufw: examples/modules/ufw.md
+      - Actions: examples/actions.md
+      - Demonstrations:
+          - Composition: examples/demonstrations/composition.md
+          - Connectors: examples/demonstrations/connectors.md
+          - Privilege: examples/demonstrations/privilege.md
+      - Roles:
+          - ansible-datadog: examples/roles/ansible-datadog.md
 
 

@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | Role | [`datadog.datadog`](https://github.com/DataDog/ansible-datadog) 5.6.0 |
-| Program | [`ansible-datadog.py`](ansible-datadog.py) |
+| Program | [`ansible-datadog.py`](../../../examples/roles/ansible-datadog/ansible-datadog.py) |
 | Target | **Ubuntu** — hosts in the inventory group `"ubuntu"` |
 | Inventory | [`inventory.json`](../../../inventory.json) at the project root |
 | Scope | the role's Debian/Ubuntu **default path** (see [§9](#9-scoped-out)) |
