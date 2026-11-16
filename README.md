@@ -1,21 +1,11 @@
 
 # Reemote
 
-**Reemote is a Python library for configuring and deploying servers.** Describe
-the packages, files and services you want using Python functions; reemote
-queries each server, plans the work and applies the changes. Your deployment is
-a Python program that you can import, test, compose and run from your existing
-automation.
+Reemote is a Python library for configuring and deploying servers, specifically built to support the automated migration of Ansible-based workflows into pure Python.
 
-Reemote is built on a two-phase *prepare → execute* execution model. Deploy
-scripts are **Python generators** that yield `OperationRequest` descriptors
-instead of calling operations directly. That lets the driver pause the script at
-every operation boundary: the prepare phase produces a full plan for dry-run
-reporting, and the apply phase runs all hosts in lockstep with a fresh fact
-cache per step, so sequential *"act, then read"* logic gives the correct answer
-in both phases.
+## Scope
 
-**Scope.** reemote is a library, not a deployment tool. It ships no CLI and no
+Reemote is a library, not a deployment tool. It ships no CLI and no
 inventory format: hosts are a plain *inventory* (a list of dictionaries) handed
 to `run`. The transport is real — the default `Host.from_inventory` factory
 opens an [asyncssh] connection per entry, gathers facts and runs commands over
@@ -23,7 +13,7 @@ it, and `run` closes the connections when it finishes.
 
 ## Documentation
 
-Full documentation — a getting-started guide, the API reference for every module,
+A getting-started guide, the API reference for every module,
 actions and connectors, and runnable examples — is available at
 **[https://reemote.org/](https://reemote.org/)**.
 
