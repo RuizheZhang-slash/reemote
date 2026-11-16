@@ -16,7 +16,7 @@ old symlink, ensure the directory exists, download the launcher phar
 `is_ubuntu`, so the other hosts in the shared `inventory.json` (Alpine,
 CentOS) are skipped without being contacted. The role's two opt-in branches —
 `drush_composer_global_install` and `drush_install_from_source`, both
-default-false — are scoped out (§8), so the launcher path is the whole
+default-false — are scoped out (§9), so the launcher path is the whole
 migration.
 
 The migration is complete: every task on the launcher path maps to a covered
@@ -60,7 +60,8 @@ never downloads anything.
   is assumed.
 - PHP must already be installed for `drush` to run (§1.1). The launcher
   install itself needs nothing beyond a stock Ubuntu userland (`sha1sum`,
-  `cp`, `chmod` — all present).
+  `cp`, `chmod` — all present). The demo host had no PHP at all — see §8
+  for the symptom and the one-line remedy.
 
 ### 1.4 Inventory: what you must add
 
@@ -146,7 +147,7 @@ original name, read from the inventory entry's extra keys.
 Invalid values (a non-boolean flag, an empty or relative path, a non-string
 URL) raise before any host is contacted. The composer/source branch
 variables (`drush_composer_*`, `drush_source_*`, `drush_install_from_source`,
-…) are scoped out (§8) and ignored.
+…) are scoped out (§9) and ignored.
 
 ## 4. Program shape: one deploy and its one barrier
 
@@ -199,8 +200,8 @@ shape change).
 | # | Ansible task | reemote target | Status |
 | --- | --- | --- | --- |
 | 1 | `include_tasks: install-drush-launcher.yml` `when: drush_launcher_install` | the flag gates plan creation in `main()` — a disabled host yields no requests | covered |
-| 2 | `include_tasks: install-drush-composer.yml` `when: drush_composer_global_install` (default false) | scoped out (§8) | out of scope |
-| 3 | `include_tasks: install-source.yml` `when: drush_install_from_source` (default false) | scoped out (§8) | out of scope |
+| 2 | `include_tasks: install-drush-composer.yml` `when: drush_composer_global_install` (default false) | scoped out (§9) | out of scope |
+| 3 | `include_tasks: install-source.yml` `when: drush_install_from_source` (default false) | scoped out (§9) | out of scope |
 
 ### `tasks/install-drush-launcher.yml` → the one deploy
 
@@ -300,7 +301,41 @@ destination and writes the `file_stats` row the `File` fact reads), so pass 2
 observes pass 1 through the simulation's own mutators. The remaining seeding
 choices are documented in the test docstring.
 
-## 8. Scoped out
+## 8. Verified on the demo ubuntu host
+
+Run against the shared `ubuntu` demo host (`192.168.0.181`) on 2026-11-16
+with the stock inventory entry (role defaults, no extra keys):
+
+- **Run 1:** the plan froze `(absent)`; `Install Drush.` spooled the binary
+  phar unprivileged and installed it with the elevated `cp`/`chmod` —
+  **1 changed request**.
+- **Run 2:** the plan froze `(present)`; `Install Drush.` reported
+  `content already up to date (/usr/local/bin/drush)`, and the directory and
+  executable-bit requests were no-ops — **0 changed requests**.
+- On the target: `/usr/local/bin/drush` is `mode=755 owner=root:root
+  size=298469`, and `drush --version` prints
+  `Drush Launcher Version: 0.10.1`.
+
+**PHP prerequisite: install `php-cli` before `drush --version` works.** The
+launcher is a phar with a `#!/usr/bin/env php` shebang, and the demo host had
+no PHP at all — the role does not install PHP (§1.1). The launcher *install*
+succeeds without PHP, but running it fails with
+`/usr/bin/env: 'php': No such file or directory` (exit 127). One-line remedy:
+
+```bash
+ssh supervisor@192.168.0.181 'sudo apt-get install -y php-cli'
+```
+
+This is host state, not a program defect — the migration installs the
+launcher faithfully, and PHP is the role's documented prerequisite. With
+`php-cli` installed (PHP 8.3.6), `drush --version` prints the launcher version
+and then the notice `The Drush launcher could not find a Drupal site to
+operate on` with **exit 1** — expected outside a Drupal project: the
+launcher's job is to delegate to a site-local Drush, and the demo host has no
+Drupal site. From inside a Drupal project (or with `--root=/path/to/drupal`)
+it delegates instead.
+
+## 9. Scoped out
 
 - **The composer-global branch** (`drush_composer_global_install`, default
   false): installs Drush via a global `composer require` and symlinks
