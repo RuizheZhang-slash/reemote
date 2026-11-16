@@ -40,6 +40,7 @@
         - move
         - put
         - transform
+        - unarchive
 
 
 
@@ -53,7 +54,8 @@ in a single source, so the read side (`FileLink`, `FileExists`,
 `FileFlags`, `FindFiles`, `FindDirectories`, `FindLinks`, `FindInFile`,
 `FindInFiles`, `FindFilesInfo`, `DirectoryEntries`)
 sits beside the `files.link`, `files.file`, `files.put`, `files.get`,
-`files.edit`, `files.install`, `files.transform`, `files.move`, `files.copy`, `files.directory`
+`files.edit`, `files.install`, `files.transform`, `files.move`, `files.copy`, `files.directory`,
+`files.unarchive`
 and `files.flags`
 operations that consume it.
 
@@ -228,7 +230,7 @@ Operations live in namespace modules so a deploy reads `files.link`,
 `files.file`, `files.put`, `files.get`, `files.edit`, `files.install`,
 `files.transform`,
 `files.move`,
-`files.copy`, `files.directory` and `files.flags`,
+`files.copy`, `files.directory`, `files.unarchive` and `files.flags`,
 mirroring the baseline's
 API. Every
 operation is an async generator taking an [`OpContext`][reemote.core.OpContext],
@@ -392,6 +394,45 @@ under `/etc` needs root, so flag the request `sudo=True`; the spool transfer
 stays unprivileged regardless. See
 [Migrating a URL download](../migrating.md#migrating-a-url-download-get_url)
 for the `get_url`/`rpm_key` mapping.
+
+`files.unarchive` is the pyinfra `files.unarchive` migration that closes
+issue #21 (Ansible `unarchive` parity -- the php-xdebug source tarball): it
+extracts an archive into a remote directory, idempotently gated by `creates`.
+`src` is auto-detected: an `http(s)` URL is fetched *control-side* as binary
+bytes (the `_fetch_url_bytes` seam `files.fetch_url` rides, without its
+text-only decode -- a `.tgz`/`.zip` body never raises), spooled to a
+URL-derived `/tmp` name over unprivileged scp, extracted, and the spool
+removed; any other `src` is a remote path already on the target, extracted in
+place and left alone (pyinfra's `remote_src=True`). The `remote_src` option
+itself is dropped -- the scheme decides -- because pyinfra's
+`remote_src=False` default uploads a *controller-side path*, a shape reemote's
+IO-only transfer decision deliberately does not have. The format derives from
+the archive's basename, case-insensitively (a URL query string never hides
+it): the tar family (`.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`,
+`.tar.xz`/`.txz`, `.tar.zst`) extracts with `tar` and the compression flag the
+suffix names, `.zip` with `unzip -o`; anything else raises `ValueError` before
+any fetch or fact read. `creates` is Ansible's `creates:` gate, resolved
+in-operation through the `FileExists` fact (`test -e`, so it sees the
+extracted *directory* Ansible names, not just regular files): a converged
+host reports `changed=False` with zero commands and skips the fetch entirely.
+Without it the operation is stateless like pyinfra's -- extraction always
+yields and always reports changed (there is no fact that can compare an
+extracted tree). `dest` is created with its parents when absent (the issue's
+requirement -- pyinfra raises on a non-existing directory); a `dest` held by
+a non-directory raises `ValueError`, and a remote `src` that is absent or not
+a regular file raises in *both* phases, the phase-unaware strictness
+`files.move`/`files.copy` chose. `extra_opts` is a tuple, not pyinfra's list
+(request arguments must be hashable), placed between the tool's flags and the
+archive path -- tar keeps `-f` adjacent to the path so an extra is never
+mistaken for it. `user`/`group` yield a recursive `chown` of `dest` after the
+extraction (the named account must already exist). The optional `checksum` is
+a reemote addition, the `files.download` contract
+(`"<algorithm>:<hexdigest>"`): a URL-fetched body must match it or
+`ValueError` raises before anything is staged -- pinning it is what keeps the
+two-phase fetch deterministic, because the body runs once per phase and both
+phases must stage byte-identical content. The extraction, mkdir, cleanup and
+chown are shell text, so flag the request `sudo=True` for a root-owned
+`dest`; the spool transfer stays unprivileged regardless.
 
 `files.fetch_url` is the control-side GET helper and a reemote original: it
 fetches an `http(s)` `url` on the *control* machine (`urllib` in a worker

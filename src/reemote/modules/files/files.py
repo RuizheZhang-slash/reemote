@@ -33,12 +33,13 @@
 #
 # Operation side (design doc section 6): ``files.link``, ``files.file``,
 # ``files.put``, ``files.get``, ``files.edit``, ``files.install``,
-# ``files.move``, ``files.copy``,
+# ``files.move``, ``files.copy``, ``files.unarchive``,
 # ``files.directory`` and ``files.flags`` plus the typed command descriptors
 # they yield (``LinkCommand``/``FileCommand``/``PutCommand``/``GetCommand``/
 # ``InstallSpoolCommand``/``InstallCommand``/
 # ``MoveCommand``/``RemoveTreeCommand``/``CopyCommand``/``MkdirCommand``/
-# ``ChmodCommand``/``ChownCommand``/``ChattrCommand``). Operations
+# ``ChmodCommand``/``ChownCommand``/``ChattrCommand``/
+# ``UnarchiveSpoolCommand``/``UnarchiveCommand``). Operations
 # are async generators that receive an ``OpContext``, await facts, set
 # ``ctx.changed``/``ctx.reason``, and yield command descriptors; they never
 # touch the host directly. ``PutCommand`` and ``GetCommand`` are the *non-shell*
@@ -56,6 +57,7 @@ import posixpath
 import re
 import shlex
 import stat
+import urllib.parse
 import urllib.request
 from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass
@@ -3260,6 +3262,276 @@ async def download(
         yield command
 
 
+# The archive formats ``files.unarchive`` extracts, ported from the baseline's
+# ``_TAR_FORMATS``/``_ZIP_FORMATS`` tables: the extension -> tar extraction
+# flags mapping (unzip always rides its ``-o`` overwrite flag). Matching is on
+# the archive's *basename*, case-insensitively, so a URL's query string never
+# hides the format.
+_TAR_FORMATS: dict[str, tuple[str, ...]] = {
+    ".tar": ("-x",),
+    ".tar.gz": ("-xz",),
+    ".tgz": ("-xz",),
+    ".tar.bz2": ("-xj",),
+    ".tbz2": ("-xj",),
+    ".tar.xz": ("-xJ",),
+    ".txz": ("-xJ",),
+    ".tar.zst": ("-x", "--zstd"),
+}
+_ZIP_FORMATS = (".zip",)
+_ARCHIVE_EXTENSIONS = tuple(_TAR_FORMATS) + _ZIP_FORMATS
+
+
+def _archive_format(name: str) -> tuple[str, tuple[str, ...]] | None:
+    """The extraction tool and flags for an archive basename, or None.
+
+    Ports the baseline's ``_get_archive_format``: a ``.tar``-family extension
+    selects ``tar`` with the compression flag the suffix names, ``.zip``
+    selects ``unzip -o``, and anything else is unsupported (the operation
+    raises ``ValueError`` before any fetch or fact read).
+    """
+    lower = name.lower()
+    for ext, flags in _TAR_FORMATS.items():
+        if lower.endswith(ext):
+            return "tar", flags
+    for ext in _ZIP_FORMATS:
+        if lower.endswith(ext):
+            return "unzip", ("-o",)
+    return None
+
+
+def _unarchive_spool_path(url: str) -> str:
+    """The deterministic ``/tmp`` spool file a URL-sourced unarchive uploads to.
+
+    The ``_install_spool_path`` collision rule applied to an archive URL: the
+    sha1 prefix of the URL keeps two different sources from sharing (and
+    clobbering) one spool while the name stays identical in both phases, and
+    the URL path's basename is appended so the spool keeps its extension --
+    the extraction derives its tool and flags from the *spool* path's suffix.
+    A top-level ``/tmp`` file (no subdirectory): the paired
+    ``RemoveTreeCommand`` removes it completely after the extraction. Like
+    install's spool, the name avoids collisions, not a hostile local user.
+    """
+    digest = hashlib.sha1(url.encode()).hexdigest()[:16]
+    name = PurePosixPath(urllib.parse.urlparse(url).path).name
+    return f"/tmp/reemote-unarchive-{digest}-{name}"
+
+
+@dataclass(frozen=True)
+class UnarchiveSpoolCommand(TransferCommand):
+    """Spool a URL-fetched archive's bytes to a ``/tmp`` path on the target.
+
+    The first step of a URL-sourced ``files.unarchive`` and a *non-shell*
+    descriptor: the copy rides the connection's scp channel via
+    ``Host.upload_file``, so it has no ``shell()`` and its loggable form is
+    the ``__str__`` rendering ``command_shell`` falls back to. Unlike
+    ``InstallSpoolCommand`` the content is raw ``bytes`` -- an archive is
+    binary, and bytes are hashable and equal across phases -- wrapped in a
+    fresh ``io.BytesIO`` only at transfer time, so no identity-stable stream
+    is needed at the call site. The copy rides as the login user (transfers
+    are unprivileged, so the request's ``sudo`` does not apply to it), which
+    is why the spool lives in world-writable ``/tmp`` rather than the
+    possibly root-owned destination directory.
+    """
+
+    content: bytes  # the fetched archive body (binary-safe, never decoded)
+    dest: str  # spool file path on the target host (a sha1-derived /tmp name)
+
+    def __str__(self) -> str:
+        return f"scp <files unarchive> -> {self.dest}"
+
+    async def transfer(self, host: Host) -> None:
+        await host.upload_file(io.BytesIO(self.content), self.dest)
+
+
+@dataclass(frozen=True)
+class UnarchiveCommand(Command):
+    """Extract an archive into a directory (``tar``/``unzip`` shell text).
+
+    The tool and its flags derive from ``src``'s extension through
+    ``_archive_format`` (``tar -xz ... -f src -C dest`` for the tar family,
+    ``unzip -o ... src -d dest`` for a zip). ``extra_opts`` ride between the
+    flags and the archive path; tar keeps ``-f`` adjacent to the path so an
+    extra is never mistaken for it, the baseline's ordering kept. Paths and
+    extras are shell-quoted. An unsupported extension raises ``ValueError``
+    (the operation validates first, so this is a direct-construction guard).
+    """
+
+    src: str  # the archive path on the target (remote src or the /tmp spool)
+    dest: str  # the directory to extract into
+    extra_opts: tuple[str, ...] = ()  # additional extract-command arguments
+
+    def shell(self) -> str:
+        fmt = _archive_format(PurePosixPath(self.src).name)
+        if fmt is None:
+            raise ValueError(
+                f"unsupported archive format: {self.src!r} "
+                f"(supported: {', '.join(_ARCHIVE_EXTENSIONS)})"
+            )
+        tool, flags = fmt
+        parts = [tool, *flags, *(shlex.quote(opt) for opt in self.extra_opts)]
+        src = shlex.quote(self.src)
+        dest = shlex.quote(self.dest)
+        if tool == "tar":
+            parts.extend(["-f", src, "-C", dest])
+        else:
+            parts.extend([src, "-d", dest])
+        return " ".join(parts)
+
+
+async def unarchive(
+    ctx: OpContext,
+    src: str,
+    dest: str,
+    creates: str | None = None,
+    extra_opts: tuple[str, ...] = (),
+    user: str | None = None,
+    group: str | None = None,
+    checksum: str | None = None,
+    **kwargs: Any,
+) -> AsyncGenerator[Command]:
+    """Extract an archive into a remote directory, gated by ``creates``.
+
+    Args:
+        ctx (OpContext): Execution context for the operation.
+        src (str): The archive to extract: a remote path already on the
+            target, or an ``http(s)`` URL fetched control-side as binary
+            bytes and spooled to ``/tmp`` first.
+        dest (str): The remote directory to extract into, created (with its
+            parents) when absent.
+        creates (str | None, optional): A path whose existence makes the
+            operation a no-op -- Ansible's ``creates:`` idempotence, resolved
+            in-operation through the ``FileExists`` fact (which sees files
+            and directories alike). Defaults to None (always extract, the
+            baseline's stateless behaviour).
+        extra_opts (tuple[str, ...], optional): Additional arguments for the
+            extract command (eg ``("--strip-components=1",)``), placed
+            between the tool's flags and the archive path. Defaults to ().
+        user (str | None, optional): The user to own the extracted tree
+            (a recursive ``chown`` of ``dest`` after the extraction).
+            Defaults to None (the archive's stored owners are kept).
+        group (str | None, optional): The group to own the extracted tree.
+            Defaults to None.
+        checksum (str | None, optional): An Ansible-style
+            ``"<algorithm>:<hexdigest>"`` (eg ``"sha256:9f2c..."``) a
+            URL-fetched body must match; a mismatch raises ``ValueError``
+            before anything is staged. Pinning it makes the two-phase fetch
+            deterministic. Ignored for a remote-path ``src``. Defaults to
+            None (fetch without verification).
+        **kwargs: Additional keyword arguments.
+
+    Yields:
+        Command: The directory creation, spool transfer, extraction, spool
+            cleanup and ownership commands, only when ``creates`` does not
+            already exist.
+
+    **Raises:**
+
+    ```python
+    CommandNotFoundError, HostConnectionError, OSError, ValueError
+    ```
+
+    Examples:
+        Examples can be found in ``examples/modules/files/files_unarchive.py``.
+    """
+
+    # pyinfra ``files.unarchive`` parity, with the issue #21 resolution of the
+    # controller-path conflict. pyinfra's ``remote_src=False`` default uploads
+    # a *controller-side path* to a temp file first -- a shape reemote's
+    # IO-only transfer decision deliberately does not have. Instead ``src`` is
+    # auto-detected: an ``http(s)`` URL is fetched *control-side* as binary
+    # bytes (the ``_fetch_url_bytes`` seam ``files.fetch_url`` rides, without
+    # its UTF-8 decode -- a ``.tgz``/``.zip`` body never raises the text-only
+    # ``ValueError``), spooled to a URL-derived ``/tmp`` name over unprivileged
+    # scp, extracted, and the spool removed; any other ``src`` is a remote path
+    # extracted in place and left alone (pyinfra's ``remote_src=True``). The
+    # ``remote_src`` option itself is therefore dropped -- the scheme decides.
+    #
+    # ``creates`` is Ansible's ``unarchive`` ``creates:`` gate (the
+    # php-xdebug source-tarball shape): the ``FileExists`` fact -- ``test -e``,
+    # so it sees the extracted *directory* Ansible names, not just regular
+    # files -- makes a converged host report ``changed=False`` with zero
+    # commands, and skips the fetch entirely. Without it the operation is
+    # stateless like pyinfra's: extraction always yields and always reports
+    # changed (there is no fact that can compare an extracted tree).
+    #
+    # ``dest`` is created when absent (a ``MkdirCommand``, the issue's
+    # requirement -- pyinfra instead raises on a non-existing directory); a
+    # ``dest`` held by a non-directory raises ``ValueError``. A remote ``src``
+    # that is absent or not a regular file raises in *both* phases, the
+    # phase-unaware strictness ``files.move``/``files.copy`` chose (pyinfra
+    # soft-logs while planning). The format is validated from the basename
+    # before any fetch or fact read, and the optional ``checksum`` (a reemote
+    # addition, the ``files.download`` contract) is parsed before the fetch
+    # and verified against the raw bytes before anything is staged -- the
+    # body runs once per phase, so the pin is what keeps both phases'
+    # ``UnarchiveSpoolCommand`` bytes identical.
+    #
+    # ``extra_opts`` is a tuple, not pyinfra's list (``OperationRequest``
+    # arguments must be hashable). ``user``/``group`` yield a recursive
+    # ``ChownCommand`` on ``dest`` after the extraction, pyinfra's ownership
+    # step; the named account must already exist. The extraction, mkdir,
+    # cleanup and chown are shell text, so flag the request ``sudo=True`` for
+    # a root-owned ``dest``; the spool transfer stays unprivileged regardless.
+    # ``**kwargs`` absorbs any further global arguments (``op()`` already
+    # strips ``name``/``sudo``/``su``).
+    is_url = src.startswith(("http://", "https://"))
+    name = (
+        PurePosixPath(urllib.parse.urlparse(src).path).name
+        if is_url
+        else PurePosixPath(src).name
+    )
+    if _archive_format(name) is None:
+        raise ValueError(
+            f"unsupported archive format for {src!r} "
+            f"(supported: {', '.join(_ARCHIVE_EXTENSIONS)})"
+        )
+    expected = _parse_checksum(checksum) if checksum is not None else None
+
+    if creates is not None and await ctx.facts.get(FileExists, creates):
+        ctx.reason = f"archive already extracted ({creates} exists)"
+        return
+
+    reasons: list[str] = []
+    if is_url:
+        data = await asyncio.to_thread(_fetch_url_bytes, src)
+        if expected is not None:
+            algorithm, digest = expected
+            actual = hashlib.new(algorithm, data).hexdigest().lower()
+            if actual != digest:
+                raise ValueError(
+                    f"checksum mismatch for {src}: expected {algorithm} {digest}, "
+                    f"got {actual}"
+                )
+        archive = _unarchive_spool_path(src)
+    else:
+        info = await ctx.facts.get(File, src)
+        if info is None:
+            raise ValueError(f"src {src} does not exist")
+        if info is False:
+            raise ValueError(f"src {src} is not a regular file")
+        archive = src
+
+    dest_info = await ctx.facts.get(Directory, dest)
+    if dest_info is False:
+        raise ValueError(f"dest {dest} is not a directory")
+    if dest_info is None:
+        reasons.append(f"{dest} missing, will create")
+        yield MkdirCommand(path=dest)
+
+    if is_url:
+        yield UnarchiveSpoolCommand(content=data, dest=archive)
+    reasons.append(f"will extract {src} into {dest}")
+    yield UnarchiveCommand(src=archive, dest=dest, extra_opts=tuple(extra_opts))
+    if is_url:
+        yield RemoveTreeCommand(src=archive)
+    if user or group:
+        reasons.append(f"will set ownership of {dest} recursively")
+        yield ChownCommand(path=dest, user=user, group=group, recursive=True)
+
+    ctx.changed = True
+    ctx.reason = "; ".join(reasons)
+
+
 @dataclass(frozen=True)
 class MoveCommand(Command):
     """Move a remote path into a remote directory (``mv src dest``)."""
@@ -3871,6 +4143,8 @@ __all__ = [
     "Sha256File",
     "Sha384File",
     "Socket",
+    "UnarchiveCommand",
+    "UnarchiveSpoolCommand",
     "copy",
     "directory",
     "download",
@@ -3885,5 +4159,6 @@ __all__ = [
     "put",
     "read_source_bytes",
     "transform",
+    "unarchive",
     "write_dest_bytes",
 ]

@@ -237,6 +237,8 @@ from .modules.files.files import (
     Sha256File,
     Sha384File,
     Socket,
+    UnarchiveCommand,
+    UnarchiveSpoolCommand,
 )
 from .modules.firewalld.firewalld import (
     FirewalldDefaultZone,
@@ -1194,6 +1196,8 @@ __all__ = [
     "UfwStateCommand",
     "UfwStatus",
     "UfwStatusInfo",
+    "UnarchiveCommand",
+    "UnarchiveSpoolCommand",
     "UnhashableArgumentError",
     "Uptime",
     "User",

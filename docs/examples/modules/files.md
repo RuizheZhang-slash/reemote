@@ -399,6 +399,34 @@ for the `uri`/`return_content` mapping.
     options:
       members: []
 
+## Extracting a source tarball (unarchive)
+
+`files.unarchive` (the pyinfra `files.unarchive` migration, issue #21) is
+Ansible's `unarchive` parity for the build-from-source path: it extracts an
+archive into a remote directory, idempotently gated by `creates`. The example
+is the geerlingguy.php-xdebug role's first task — "Untar Xdebug" — whose
+`copy: false` URL source and `creates:` gate collapse from the role
+migration's three-piece workaround (a control-side `urllib` fetch, a
+`files.put` spool deploy, and a `tar` `Shell` action outside the deploys) into
+ONE in-deploy request. `src` is auto-detected: an `http(s)` URL is fetched
+*control-side* as binary bytes (the `_fetch_url_bytes` seam, without the
+text-only decode — a `.tgz` body never raises), spooled to a URL-derived
+`/tmp` name over unprivileged scp, extracted, and the spool removed; a remote
+path is extracted in place and left alone. `creates` is resolved in-operation
+through `FileExists` (`test -e` sees the extracted *directory*), so a
+converged host reports no change and skips the fetch entirely; without it the
+extraction is stateless like pyinfra's. The workspace `dest` is created when
+absent (pyinfra raises instead), and `sudo=True` elevates the extraction for
+the root-owned `/usr/local/src` while the scp spool transfer stays
+unprivileged. The script runs the same deploy twice: the first run extracts,
+the second reports no change on every host. It omits a hardcoded checksum so
+it stays runnable against the live xdebug.org URL; add
+`checksum="sha256:<hex>"` in production to pin the two-phase fetch.
+
+::: files_unarchive
+    options:
+      members: []
+
 ## A health-check deploy: dnf install, put and get
 
 The reemote take on a relatable the baseline scenario — a simple web-server

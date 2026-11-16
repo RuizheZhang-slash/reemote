@@ -6,8 +6,8 @@
 Re-exports everything from ``files.py`` so the operations (``files.link``,
 ``files.file``, ``files.put``, ``files.get``, ``files.edit``,
 ``files.install``, ``files.transform``, ``files.download``, ``files.move``,
-``files.copy``, ``files.directory`` and ``files.flags``), the control-side
-content-fetch helper (``files.fetch_url``) and the facts
+``files.copy``, ``files.unarchive``, ``files.directory`` and ``files.flags``),
+the control-side content-fetch helper (``files.fetch_url``) and the facts
 (``files.FileLink``, ``files.FileExists``,
 ``files.RemoteFileSha1``, ``files.Sha256File``, ``files.Sha384File``,
 ``files.Md5File``, ``files.FileContents``, ``files.FileFlags``,
@@ -57,6 +57,8 @@ from .files import (
     Sha256File,
     Sha384File,
     Socket,
+    UnarchiveCommand,
+    UnarchiveSpoolCommand,
     copy,
     directory,
     download,
@@ -70,6 +72,7 @@ from .files import (
     move,
     put,
     transform,
+    unarchive,
 )
 
 __all__ = [
@@ -109,6 +112,8 @@ __all__ = [
     "Sha256File",
     "Sha384File",
     "Socket",
+    "UnarchiveCommand",
+    "UnarchiveSpoolCommand",
     "copy",
     "directory",
     "download",
@@ -123,4 +128,5 @@ __all__ = [
     "move",
     "put",
     "transform",
+    "unarchive",
 ]

@@ -30,7 +30,7 @@ a real asyncssh transport is missing:
   ``file_flags`` / ``directory_stats`` / ``directory_entries`` /
   ``link_stats`` / ``socket_stats`` / ``same_files`` /
   ``find_results`` / ``found_files`` / ``grep_lines`` / ``grep_files`` /
-  ``remote_files`` /
+  ``remote_files`` / ``archive_members`` /
   ``repositories`` / ``repo_list`` / ``enabled_modules`` / ``disabled_modules``
   / ``installed_modules`` / ``installed_groups`` / ``available_groups``
   / ``rpm_files`` / ``rpm_packages`` / ``rpm_gpg_keys`` / ``services`` / ``enabled_services``
@@ -254,6 +254,8 @@ from reemote.modules.files.files import (
     MoveCommand,
     PutCommand,
     RemoveTreeCommand,
+    UnarchiveCommand,
+    UnarchiveSpoolCommand,
     read_source_bytes,
     write_dest_bytes,
 )
@@ -604,6 +606,17 @@ class SimulatedHost(Host):
     # transfer a no-op: execute_command mutates it, and the next step's fresh
     # fact cache sees the mutation.
     remote_files: dict[str, bytes] = field(default_factory=dict)
+    # Archive path -> the member names a simulated extraction materializes,
+    # backing the ``UnarchiveCommand`` seam of ``files.unarchive`` (no fact
+    # reads it directly). A test seeds the archive's listing -- relative
+    # member names, a trailing ``/`` marking a directory -- because the
+    # simulation models no tar/zip parser; ``extract_archive`` then writes
+    # each member into the shared filesystem seams (``existing_files`` plus
+    # ``file_stats`` for a file, ``directory_stats`` plus ``existing_files``
+    # for a directory), so a ``creates`` gate reading ``FileExists`` sees the
+    # extracted tree and a second run is a no-op. An unseeded archive
+    # extracts nothing.
+    archive_members: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # Spool paths whose ``files.install`` validation is simulated to fail: the
     # ``InstallValidateCommand`` case raises ``CommandError`` for a spool named
     # here, so a test can drive the abort path and prove a failed ``validate``
@@ -2089,6 +2102,10 @@ class SimulatedHost(Host):
                 spool=spool, dest=dest, mode=mode, user=user, group=group
             ):
                 self.install_file(spool, dest, mode, user, group)
+            case UnarchiveSpoolCommand(content=content, dest=dest):
+                self.put_file(io.BytesIO(content), dest)
+            case UnarchiveCommand(src=src, dest=dest):
+                self.extract_archive(src, dest)
             case MoveCommand(src=src, dest=dest):
                 self.move_path(src, dest)
             case RemoveTreeCommand(src=src):
@@ -4446,6 +4463,33 @@ class SimulatedHost(Host):
         self.directory_stats.setdefault(
             path, {"mode": 755, "user": "root", "group": "root"}
         )
+
+    def extract_archive(self, src: str, dest: str) -> None:
+        """Record a simulated ``tar -x``/``unzip``: materialize the members.
+
+        ``files.unarchive``'s extraction mutation. The simulation models no
+        archive parser, so the member listing comes from the seeded
+        ``archive_members`` store (keyed by the archive's remote path -- the
+        ``/tmp`` spool for a URL source, the remote path itself otherwise);
+        an unseeded archive extracts nothing. Each member lands under
+        ``dest``: a file member rides ``create_file`` (the ``existing_files``
+        marker plus a root-owned ``644`` ``file_stats`` row -- the simulation
+        does not model the archive's stored modes), and a directory member
+        (a trailing ``/``) rides ``make_directory`` *plus* the
+        ``existing_files`` marker, because ``FileExists`` is ``test -e`` and
+        sees directories too -- that marker is what makes a ``creates``
+        gate on an extracted directory converge on the second run. The
+        archive itself is left in place: a URL spool is cleaned up by the
+        paired ``RemoveTreeCommand``, a remote source stays.
+        """
+        for member in self.archive_members.get(src, ()):
+            path = posixpath.join(dest, member)
+            if member.endswith("/"):
+                path = path.rstrip("/")
+                self.make_directory(path)
+                self.existing_files.add(path)
+            else:
+                self.create_file(path)
 
     def chmod_path(self, path: str, mode: int | str) -> None:
         """Record a simulated ``chmod``: replace the row's mode.
