@@ -1,18 +1,22 @@
 # Copyright (c) 2026 Kim Jarvis.
 # SPDX-License-Identifier: EPL-2.0
 
-"""Tests for ``files.copy``: copy a remote path into a remote directory.
+"""Tests for ``files.copy``: copy a remote path to a directory or file path.
 
 Covers the ``CopyCommand`` shell descriptor (quoting, the ``-f`` overwrite
 flag, elevated ``command_shell`` renderings), the operation's the baseline
 ``files.copy`` fixture parity (file/directory copies with and without
-overwrite, the equal-content no-op, and the error branches), the deliberate
-phase-unaware deviation (absent src / absent dest directory raise
+overwrite, the equal-content no-op, and the error branches), the issue #22
+Ansible remote-copy parity (a file ``dest`` renames, ``mode``/``user``/
+``group`` converge in the same request, and ``overwrite=True`` is
+sha1-gated so a drifted target converges once then no-ops), the deliberate
+phase-unaware deviation (absent src / absent rename parent raise
 ``ValueError`` in *both* phases, where the baseline logs softly while planning),
 the upstream src check that rejects a symlink source (kept verbatim, unlike
 ``files.move`` which accepts links), the ``SimulatedHost`` seam dispatch
-(the source stays in place), and end-to-end plan/log behaviour including
-the idempotent repeat copy and the put-then-copy two-run consequence.
+(the source stays in place, both dest forms), and end-to-end plan/log
+behaviour including the idempotent repeat copy, the two-pass rename no-op,
+drift convergence and the put-then-copy two-run consequence.
 """
 
 import io
@@ -30,7 +34,7 @@ from reemote.drivers import (
 )
 from reemote.hosts import Host
 from reemote.modules import files
-from reemote.modules.files.files import CopyCommand
+from reemote.modules.files.files import ChmodCommand, ChownCommand, CopyCommand
 from tests.simulated_host import SimulatedHost
 
 INVENTORY = [
@@ -184,9 +188,12 @@ async def test_copy_invalid_overwrite_fixture_raises():
 
 
 async def test_copy_invalid_dest_fixture_raises():
-    # The baseline's invalid_dest.json: dest exists but is not a directory.
+    # The baseline's invalid_dest.json shape, re-read through the issue #22
+    # rename semantics: a dest that exists as a non-directory is now a
+    # rename target, so the error comes from its absent parent ("/" is
+    # unseeded here) instead of the old "is not a directory" rejection.
     host = make_host(src_stats={"mode": 600}, dest_stats=False)
-    with pytest.raises(ValueError, match=r"dest /tmp2 is not a directory"):
+    with pytest.raises(ValueError, match=r"dest directory / does not exist"):
         await materialize(host, src=SRC, dest=DEST)
 
 
@@ -200,13 +207,14 @@ async def test_copy_absent_src_raises_in_both_phases():
             await materialize(host, src=SRC, dest=DEST, phase=phase)
 
 
-async def test_copy_absent_dest_directory_raises_in_both_phases():
-    # The baseline's missing_dest.json: same phase-aware softness, same
-    # deliberate always-raise deviation.
+async def test_copy_absent_dest_is_a_rename_target_gated_on_its_parent():
+    # The baseline's missing_dest.json raised on an absent dest directory;
+    # with issue #22 an absent dest is the rename form, and the strictness
+    # moves to the target's parent: "/" is unseeded, so both phases raise.
     host = make_host(src_stats={"mode": 600})
     for phase in ("prepare", "apply"):
         with pytest.raises(
-            ValueError, match=r"dest directory /tmp2 does not exist"
+            ValueError, match=r"dest directory / does not exist"
         ):
             await materialize(host, src=SRC, dest=DEST, phase=phase)
 
@@ -245,6 +253,154 @@ async def test_copy_kwargs_absorb_extra_globals():
     assert commands == [CopyCommand(src=SRC, dest=DEST)]
 
 
+# --- Issue #22: rename, mode/owner, sha1-gated overwrite ------------------------
+
+RENAMED = "/tmp2/renamed.txt"
+
+
+async def test_copy_rename_to_file_dest():
+    # A dest that is not an existing directory is the full target path:
+    # the basename changes and the cp addresses the file directly.
+    host = make_host(src_stats={"mode": 600}, dest_stats={"mode": 700})
+    ctx, commands = await materialize(host, src=SRC, dest=RENAMED)
+
+    assert ctx.changed
+    assert ctx.reason == f"will copy {SRC} to {RENAMED}"
+    assert commands == [CopyCommand(src=SRC, dest=RENAMED)]
+
+
+async def test_copy_rename_absent_parent_raises_in_both_phases():
+    host = make_host(src_stats={"mode": 600})
+    for phase in ("prepare", "apply"):
+        with pytest.raises(
+            ValueError, match=r"dest directory /nowhere does not exist"
+        ):
+            await materialize(
+                host, src=SRC, dest="/nowhere/renamed.txt", phase=phase
+            )
+
+
+async def test_copy_rename_non_directory_parent_raises():
+    host = make_host(src_stats={"mode": 600})
+    host.directory_stats["/tmp2"] = False
+    with pytest.raises(
+        ValueError, match=r"dest parent /tmp2 is not a directory"
+    ):
+        await materialize(host, src=SRC, dest=RENAMED)
+
+
+async def test_copy_rename_existing_target_without_overwrite_raises():
+    host = make_host(src_stats={"mode": 600}, dest_stats={"mode": 700})
+    host.file_stats[RENAMED] = {"mode": 600}
+    host.remote_files = {SRC: b"new\n", RENAMED: b"old\n"}
+    with pytest.raises(
+        ValueError, match=r"/tmp2/renamed.txt already exists and is different than src"
+    ):
+        await materialize(host, src=SRC, dest=RENAMED)
+
+
+async def test_copy_overwrite_equal_content_is_a_no_op():
+    # The sha1 gate extends to overwrite=True: equal content skips the
+    # copy, so a repeat reports no change (Ansible force:yes idempotence).
+    host = make_host(
+        src_stats={"mode": 600},
+        dest_stats={"mode": 700},
+        target_stats={"mode": 600},
+    )
+    host.remote_files = {SRC: b"same\n", FULL_DEST: b"same\n"}
+    ctx, commands = await materialize(host, src=SRC, dest=DEST, overwrite=True)
+
+    assert not ctx.changed
+    assert ctx.reason == f"{FULL_DEST} already exists"
+    assert commands == []
+
+
+async def test_copy_overwrite_drift_converges():
+    host = make_host(
+        src_stats={"mode": 600},
+        dest_stats={"mode": 700},
+        target_stats={"mode": 600},
+    )
+    host.remote_files = {SRC: b"new\n", FULL_DEST: b"old\n"}
+    ctx, commands = await materialize(host, src=SRC, dest=DEST, overwrite=True)
+
+    assert ctx.changed
+    assert commands == [CopyCommand(src=SRC, dest=DEST, overwrite=True)]
+
+
+async def test_copy_sets_mode_and_owner_after_the_copy():
+    # The create-branch contract: a planned copy yields the requested
+    # chown/chmod unconditionally (chown first -- it clears setuid bits).
+    host = make_host(src_stats={"mode": 600}, dest_stats={"mode": 700})
+    ctx, commands = await materialize(
+        host, src=SRC, dest=RENAMED, mode="0644", user="root", group="root"
+    )
+
+    assert ctx.changed
+    assert commands == [
+        CopyCommand(src=SRC, dest=RENAMED),
+        ChownCommand(path=RENAMED, user="root", group="root"),
+        ChmodCommand(path=RENAMED, mode=644),
+    ]
+
+
+async def test_copy_noop_converges_metadata_drift():
+    # Equal content but drifted mode/owner: only the differing metadata
+    # commands are yielded (the files.file update branch), no re-copy.
+    host = make_host(
+        src_stats={"mode": 600},
+        dest_stats={"mode": 700},
+        target_stats={"mode": 600, "user": "nobody", "group": "nogroup"},
+    )
+    host.remote_files = {SRC: b"same\n", FULL_DEST: b"same\n"}
+    ctx, commands = await materialize(
+        host, src=SRC, dest=DEST, mode="0644", user="root", group="root"
+    )
+
+    assert ctx.changed
+    assert commands == [
+        ChownCommand(path=FULL_DEST, user="root", group="root"),
+        ChmodCommand(path=FULL_DEST, mode=644),
+    ]
+
+
+async def test_copy_noop_equal_metadata_stays_a_no_op():
+    host = make_host(
+        src_stats={"mode": 644},
+        dest_stats={"mode": 700},
+        target_stats={"mode": 644, "user": "root", "group": "root"},
+    )
+    host.remote_files = {SRC: b"same\n", FULL_DEST: b"same\n"}
+    ctx, commands = await materialize(
+        host, src=SRC, dest=DEST, mode="0644", user="root", group="root"
+    )
+
+    assert not ctx.changed
+    assert ctx.reason == f"{FULL_DEST} already exists"
+    assert commands == []
+
+
+async def test_copy_symbolic_mode_reruns_on_equal_content():
+    # A symbolic mode never equals the fact's octal int, so its chmod
+    # re-runs on every pass (the files.file precedent).
+    host = make_host(
+        src_stats={"mode": 644},
+        dest_stats={"mode": 700},
+        target_stats={"mode": 644},
+    )
+    host.remote_files = {SRC: b"same\n", FULL_DEST: b"same\n"}
+    ctx, commands = await materialize(host, src=SRC, dest=DEST, mode="u+x")
+
+    assert ctx.changed
+    assert commands == [ChmodCommand(path=FULL_DEST, mode="u+x")]
+
+
+async def test_copy_invalid_mode_raises():
+    host = make_host(src_stats={"mode": 600}, dest_stats={"mode": 700})
+    with pytest.raises(ValueError, match=r"Invalid file mode"):
+        await materialize(host, src=SRC, dest=DEST, mode="0999")
+
+
 # --- The SimulatedHost seam ----------------------------------------------------
 
 
@@ -253,6 +409,7 @@ async def test_send_command_copy_mutates_the_stores():
     host.remote_files = {SRC: b"payload\n"}
     host.existing_files = {SRC}
     host.file_stats = {SRC: {"mode": 600}}
+    host.directory_stats = {DEST: {"mode": 700}}
     await send_command(host, CopyCommand(src=SRC, dest=DEST))
 
     # The copy landed and the source stayed in place (the move difference).
@@ -265,11 +422,29 @@ async def test_send_command_copy_mutates_the_stores():
 
 async def test_send_command_copy_seeds_directory_stats():
     host = SimulatedHost(name="h")
-    host.directory_stats = {SRC: {"mode": 700}}
+    host.directory_stats = {SRC: {"mode": 700}, DEST: {"mode": 700}}
     await send_command(host, CopyCommand(src=SRC, dest=DEST, overwrite=True))
 
-    assert host.directory_stats == {SRC: {"mode": 700}, FULL_DEST: {"mode": 700}}
+    assert host.directory_stats == {
+        SRC: {"mode": 700},
+        DEST: {"mode": 700},
+        FULL_DEST: {"mode": 700},
+    }
     assert host.directory_stats[SRC] is not host.directory_stats[FULL_DEST]
+
+
+async def test_send_command_copy_rename_lands_at_the_full_dest():
+    # No directory row for the dest: the mutator resolves it as the full
+    # target path, exactly as the operation does (the rename form).
+    host = SimulatedHost(name="h")
+    host.remote_files = {SRC: b"payload\n"}
+    host.existing_files = {SRC}
+    host.file_stats = {SRC: {"mode": 600}}
+    await send_command(host, CopyCommand(src=SRC, dest=RENAMED, overwrite=True))
+
+    assert host.remote_files == {SRC: b"payload\n", RENAMED: b"payload\n"}
+    assert host.existing_files == {SRC, RENAMED}
+    assert host.file_stats == {SRC: {"mode": 600}, RENAMED: {"mode": 600}}
 
 
 # --- End to end through the driver ---------------------------------------------
@@ -343,6 +518,101 @@ async def test_repeat_copy_is_a_no_op():
 
 
 PAYLOAD = io.StringIO("staged for the files.copy guard test\n")
+
+
+# --- Issue #22 end to end: rename + metadata + drift convergence ----------------
+
+MODULE_SRC = "/tmp/xdebug.so"
+MODULE_DEST = "/usr/lib/php/modules/xdebug-3.3.2.so"
+
+
+def module_factory(entry: dict) -> SimulatedHost:
+    """A host with a built module spooled in /tmp and the root-owned target dir."""
+    host = SimulatedHost.from_inventory(entry)
+    host.remote_files = {MODULE_SRC: b"built module v1\n"}
+    host.file_stats = {MODULE_SRC: {"mode": 755, "user": "root", "group": "root"}}
+    host.directory_stats = {"/usr/lib/php/modules": {"mode": 755}}
+    return host
+
+
+def module_deploy(host: Host) -> Generator[OperationRequest]:
+    # The Ansible one-task `copy remote_src` shape: rename, mode/owner and
+    # idempotent overwrite in a single elevated request.
+    yield op(
+        files.copy,
+        name="Install module",
+        src=MODULE_SRC,
+        dest=MODULE_DEST,
+        mode="0644",
+        user="root",
+        group="root",
+        overwrite=True,
+        sudo=True,
+    )
+
+
+async def test_rename_copy_converges_in_one_request_then_no_ops():
+    plans, report, hosts = await run(
+        INVENTORY, module_deploy, host_factory=module_factory
+    )
+    (planned,) = plans["web1"]
+    assert planned.changed
+    assert f"will copy {MODULE_SRC} to {MODULE_DEST}" in format_plan(plans)
+
+    assert report is not None
+    log = format_log(report)
+    assert f"$ sudo cp -r -f {MODULE_SRC} {MODULE_DEST}" in log
+    assert f"$ sudo chown root:root {MODULE_DEST}" in log
+    assert f"$ sudo chmod 644 {MODULE_DEST}" in log
+
+    host = hosts[0]
+    # The renamed target landed with the requested metadata; the source stayed.
+    assert host.remote_files[MODULE_DEST] == b"built module v1\n"
+    assert host.file_stats[MODULE_DEST] == {
+        "mode": 644,
+        "user": "root",
+        "group": "root",
+    }
+    assert MODULE_SRC in host.remote_files
+
+    # Second pass: equal sha1 and converged metadata -> a literal no-op.
+    plans, report, _hosts = await run(
+        INVENTORY, module_deploy, host_factory=lambda entry: host
+    )
+    (planned,) = plans["web1"]
+    assert not planned.changed
+    assert planned.reason == f"{MODULE_DEST} already exists"
+    assert report is not None
+    assert not report.changed
+    assert not report.log[0].changed
+
+
+async def test_overwrite_copy_converges_content_drift_then_no_ops():
+    _plans, _report, hosts = await run(
+        INVENTORY, module_deploy, host_factory=module_factory
+    )
+    host = hosts[0]
+
+    # The target drifts (a hand-edited or stale module): overwrite=True
+    # must converge it once, reporting changed, not raise or churn.
+    host.remote_files[MODULE_DEST] = b"drifted module\n"
+    plans, report, _hosts = await run(
+        INVENTORY, module_deploy, host_factory=lambda entry: host
+    )
+    (planned,) = plans["web1"]
+    assert planned.changed
+    assert report is not None
+    assert f"$ sudo cp -r -f {MODULE_SRC} {MODULE_DEST}" in format_log(report)
+    assert host.remote_files[MODULE_DEST] == b"built module v1\n"
+
+    # Third pass: converged again -> no-op.
+    plans, report, _hosts = await run(
+        INVENTORY, module_deploy, host_factory=lambda entry: host
+    )
+    (planned,) = plans["web1"]
+    assert not planned.changed
+    assert report is not None
+    assert not report.changed
 
 
 async def test_put_then_copy_in_one_deploy_raises_at_prepare():

@@ -4372,17 +4372,23 @@ class SimulatedHost(Host):
         return bool(perm & 0o004)
 
     def move_path(self, src: str, dest: str) -> None:
-        """Record a simulated ``mv``: relocate ``src`` into the directory ``dest``.
+        """Record a simulated ``mv``: relocate ``src`` to ``dest``.
 
-        The moved path is ``dest/basename(src)``, exactly as the operation
-        computes it. The content bytes move within ``remote_files`` (so
-        ``FileContents`` and ``RemoteFileSha1`` read them at the new path),
-        any ``existing_files`` membership moves with them, and a seeded
+        ``dest`` is resolved exactly as the operation resolves it (issue
+        #22): a seeded ``directory_stats`` dict row makes it the directory
+        to move into (the moved path is ``dest/basename(src)``); any other
+        path is the full target path -- the rename form. The content bytes
+        move within ``remote_files`` (so ``FileContents`` and
+        ``RemoteFileSha1`` read them at the new path), any
+        ``existing_files`` membership moves with them, and a seeded
         ``file_stats`` row relocates too, so the ``File`` fact answers
         consistently after the move. An absent source moves nothing -- the
         real ``mv`` would exit non-zero and fail the apply step.
         """
-        full_dest = posixpath.join(dest, PurePosixPath(src).name)
+        if isinstance(self.directory_stats.get(dest), dict):
+            full_dest = posixpath.join(dest, PurePosixPath(src).name)
+        else:
+            full_dest = dest
         data = self.remote_files.pop(src, None)
         if data is not None:
             self.remote_files[full_dest] = data
@@ -4394,23 +4400,29 @@ class SimulatedHost(Host):
             self.file_stats[full_dest] = stats
 
     def copy_path(self, src: str, dest: str) -> None:
-        """Record a simulated ``cp -r``: duplicate ``src`` into the directory ``dest``.
+        """Record a simulated ``cp -r``: duplicate ``src`` to ``dest``.
 
-        The copied path is ``dest/basename(src)``, exactly as the operation
-        computes it, and the source stays in place -- the difference from
-        ``move_path``. The content bytes are duplicated within
-        ``remote_files`` (so ``FileContents`` and ``RemoteFileSha1`` read
-        them at both paths, which is what makes a repeat ``files.copy``
-        with ``overwrite`` unset a no-op), ``existing_files`` gains the new
-        member, and seeded ``file_stats``/``directory_stats`` rows are
-        copied as fresh dicts so the two paths never share one mutable
-        row. Nested paths inside a copied directory are not modelled --
-        the simulation's stores are flat. An absent source copies nothing:
-        the real ``cp`` would exit non-zero and fail the apply step. The
-        ``overwrite`` flag needs no separate arm: ``cp -r -f`` replaces the
-        target's content exactly as the plain copy does.
+        ``dest`` is resolved exactly as the operation resolves it (issue
+        #22): a seeded ``directory_stats`` dict row makes it the directory
+        to copy into (the copied path is ``dest/basename(src)``); any other
+        path is the full target path -- the rename form. The source stays
+        in place -- the difference from ``move_path``. The content bytes
+        are duplicated within ``remote_files`` (so ``FileContents`` and
+        ``RemoteFileSha1`` read them at both paths, which is what makes a
+        repeat ``files.copy`` a no-op in either overwrite mode),
+        ``existing_files`` gains the new member, and seeded
+        ``file_stats``/``directory_stats`` rows are copied as fresh dicts
+        so the two paths never share one mutable row. Nested paths inside
+        a copied directory are not modelled -- the simulation's stores are
+        flat. An absent source copies nothing: the real ``cp`` would exit
+        non-zero and fail the apply step. The ``overwrite`` flag needs no
+        separate arm: ``cp -r -f`` replaces the target's content exactly
+        as the plain copy does.
         """
-        full_dest = posixpath.join(dest, PurePosixPath(src).name)
+        if isinstance(self.directory_stats.get(dest), dict):
+            full_dest = posixpath.join(dest, PurePosixPath(src).name)
+        else:
+            full_dest = dest
         data = self.remote_files.get(src)
         if data is not None:
             self.remote_files[full_dest] = data

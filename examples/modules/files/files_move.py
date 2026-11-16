@@ -1,22 +1,26 @@
 # Copyright (c) 2026 Kim Jarvis.
 # SPDX-License-Identifier: EPL-2.0
 
-"""Example: move a remote file into a remote directory with files.move.
+"""Example: move a remote file to a new name with files.move.
 
 This is a *usage* example, not part of the library. It shows ``files.move``
-(baseline ``files.move`` parity): ``src`` is a remote path, ``dest`` is the
-remote *directory* to move it into, and the moved path becomes
-``dest/basename(src)``. With ``overwrite=True`` an existing target is removed
+with the issue #22 rename/metadata parity: ``src`` is a remote path, ``dest``
+is either an existing remote *directory* (the moved path becomes
+``dest/basename(src)``) or -- as here -- a full file path, so the move
+**renames**. ``mode``/``user``/``group`` are applied to the moved path in
+the same request. With ``overwrite=True`` an existing target is removed
 first (``rm -rf``) before the ``mv``; without it an existing target raises
 ``ValueError``.
 
 Two properties shape the script:
 
 * ``files.move`` is **stateless** like the baseline: a valid move always yields a
-  command, there is no idempotent no-op branch. Re-running a move whose
-  source is gone fails fail-fast (here ``overwrite=True`` keeps the *target*
-  side re-runnable; the source is re-staged by run 1 each time).
-* An absent source or an absent/non-directory destination raises
+  command, there is no idempotent no-op branch (for an idempotent
+  remote-to-remote install use ``files.copy`` with ``overwrite=True``, whose
+  overwrite is sha1-gated). Re-running a move whose source is gone fails
+  fail-fast (here ``overwrite=True`` keeps the *target* side re-runnable;
+  the source is re-staged by run 1 each time).
+* An absent source or an absent/non-directory rename parent raises
   ``ValueError`` in **both** phases -- reemote operations are phase-unaware,
   so the baseline's soft plan-time logging of those cases is deliberately dropped.
   A "create the file then move it" flow therefore cannot share one deploy:
@@ -26,11 +30,12 @@ Two properties shape the script:
 
 Run 1 stages the payload with ``files.put`` (an unprivileged scp transfer of
 a module-level stream -- one stable identity across both phases) into
-``/tmp``. Run 2 moves it into ``/var/tmp``. Both directories exist on every
-host and are writable by any login user, so the example depends on no
-account's home directory existing and nothing here is elevated; for a
-root-owned destination directory such as ``/etc`` the move request would
-carry ``sudo=True``; for whole-content root-owned writes ``files.install``
+``/tmp``. Run 2 moves it to a *renamed* file under ``/var/tmp`` with mode
+``0644``. Both directories exist on every host and are writable by any login
+user, so the example depends on no account's home directory existing and
+nothing here is elevated; for a root-owned destination such as ``/etc`` the
+move request would carry ``sudo=True`` (and ``user``/``group`` would name
+the owning account); for whole-content root-owned writes ``files.install``
 covers the same ground in one deploy (see ``files_install.py``).
 
 Every request carries ``when=is_centos``, the declarative eligibility
@@ -40,10 +45,7 @@ is a stable module-level function, so the prepare and apply phases reach
 the same skip decision. The driver skips a rejected request without
 materializing it, so on hosts outside the ``"centos"`` group neither the
 commands nor the facts behind them run, and plan and log render the step
-as ``[skipped: when guard is_centos]`` in its lockstep slot. The path is
-resolved from ``__file__``, so the example works from any working
-directory; point ``INVENTORY_PATH`` at your own file to target your
-machines.
+as ``[skipped: when guard is_centos]`` in its lockstep slot.
 
 The path is resolved from ``__file__``, so the example works from any
 working directory; point ``INVENTORY_PATH`` at your own file (or edit
@@ -82,12 +84,13 @@ from reemote import (
 # apply request sequences compare equal.
 PAYLOAD = io.StringIO("staged by the reemote files.move example\n")
 
-# Staging source under /tmp and the destination directory /var/tmp: its
-# basename makes the moved path /var/tmp/reemote-move.txt. Two distinct
-# world-writable directories that exist on every host, so the move has a real
-# destination other than its source and no home directory is assumed.
+# Staging source under /tmp and a full file path under /var/tmp: the dest
+# is not an existing directory, so the move renames the payload to
+# /var/tmp/reemote-move-renamed.txt. Two distinct world-writable directories
+# that exist on every host, so the move has a real destination other than
+# its source and no home directory is assumed.
 STAGED = "/tmp/reemote-move.txt"
-DEST_DIR = "/var/tmp"
+DEST = "/var/tmp/reemote-move-renamed.txt"
 
 # examples/modules/files/files_move.py -> the project root, so the inventory
 # is found whatever the current working directory is.
@@ -126,16 +129,18 @@ def stage(host: Host) -> Generator[OperationRequest]:
 
 
 def install(host: Host) -> Generator[OperationRequest]:
-    """Run 2: move the staged file into the destination directory.
+    """Run 2: move the staged file to its renamed target with mode 0644.
 
     ``overwrite=True`` removes a target left by a previous script run before
-    the mv; the move itself is stateless and always plans a command.
+    the mv, and the requested ``chmod`` rides the same request; the move
+    itself is stateless and always plans a command.
     """
     yield op(
         files.move,
-        name="Move payload to dest",
+        name="Move payload to renamed dest",
         src=STAGED,
-        dest=DEST_DIR,
+        dest=DEST,
+        mode="0644",
         overwrite=True,
         when=is_centos,
     )

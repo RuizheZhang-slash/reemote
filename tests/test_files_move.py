@@ -1,16 +1,18 @@
 # Copyright (c) 2026 Kim Jarvis.
 # SPDX-License-Identifier: EPL-2.0
 
-"""Tests for ``files.move``: move a remote path into a remote directory.
+"""Tests for ``files.move``: move a remote path to a directory or file path.
 
 Covers the ``MoveCommand``/``RemoveTreeCommand`` shell descriptors (quoting,
 elevated ``command_shell`` renderings), the operation's the baseline
 ``files.move`` fixture parity (no-conflict move, directory/link sources,
-overwrite's ``rm -rf`` + ``mv`` pair, and the three error branches), the
-deliberate phase-unaware deviation (absent src / absent dest directory raise
+overwrite's ``rm -rf`` + ``mv`` pair, and the error branches), the issue #22
+rename/metadata parity (a file ``dest`` renames, ``mode``/``user``/``group``
+ride the move; the operation stays stateless by design), the deliberate
+phase-unaware deviation (absent src / absent rename parent raise
 ``ValueError`` in *both* phases, where the baseline logs softly while planning),
-the ``SimulatedHost`` seam dispatch, end-to-end plan/log behaviour with
-``sudo=True``, and the ``/etc/hosts`` recipe: ``files.edit``
+the ``SimulatedHost`` seam dispatch (both dest forms), end-to-end plan/log
+behaviour with ``sudo=True``, and the ``/etc/hosts`` recipe: ``files.edit``
 spools the transformed content into a writable path in one run, then
 ``files.move`` installs it into ``/etc`` elevated in a second run -- the
 two-run split the always-raise deviation makes necessary. The hosts case
@@ -32,7 +34,12 @@ from reemote.drivers import (
 )
 from reemote.hosts import Host
 from reemote.modules import files
-from reemote.modules.files.files import MoveCommand, RemoveTreeCommand
+from reemote.modules.files.files import (
+    ChmodCommand,
+    ChownCommand,
+    MoveCommand,
+    RemoveTreeCommand,
+)
 from tests.simulated_host import SimulatedHost
 
 INVENTORY = [
@@ -172,9 +179,12 @@ async def test_move_no_overwrite_fixture_raises():
 
 
 async def test_move_invalid_dest_fixture_raises():
-    # The baseline's invalid_dest.json: dest exists but is not a directory.
+    # The baseline's invalid_dest.json shape, re-read through the issue #22
+    # rename semantics: a dest that exists as a non-directory is now a
+    # rename target, so the error comes from its absent parent ("/" is
+    # unseeded here) instead of the old "is not a directory" rejection.
     host = make_host(src_stats={"mode": 600}, dest_stats=False)
-    with pytest.raises(ValueError, match=r"dest /tmp2 is not a directory"):
+    with pytest.raises(ValueError, match=r"dest directory / does not exist"):
         await materialize(host, src=SRC, dest=DEST)
 
 
@@ -187,12 +197,13 @@ async def test_move_absent_src_raises_in_both_phases():
         await materialize(host, src=SRC, dest=DEST)
 
 
-async def test_move_absent_dest_directory_raises_in_both_phases():
-    # The baseline's missing_dest.json: same phase-aware softness, same
-    # deliberate always-raise deviation.
+async def test_move_absent_dest_is_a_rename_target_gated_on_its_parent():
+    # The baseline's missing_dest.json raised on an absent dest directory;
+    # with issue #22 an absent dest is the rename form, and the strictness
+    # moves to the target's parent: "/" is unseeded, so both phases raise.
     host = make_host(src_stats={"mode": 600})
     with pytest.raises(
-        ValueError, match=r"dest directory /tmp2 does not exist"
+        ValueError, match=r"dest directory / does not exist"
     ):
         await materialize(host, src=SRC, dest=DEST)
 
@@ -206,6 +217,83 @@ async def test_move_kwargs_absorb_extra_globals():
     assert commands == [MoveCommand(src=SRC, dest=DEST)]
 
 
+# --- Issue #22: rename and mode/owner parity (still stateless) ------------------
+
+RENAMED = "/tmp2/renamed.txt"
+
+
+async def test_move_rename_to_file_dest():
+    host = make_host(src_stats={"mode": 600}, dest_stats={"mode": 700})
+    ctx, commands = await materialize(host, src=SRC, dest=RENAMED)
+
+    assert ctx.changed
+    assert ctx.reason == f"will move {SRC} to {RENAMED}"
+    assert commands == [MoveCommand(src=SRC, dest=RENAMED)]
+
+
+async def test_move_rename_overwrite_removes_the_full_target_first():
+    host = make_host(src_stats={"mode": 600}, dest_stats={"mode": 700})
+    host.file_stats[RENAMED] = {"mode": 600}
+    ctx, commands = await materialize(
+        host, src=SRC, dest=RENAMED, overwrite=True
+    )
+
+    assert ctx.changed
+    assert commands == [
+        RemoveTreeCommand(src=RENAMED),
+        MoveCommand(src=SRC, dest=RENAMED),
+    ]
+
+
+async def test_move_rename_existing_target_without_overwrite_raises():
+    host = make_host(src_stats={"mode": 600}, dest_stats={"mode": 700})
+    host.file_stats[RENAMED] = {"mode": 600}
+    with pytest.raises(
+        ValueError,
+        match=r"dest /tmp2/renamed.txt already exists and `overwrite` is unset",
+    ):
+        await materialize(host, src=SRC, dest=RENAMED)
+
+
+async def test_move_rename_absent_parent_raises_in_both_phases():
+    host = make_host(src_stats={"mode": 600})
+    with pytest.raises(
+        ValueError, match=r"dest directory /nowhere does not exist"
+    ):
+        await materialize(host, src=SRC, dest="/nowhere/renamed.txt")
+
+
+async def test_move_rename_non_directory_parent_raises():
+    host = make_host(src_stats={"mode": 600})
+    host.directory_stats["/tmp2"] = False
+    with pytest.raises(
+        ValueError, match=r"dest parent /tmp2 is not a directory"
+    ):
+        await materialize(host, src=SRC, dest=RENAMED)
+
+
+async def test_move_sets_mode_and_owner_after_the_mv():
+    # Stateless: the metadata commands ride every move unconditionally,
+    # chown before chmod (a chown clears setuid/setgid bits).
+    host = make_host(src_stats={"mode": 600}, dest_stats={"mode": 700})
+    ctx, commands = await materialize(
+        host, src=SRC, dest=RENAMED, mode="0644", user="root", group="root"
+    )
+
+    assert ctx.changed
+    assert commands == [
+        MoveCommand(src=SRC, dest=RENAMED),
+        ChownCommand(path=RENAMED, user="root", group="root"),
+        ChmodCommand(path=RENAMED, mode=644),
+    ]
+
+
+async def test_move_invalid_mode_raises():
+    host = make_host(src_stats={"mode": 600}, dest_stats={"mode": 700})
+    with pytest.raises(ValueError, match=r"Invalid file mode"):
+        await materialize(host, src=SRC, dest=DEST, mode="0999")
+
+
 # --- The SimulatedHost seam ----------------------------------------------------
 
 
@@ -214,11 +302,26 @@ async def test_send_command_move_mutates_the_stores():
     host.remote_files = {SRC: b"payload\n"}
     host.existing_files = {SRC}
     host.file_stats = {SRC: {"mode": 600}}
+    host.directory_stats = {DEST: {"mode": 700}}
     await send_command(host, MoveCommand(src=SRC, dest=DEST))
 
     assert host.remote_files == {FULL_DEST: b"payload\n"}
     assert host.existing_files == {FULL_DEST}
     assert host.file_stats == {FULL_DEST: {"mode": 600}}
+
+
+async def test_send_command_move_rename_lands_at_the_full_dest():
+    # No directory row for the dest: the mutator resolves it as the full
+    # target path, exactly as the operation does (the rename form).
+    host = SimulatedHost(name="h")
+    host.remote_files = {SRC: b"payload\n"}
+    host.existing_files = {SRC}
+    host.file_stats = {SRC: {"mode": 600}}
+    await send_command(host, MoveCommand(src=SRC, dest=RENAMED))
+
+    assert host.remote_files == {RENAMED: b"payload\n"}
+    assert host.existing_files == {RENAMED}
+    assert host.file_stats == {RENAMED: {"mode": 600}}
 
 
 async def test_send_command_remove_tree_mutates_the_stores():
@@ -293,6 +396,47 @@ async def test_repeating_a_move_is_not_a_no_op():
 
     with pytest.raises(ValueError, match=r"src /tmp/hosts does not exist"):
         await run(INVENTORY, deploy, host_factory=install_factory)
+
+
+async def test_rename_move_end_to_end_with_metadata():
+    # The issue #22 rename form: a file dest lands the spool under a new
+    # basename and the requested chown/chmod ride the same elevated request.
+    def deploy(host: Host) -> Generator[OperationRequest]:
+        yield op(
+            files.move,
+            name="Install hosts file",
+            src="/tmp/hosts",
+            dest="/etc/hosts.managed",
+            overwrite=True,
+            mode="0644",
+            user="root",
+            group="root",
+            sudo=True,
+        )
+
+    plans, report, hosts = await run(
+        INVENTORY, deploy, host_factory=install_factory
+    )
+    (planned,) = plans["web1"]
+    assert planned.changed
+    assert "will move /tmp/hosts to /etc/hosts.managed" in format_plan(plans)
+
+    assert report is not None
+    log = format_log(report)
+    assert "$ sudo mv /tmp/hosts /etc/hosts.managed" in log
+    assert "$ sudo chown root:root /etc/hosts.managed" in log
+    assert "$ sudo chmod 644 /etc/hosts.managed" in log
+
+    host = hosts[0]
+    assert host.remote_files["/etc/hosts.managed"] == (
+        b"127.0.0.1 localhost\n10.0.0.5 db.internal db\n"
+    )
+    assert "/tmp/hosts" not in host.remote_files
+    assert host.file_stats["/etc/hosts.managed"] == {
+        "mode": 644,
+        "user": "root",
+        "group": "root",
+    }
 
 
 # --- The /etc/hosts recipe: edit spools, move installs -------------------------

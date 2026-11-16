@@ -1,24 +1,27 @@
 # Copyright (c) 2026 Kim Jarvis.
 # SPDX-License-Identifier: EPL-2.0
 
-"""Example: copy a remote file into a remote directory with files.copy.
+"""Example: copy a remote file to a new name with files.copy.
 
 This is a *usage* example, not part of the library. It shows ``files.copy``
-(baseline ``files.copy`` parity): ``src`` is a remote path, ``dest`` is the
-remote *directory* to copy it into, and the copied path becomes
-``dest/basename(src)`` -- with the source left in place, the difference from
-``files.move``. With ``overwrite=True`` the copy is forced (``cp -r -f``);
-without it an existing target with *equal* content is a no-op and one with
-different content raises ``ValueError``.
+with the Ansible ``copy remote_src: true`` parity (issue #22): ``src`` is a
+remote path, ``dest`` is either an existing remote *directory* (the copied
+path becomes ``dest/basename(src)``) or -- as here -- a full file path, so
+the copy **renames**. ``mode``/``user``/``group`` converge the target's
+metadata in the same request, and ``overwrite=True`` is **sha1-gated**: an
+existing target with equal content is a no-op, a drifted one is overwritten
+once and then converges (Ansible's ``force: yes`` idempotence). Without
+``overwrite`` an existing target with different content raises
+``ValueError``.
 
 Two properties shape the script:
 
-* Unlike the stateless ``files.move``, ``files.copy`` has an idempotent
-  branch: an existing regular-file target whose sha1 matches the source
-  reports "already exists" with no command. This script uses
-  ``overwrite=True`` so a target left by a previous run is simply
-  overwritten; drop the flag and the second script run becomes a no-op.
-* An absent source or an absent/non-directory destination raises
+* The idempotent branch is content *and* metadata: an existing regular-file
+  target whose sha1 matches the source skips the copy, and only a
+  ``chmod``/``chown`` whose requested value differs from the ``File`` fact's
+  row is issued. Run 3 repeats run 2's deploy to show the literal no-op --
+  every request reports no change.
+* An absent source or an absent/non-directory rename parent raises
   ``ValueError`` in **both** phases -- reemote operations are phase-unaware,
   so the baseline's soft plan-time logging of those cases is deliberately dropped
   (the same strictness as ``files.move``). A "create the file then copy it"
@@ -29,11 +32,13 @@ Two properties shape the script:
 
 Run 1 stages the payload with ``files.put`` (an unprivileged scp transfer of
 a module-level stream -- one stable identity across both phases) into
-``/tmp``. Run 2 copies it into ``/var/tmp``, leaving the staging file in
-``/tmp``. Both directories exist on every host and are writable by any login
-user, so the example depends on no account's home directory existing and
-nothing here is elevated; for a root-owned destination directory such as
-``/etc`` the copy request would carry ``sudo=True``.
+``/tmp``. Run 2 copies it to a *renamed* file under ``/var/tmp`` with mode
+``0644``, leaving the staging file in ``/tmp``; run 3 repeats the copy and
+converges to a no-op. Both directories exist on every host and are writable
+by any login user, so the example depends on no account's home directory
+existing and nothing here is elevated; for a root-owned destination such as
+a PHP module under ``/usr/lib`` the copy request would carry ``sudo=True``
+(and ``user``/``group`` would name the owning account).
 
 Every request carries ``when=is_centos``, the declarative eligibility
 guard: the predicate reads only **static** inventory data --
@@ -80,12 +85,14 @@ from reemote import (
 # apply request sequences compare equal.
 PAYLOAD = io.StringIO("staged by the reemote files.copy example\n")
 
-# Staging source under /tmp and the destination directory /var/tmp: its
-# basename makes the copied path /var/tmp/reemote-copy.txt. Two distinct
-# world-writable directories that exist on every host, so the copy has a real
-# destination other than its source and no home directory is assumed.
+# Staging source under /tmp and a full file path under /var/tmp: the dest
+# is not an existing directory, so the copy renames the payload to
+# /var/tmp/reemote-copy-renamed.txt (the Ansible copy remote_src shape).
+# Two distinct world-writable directories that exist on every host, so the
+# copy has a real destination other than its source and no home directory
+# is assumed.
 STAGED = "/tmp/reemote-copy.txt"
-DEST_DIR = "/var/tmp"
+DEST = "/var/tmp/reemote-copy-renamed.txt"
 
 # examples/modules/files/files_copy.py -> the project root, so the inventory
 # is found whatever the current working directory is.
@@ -124,16 +131,19 @@ def stage(host: Host) -> Generator[OperationRequest]:
 
 
 def install(host: Host) -> Generator[OperationRequest]:
-    """Run 2: copy the staged file into the destination directory.
+    """Run 2 (and run 3): copy the staged file to its renamed target.
 
-    ``overwrite=True`` forces the copy over a target left by a previous
-    script run (``cp -r -f``); the staging file stays in /tmp.
+    One request renames, sets mode ``0644`` and converges on drift:
+    ``overwrite=True`` is sha1-gated, so a target left by a previous script
+    run with equal content is a no-op and a drifted one is overwritten
+    once. The staging file stays in /tmp.
     """
     yield op(
         files.copy,
-        name="Copy payload to dest",
+        name="Copy payload to renamed dest",
         src=STAGED,
-        dest=DEST_DIR,
+        dest=DEST,
+        mode="0644",
         overwrite=True,
         when=is_centos,
     )
@@ -163,6 +173,17 @@ async def main() -> None:
 
         plans, report, _hosts = await run(inventory, install)
         print("\n== Run 2 log: copy payload ==")
+        assert report is not None
+        print(format_log(report))
+
+        # Run 3: the same deploy again -- the target's sha1 and mode now
+        # match, so the sha1-gated overwrite reports no change.
+        plans, _, _hosts = await run(inventory, install, dry=True)
+        print("\n== Run 3 plan: repeat copy (--dry) ==")
+        print(format_plan(plans))
+
+        plans, report, _hosts = await run(inventory, install)
+        print("\n== Run 3 log: repeat copy (no-op) ==")
         assert report is not None
         print(format_log(report))
     except (OSError, json.JSONDecodeError) as exc:

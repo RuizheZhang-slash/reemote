@@ -3534,7 +3534,13 @@ async def unarchive(
 
 @dataclass(frozen=True)
 class MoveCommand(Command):
-    """Move a remote path into a remote directory (``mv src dest``)."""
+    """Move a remote path to a remote directory or file path (``mv src dest``).
+
+    ``dest`` is passed verbatim: an existing directory receives
+    ``basename(src)``, any other path is the full target path (the rename
+    form ``files.move`` gained with issue #22) -- ``mv`` itself draws the
+    same distinction.
+    """
 
     src: str
     dest: str
@@ -3563,22 +3569,38 @@ async def move(
     src: str,
     dest: str,
     overwrite: bool = False,
+    mode: int | str | None = None,
+    user: str | None = None,
+    group: str | None = None,
     **kwargs: Any,
 ) -> AsyncGenerator[Command]:
-    """Move a remote file/directory/link into a remote directory.
+    """Move a remote file/directory/link to a remote directory or file path.
 
     Args:
         ctx (OpContext): Execution context for the operation.
         src (str): The remote path to move.
-        dest (str): The remote directory to move ``src`` into; the moved path
-            becomes ``dest/basename(src)``.
+        dest (str): Where to move ``src``: an existing remote *directory*
+            (the moved path becomes ``dest/basename(src)``), or any other
+            path, treated as the full target path -- a **rename**
+            (``mv src dest``, the Ansible ``copy remote_src`` shape).
+            The target's parent directory must exist.
         overwrite (bool, optional): When the destination path already exists,
             remove it first (``rm -rf``) instead of raising. Defaults to False.
+        mode (int | str | None, optional): The moved path's permissions --
+            an octal-digit int or string (``750``, ``"0750"``, ``"0o750"``)
+            or a symbolic mode -- applied with ``chmod`` after the move.
+            Defaults to None (the source's mode is kept).
+        user (str | None, optional): The user to own the moved path
+            (a ``chown`` after the move, before the ``chmod``).
+            Defaults to None (the source's owner is kept).
+        group (str | None, optional): The group to own the moved path.
+            Defaults to None.
         **kwargs: Additional keyword arguments.
 
     Yields:
         Command: The move command, always, preceded by a removal when
-            ``overwrite`` clears an existing target.
+            ``overwrite`` clears an existing target and followed by the
+            requested ``chown``/``chmod``.
 
     **Raises:**
 
@@ -3590,19 +3612,27 @@ async def move(
         Examples can be found in ``examples/modules/files/files_move.py``.
     """
 
-    # Mirrors the baseline's ``files.move``. Stateless like the baseline: there is no
+    # Mirrors the baseline's ``files.move``, extended with the issue #22
+    # rename/metadata parity. Stateless like the baseline: there is no
     # no-op branch -- a valid move always yields a ``MoveCommand`` (preceded
     # by a ``RemoveTreeCommand`` when ``overwrite`` clears an existing
     # target), so ``ctx.changed`` is always True. Repeating the same move
     # fails at apply when ``mv`` exits non-zero on the now-absent source
-    # (``CommandError``, fail-fast).
+    # (``CommandError``, fail-fast); for an idempotent remote-to-remote
+    # install use ``files.copy`` with ``overwrite=True``.
+    #
+    # ``dest`` is auto-detected (issue #22): an existing *directory*
+    # (``Directory(dest)`` truthy) receives ``basename(src)``, the baseline's
+    # only form; any other path is the full target path, so ``mv`` renames.
+    # The rename form validates the target's *parent* directory instead --
+    # an absent or non-directory parent raises ``ValueError``, keeping the
+    # validate-in-both-phases strictness the directory form always had.
     #
     # Reads ``File(src)`` (a directory or symlink reads False, which the baseline
     # accepts -- only absence is rejected), ``Directory(dest)`` and
-    # ``File(dest/basename(src))``. An absent ``src``, a ``dest`` that is not
-    # a directory or does not exist, and an existing target without
-    # ``overwrite`` all raise ``ValueError``. The baseline's phase-aware handling
-    # of the two absence cases (a soft log while planning, an error only
+    # ``File(full_dest)``. An absent ``src`` and an existing target without
+    # ``overwrite`` raise ``ValueError``. The baseline's phase-aware handling
+    # of the absence case (a soft log while planning, an error only
     # while executing) is deliberately dropped because reemote operations
     # are phase-unaware: they raise in *both* phases. A consequence is that
     # a "create a file then move it" flow cannot share one deploy -- the
@@ -3610,21 +3640,35 @@ async def move(
     # two runs (see the ``files.edit`` + ``files.move`` ``/etc/hosts``
     # recipe example).
     #
-    # Both commands are shell text, so flagging the request ``sudo=True``
+    # ``mode``/``user``/``group`` (issue #22) yield a ``ChownCommand`` and/or
+    # ``ChmodCommand`` on the moved path after the ``mv`` -- unconditionally,
+    # because the stateless move always reports changed. The chown precedes
+    # the chmod (a chown clears setuid/setgid bits, the ``files.install``
+    # ordering); the mode is normalised through ``_ensure_mode_int`` and the
+    # named account must already exist.
+    #
+    # All commands are shell text, so flagging the request ``sudo=True``
     # elevates the whole move -- the vehicle for installing a login-user
     # spool file into a root-owned directory such as ``/etc``. ``**kwargs``
     # absorbs any further global arguments (``op()`` already strips
     # ``name``/``sudo``/``su``).
+    mode = _ensure_mode_int(mode)
     if await ctx.facts.get(File, src) is None:
         raise ValueError(f"src {src} does not exist")
 
     dest_info = await ctx.facts.get(Directory, dest)
-    if dest_info is False:
-        raise ValueError(f"dest {dest} is not a directory")
-    if dest_info is None:
-        raise ValueError(f"dest directory {dest} does not exist")
+    if dest_info:
+        full_dest = posixpath.join(dest, PurePosixPath(src).name)
+    else:
+        full_dest = dest
+        parent = posixpath.dirname(dest)
+        if parent:
+            parent_info = await ctx.facts.get(Directory, parent)
+            if parent_info is False:
+                raise ValueError(f"dest parent {parent} is not a directory")
+            if parent_info is None:
+                raise ValueError(f"dest directory {parent} does not exist")
 
-    full_dest = posixpath.join(dest, PurePosixPath(src).name)
     reasons: list[str] = []
     if await ctx.facts.get(File, full_dest) is not None:
         if not overwrite:
@@ -3634,19 +3678,30 @@ async def move(
         reasons.append(f"{full_dest} present, will remove first")
         yield RemoveTreeCommand(src=full_dest)
 
-    reasons.append(f"will move {src} into {dest}")
+    if dest_info:
+        reasons.append(f"will move {src} into {dest}")
+    else:
+        reasons.append(f"will move {src} to {full_dest}")
     ctx.changed = True
     ctx.reason = "; ".join(reasons)
     yield MoveCommand(src=src, dest=dest)
+    if user or group:
+        yield ChownCommand(path=full_dest, user=user, group=group)
+    if mode:
+        yield ChmodCommand(path=full_dest, mode=mode)
 
 
 @dataclass(frozen=True)
 class CopyCommand(Command):
-    """Copy a remote path into a remote directory (``cp -r [-f] src dest``).
+    """Copy a remote path into a directory or onto a file path (``cp -r [-f] src dest``).
 
-    Unlike ``files.move``'s overwrite branch there is no ``rm -rf`` prelude:
-    The baseline's copy expresses overwrite as ``cp``'s own ``-f`` flag, so one
-    descriptor with an ``overwrite`` field covers both forms.
+    ``dest`` is passed verbatim: an existing directory receives
+    ``basename(src)``, any other path is the full target path (the rename
+    form ``files.copy`` gained with issue #22) -- ``cp`` itself draws the
+    same distinction. Unlike ``files.move``'s overwrite branch there is no
+    ``rm -rf`` prelude: the baseline's copy expresses overwrite as ``cp``'s
+    own ``-f`` flag, so one descriptor with an ``overwrite`` field covers
+    both forms.
     """
 
     src: str
@@ -3663,22 +3718,44 @@ async def copy(
     src: str,
     dest: str,
     overwrite: bool = False,
+    mode: int | str | None = None,
+    user: str | None = None,
+    group: str | None = None,
     **kwargs: Any,
 ) -> AsyncGenerator[Command]:
-    """Copy a remote file/directory into a remote directory.
+    """Copy a remote file/directory to a remote directory or file path.
+
+    Ansible's ``copy`` with ``remote_src: true``: the copy renames, sets
+    metadata and converges idempotently on content drift, in one request.
 
     Args:
         ctx (OpContext): Execution context for the operation.
-        src (str): The remote path to copy.
-        dest (str): The remote directory to copy ``src`` into; the copied path
-            becomes ``dest/basename(src)`` and the source stays in place.
-        overwrite (bool, optional): When the destination path already exists,
-            force the copy (``cp -r -f``) instead of comparing or raising.
-            Defaults to False.
+        src (str): The remote path to copy; the source stays in place.
+        dest (str): Where to copy ``src``: an existing remote *directory*
+            (the copied path becomes ``dest/basename(src)``), or any other
+            path, treated as the full target path -- a **rename**
+            (``cp src dest``). The target's parent directory must exist.
+        overwrite (bool, optional): When the destination path already exists
+            with *different* content, force the copy (``cp -r -f``) instead
+            of raising. Sha1-gated: equal content is still a no-op, so a
+            drifted target converges once and a repeat reports no change
+            (Ansible's ``force: yes`` idempotence). Defaults to False.
+        mode (int | str | None, optional): The target's permissions --
+            an octal-digit int or string (``644``, ``"0644"``, ``"0o644"``)
+            or a symbolic mode. Applied with ``chmod`` after the copy, and
+            converged against the ``File`` fact's metadata when the content
+            is already equal. Defaults to None (the source's mode is kept).
+        user (str | None, optional): The user to own the target (a ``chown``
+            after the copy, before the ``chmod``; converged on a content
+            no-op too). Defaults to None (the source's owner is kept).
+        group (str | None, optional): The group to own the target.
+            Defaults to None.
         **kwargs: Additional keyword arguments.
 
     Yields:
-        Command: The copy command, when a copy is needed.
+        Command: The copy command when the content differs (or no comparison
+            is possible), followed by the requested ``chown``/``chmod``; on
+            equal content only the metadata commands whose values differ.
 
     **Raises:**
 
@@ -3690,64 +3767,130 @@ async def copy(
         Examples can be found in ``examples/modules/files/files_copy.py``.
     """
 
-    # Mirrors the baseline's ``files.copy``. Unlike ``files.move`` there is no
-    # ``rm -rf`` prelude -- the baseline's copy expresses overwrite as ``cp``'s own
-    # ``-f`` flag (which merges into an existing directory target rather than
-    # replacing it).
+    # Mirrors the baseline's ``files.copy``, extended with the issue #22
+    # Ansible remote-copy parity (rename, mode/owner, sha1-gated overwrite).
+    # Unlike ``files.move`` there is no ``rm -rf`` prelude -- the baseline's
+    # copy expresses overwrite as ``cp``'s own ``-f`` flag (which merges into
+    # an existing directory target rather than replacing it).
     #
     # Reads ``Directory(src)`` and ``File(src)`` and requires one of them to
     # be truthy, exactly the baseline's check: a *symlink* source reads False for
     # both and raises, even though ``files.move`` accepts links (upstream's
-    # own asymmetry, kept). ``Directory(dest)`` must be a present directory,
-    # and ``File(dest/basename(src))`` probes the target.
+    # own asymmetry, kept).
     #
-    # Idempotence differs from the stateless ``files.move``: with an existing
-    # regular-file target and ``overwrite`` unset, the source's and target's
-    # ``RemoteFileSha1`` are compared -- equal content is a no-op
-    # ("<target> already exists"), different content raises ``ValueError``.
-    # The baseline's ``Sha1File`` -> ``Md5File`` -> ``Sha256File`` fallback chain
+    # ``dest`` is auto-detected (issue #22): an existing *directory*
+    # (``Directory(dest)`` truthy) receives ``basename(src)``, the baseline's
+    # only form; any other path is the full target path, so ``cp`` renames --
+    # Ansible's ``copy remote_src`` with a file ``dest``. The rename form
+    # validates the target's *parent* directory instead (absent or
+    # non-directory raises ``ValueError``), keeping the validate-in-both-
+    # phases strictness. ``File(full_dest)`` probes the target either way.
+    #
+    # Idempotence is sha1-gated in *both* overwrite modes (issue #22): an
+    # existing regular-file target's ``RemoteFileSha1`` is compared against
+    # the source's -- equal content skips the copy, different content raises
+    # ``ValueError`` with ``overwrite`` unset and yields ``cp -r -f`` with it
+    # set. So ``overwrite=True`` is Ansible's ``force: yes``: a drifted
+    # target converges once, then reports no change (the baseline's
+    # stateless always-changed overwrite is deliberately dropped). The
+    # baseline's ``Sha1File`` -> ``Md5File`` -> ``Sha256File`` fallback chain
     # is deliberately reduced to the sha1-only ``RemoteFileSha1``, the same
     # single-hash precedent as ``files.put``/``files.get``. A target that is
-    # not a regular file (``File`` reads False/None) skips the comparison
-    # and the copy is planned, the baseline's truthiness kept verbatim.
+    # not a regular file (``File`` reads False/None) or a hash that cannot be
+    # read (a directory source, say) skips the comparison and the copy is
+    # planned, the baseline's truthiness kept verbatim.
     #
-    # An absent ``src``, a ``dest`` that is not a directory or does not
-    # exist, and an existing *different* target without ``overwrite`` all
-    # raise ``ValueError``. The baseline's phase-aware handling of the two
-    # absence cases (a soft log while planning, an error only while
-    # executing) is deliberately dropped because reemote operations are
-    # phase-unaware: they raise in *both* phases, the same strictness chosen
-    # for ``files.move``. A consequence is that a "create a file then copy
+    # ``mode``/``user``/``group`` (issue #22) converge the target's metadata
+    # in the same request: after a planned copy they yield an unconditional
+    # ``ChownCommand``/``ChmodCommand`` (the ``files.file`` create branch --
+    # the copy inherits the source's metadata, so the request is the
+    # authority); on an equal-content no-op they are compared against the
+    # ``File`` fact's row and only the differing commands are yielded (the
+    # ``files.file`` update branch), so a mode- or owner-only drift converges
+    # without re-copying. The chown precedes the chmod (a chown clears
+    # setuid/setgid bits, the ``files.install`` ordering); the mode is
+    # normalised through ``_ensure_mode_int`` (a symbolic mode never equals
+    # the fact's octal int, so its chmod re-runs every pass, the
+    # ``files.file`` precedent) and the named account must already exist.
+    #
+    # An absent ``src``, an absent/non-directory rename parent, and an
+    # existing *different* target without ``overwrite`` all raise
+    # ``ValueError``. The baseline's phase-aware handling of the absence
+    # cases (a soft log while planning, an error only while executing) is
+    # deliberately dropped because reemote operations are phase-unaware:
+    # they raise in *both* phases, the same strictness chosen for
+    # ``files.move``. A consequence is that a "create a file then copy
     # it" flow cannot share one deploy -- the prepare phase would raise on
     # the not-yet-created source -- so it spans two runs.
     #
-    # The command is shell text, so flagging the request ``sudo=True``
+    # The commands are shell text, so flagging the request ``sudo=True``
     # elevates the whole copy. ``**kwargs`` absorbs any further global
     # arguments (``op()`` already strips ``name``/``sudo``/``su``).
+    mode = _ensure_mode_int(mode)
     src_is_dir = await ctx.facts.get(Directory, src)
     src_is_file = await ctx.facts.get(File, src)
     if not src_is_file and not src_is_dir:
         raise ValueError(f"src {src} does not exist")
 
     dest_info = await ctx.facts.get(Directory, dest)
-    if dest_info is False:
-        raise ValueError(f"dest {dest} is not a directory")
-    if dest_info is None:
-        raise ValueError(f"dest directory {dest} does not exist")
+    if dest_info:
+        full_dest = posixpath.join(dest, PurePosixPath(src).name)
+    else:
+        full_dest = dest
+        parent = posixpath.dirname(dest)
+        if parent:
+            parent_info = await ctx.facts.get(Directory, parent)
+            if parent_info is False:
+                raise ValueError(f"dest parent {parent} is not a directory")
+            if parent_info is None:
+                raise ValueError(f"dest directory {parent} does not exist")
 
-    full_dest = posixpath.join(dest, PurePosixPath(src).name)
-    dest_file_exists = await ctx.facts.get(File, full_dest)
-    if dest_file_exists and not overwrite:
+    target_info = await ctx.facts.get(File, full_dest)
+    copy_needed = True
+    if target_info:
         src_sha1 = await ctx.facts.get(RemoteFileSha1, src)
         dest_sha1 = await ctx.facts.get(RemoteFileSha1, full_dest)
         if src_sha1 and dest_sha1 and src_sha1 == dest_sha1:
-            ctx.reason = f"{full_dest} already exists"
-            return
-        raise ValueError(f"{full_dest} already exists and is different than src")
+            copy_needed = False
+        elif not overwrite:
+            raise ValueError(
+                f"{full_dest} already exists and is different than src"
+            )
 
-    ctx.changed = True
-    ctx.reason = f"will copy {src} into {dest}"
-    yield CopyCommand(src=src, dest=dest, overwrite=overwrite)
+    reasons: list[str] = []
+    changed = False
+    if copy_needed:
+        changed = True
+        if dest_info:
+            reasons.append(f"will copy {src} into {dest}")
+        else:
+            reasons.append(f"will copy {src} to {full_dest}")
+        yield CopyCommand(src=src, dest=dest, overwrite=overwrite)
+        if user or group:
+            yield ChownCommand(path=full_dest, user=user, group=group)
+        if mode:
+            yield ChmodCommand(path=full_dest, mode=mode)
+    else:
+        # Equal content: converge only the metadata that differs, the
+        # files.file update branch over the target's fact row.
+        if (user and target_info["user"] != user) or (
+            group and target_info["group"] != group
+        ):
+            changed = True
+            reasons.append(
+                f"owner {target_info['user']}:{target_info['group']} "
+                "differs, will chown"
+            )
+            yield ChownCommand(path=full_dest, user=user, group=group)
+        if mode and target_info["mode"] != mode:
+            changed = True
+            reasons.append(f"mode {target_info['mode']} differs, will chmod {mode}")
+            yield ChmodCommand(path=full_dest, mode=mode)
+        if not changed:
+            reasons.append(f"{full_dest} already exists")
+
+    ctx.changed = changed
+    ctx.reason = "; ".join(reasons)
 
 
 def _ensure_mode_int(mode: int | str | None) -> int | str | None:

@@ -168,38 +168,46 @@ below).
     options:
       members: []
 
-## Moving a remote file into a remote directory
+## Moving a remote file to a new name
 
-`files.move` (baseline parity): `src` is a remote path, `dest` the remote
-*directory* to move it into, and `overwrite=True` clears an existing target
-with `rm -rf` before the `mv`. The operation is stateless — a valid move
-always plans a command — and raises `ValueError` on an absent source or
-absent/non-directory destination in *both* phases, so a "create then move"
+`files.move` (baseline parity plus the issue #22 rename/metadata extension):
+`src` is a remote path and `dest` is auto-detected — an existing directory
+receives `basename(src)`, any other path is the full target path, so the
+example's move **renames** the payload. `mode="0644"` rides the same request
+(a `chmod` after the `mv`), and `overwrite=True` clears an existing target
+with `rm -rf` first. The operation stays stateless — a valid move always
+plans a command — and raises `ValueError` on an absent source or
+absent/non-directory rename parent in *both* phases, so a "create then move"
 flow cannot share one deploy: the example stages the payload with
-`files.put` into `/tmp` in run 1, then moves it into `/var/tmp` in run 2,
-each run shown as a `--dry` plan followed by the real apply log. Both
-directories exist on every host and are writable by any login user, so no
-home directory is assumed. Nothing is elevated here; a root-owned
-destination would carry `sudo=True`.
+`files.put` into `/tmp` in run 1, then moves it to a renamed file under
+`/var/tmp` in run 2, each run shown as a `--dry` plan followed by the real
+apply log. Both directories exist on every host and are writable by any
+login user, so no home directory is assumed. Nothing is elevated here; a
+root-owned destination would carry `sudo=True`.
 
 ::: files_move
     options:
       members: []
 
-## Copying a remote file into a remote directory
+## Copying a remote file to a new name (Ansible copy remote_src parity)
 
-`files.copy` (baseline parity): `src` is a remote path, `dest` the remote
-*directory* to copy it into, and the source stays in place — the difference
-from `files.move`. `overwrite=True` forces the copy (`cp -r -f`, no `rm -rf`
-prelude); without it an existing target with equal sha1 content is a no-op
-and a different one raises `ValueError`. Absent source / absent or
-non-directory destination raise in *both* phases (the same phase-unaware
+`files.copy` (baseline parity plus the issue #22 Ansible `copy remote_src`
+extension): `dest` is auto-detected as for `files.move` — the example's
+full-file-path dest **renames** the payload — and the source stays in
+place, the difference from `files.move`. `mode="0644"` converges in the
+same request, and `overwrite=True` is **sha1-gated**: an existing target
+with equal content is a no-op, a drifted one is overwritten once and then
+converges (Ansible's `force: yes` idempotence); without `overwrite` a
+different target raises `ValueError`. Absent source / absent or
+non-directory rename parent raise in *both* phases (the same phase-unaware
 strictness as `files.move`), so the example stages the payload with
-`files.put` into `/tmp` in run 1, then copies it into `/var/tmp` in run 2,
-each run shown as a `--dry` plan followed by the real apply log. Both
-directories exist on every host and are writable by any login user, so no
-home directory is assumed. Nothing is elevated here; a root-owned
-destination would carry `sudo=True`.
+`files.put` into `/tmp` in run 1, copies it to a renamed file under
+`/var/tmp` in run 2, and repeats the copy in run 3 to show the literal
+no-op — each run shown as a `--dry` plan followed by the real apply log.
+Both directories exist on every host and are writable by any login user,
+so no home directory is assumed. Nothing is elevated here; a root-owned
+destination (a built PHP module under `/usr/lib`, say) would carry
+`sudo=True` with `user`/`group` naming the owning account.
 
 ::: files_copy
     options:

@@ -454,26 +454,62 @@ action outside the deploy. See
 [Migrating a content-returning GET](../migrating.md#migrating-a-content-returning-get-uri)
 for the `uri`/`return_content` mapping.
 
-`files.move` mirrors the baseline's `files.move`: `src` is a remote path, `dest`
-is the remote *directory* to move it into (the moved path becomes
-`dest/basename(src)`), and `overwrite=True` removes an existing target first
-(`rm -rf`) instead of raising. It is **stateless** like the baseline — a valid
-move always yields a command, there is no idempotent no-op branch — and it
-reads `File(src)`, `Directory(dest)` and `File(dest/basename(src))` to
-validate. An absent source, an absent or non-directory destination, and an
+`files.move` mirrors the baseline's `files.move`, extended with the issue #22
+rename/metadata parity: `src` is a remote path and `dest` is auto-detected —
+an existing remote *directory* receives `basename(src)` (the baseline's only
+form), any other path is the full target path, so the move **renames**
+(`mv src dest`). The rename form validates the target's *parent* directory
+instead: an absent or non-directory parent raises `ValueError`.
+`overwrite=True` removes an existing target first (`rm -rf`) instead of
+raising, and `mode`/`user`/`group` yield a `chown`/`chmod` on the moved path
+after the `mv` (chown first — it clears setuid/setgid bits). It is
+**stateless** like the baseline — a valid move always yields a command,
+there is no idempotent no-op branch — and it reads `File(src)`,
+`Directory(dest)` and `File(full_dest)` to validate. An absent source and an
 existing target without `overwrite` raise `ValueError`. The baseline's
-phase-aware softness for the two absence cases (a log while planning, an
+phase-aware softness for the absence case (a log while planning, an
 error only while executing) is deliberately dropped — reemote operations
 are phase-unaware, so they raise in *both* phases. A consequence: a
 "create a file then move it" flow cannot share one deploy (prepare would
-raise on the not-yet-created source) and spans two runs instead. Both
+raise on the not-yet-created source) and spans two runs instead. All
 commands are shell text, so `sudo=True` elevates the whole move — a
 vehicle for the two-run spool-and-install shape: `files.edit` spools the
 transformed content into a login-user-writable path in one run, then
 `files.move` installs it into a root-owned directory elevated in a second
 run. For whole-content writes prefer `files.install` above (one deploy),
-and for the hosts file specifically the dedicated `server.etc_hosts`
+for an idempotent remote-to-remote install prefer `files.copy` below, and
+for the hosts file specifically the dedicated `server.etc_hosts`
 operation now covers the old `/etc/hosts` recipe natively.
+
+`files.copy` mirrors the baseline's `files.copy`, extended with the issue #22
+Ansible `copy remote_src: true` parity — the copy renames, sets metadata and
+converges idempotently on content drift, in one request. `dest` is
+auto-detected exactly as `files.move`'s: an existing directory receives
+`basename(src)`, any other path is the full target path (a rename, with the
+parent directory validated in both phases). The source stays in place — the
+difference from `files.move`. Idempotence is **sha1-gated in both overwrite
+modes**: an existing regular-file target's `RemoteFileSha1` is compared
+against the source's — equal content skips the copy, different content
+raises `ValueError` with `overwrite` unset and yields `cp -r -f` with it set.
+So `overwrite=True` is Ansible's `force: yes`: a drifted target converges
+once, then reports no change (the baseline's stateless always-changed
+overwrite is deliberately dropped). `mode`/`user`/`group` converge the
+target's metadata in the same request: after a planned copy they yield an
+unconditional `chown`/`chmod` (the `files.file` create branch — the copy
+inherits the source's metadata), and on an equal-content no-op they are
+compared against the `File` fact's row so only the differing commands are
+yielded (the `files.file` update branch) — a mode- or owner-only drift
+converges without re-copying. The mode accepts the `files.file` spellings
+(a symbolic mode never equals the fact's octal int, so its `chmod` re-runs
+every pass); the named account must already exist. A target that is not a
+regular file, or a hash that cannot be read (a directory source), skips the
+comparison and the copy is planned. An absent source, an absent or
+non-directory rename parent, and an existing *different* target without
+`overwrite` raise `ValueError` in *both* phases (the same phase-unaware
+strictness as `files.move`), so a "create then copy" flow spans two runs.
+The commands are shell text, so `sudo=True` elevates the whole copy — the
+one-request shape for installing a built artifact (a PHP module, say) under
+a root-owned path with its final name, mode and owner.
 
 `files.directory` mirrors the baseline's `files.directory`: it reads the
 `Directory` fact once and — for an absent path — yields `mkdir -p` plus,
