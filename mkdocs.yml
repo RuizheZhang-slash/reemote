@@ -177,5 +177,6 @@ nav:
           - ansible-role-nfs: examples/roles/ansible-role-nfs.md
           - ansible-role-nginx: examples/roles/ansible-role-nginx.md
           - ansible-role-php: examples/roles/ansible-role-php.md
+          - ansible-role-php-xdebug: examples/roles/ansible-role-php-xdebug.md
 
 
