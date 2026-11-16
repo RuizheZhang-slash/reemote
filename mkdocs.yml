@@ -170,5 +170,12 @@ nav:
           - Privilege: examples/demonstrations/privilege.md
       - Roles:
           - ansible-datadog: examples/roles/ansible-datadog.md
+          - ansible-role-apache: examples/roles/ansible-role-apache.md
+          - ansible-role-docker: examples/roles/ansible-role-docker.md
+          - ansible-role-java: examples/roles/ansible-role-java.md
+          - ansible-role-memcached: examples/roles/ansible-role-memcached.md
+          - ansible-role-nfs: examples/roles/ansible-role-nfs.md
+          - ansible-role-nginx: examples/roles/ansible-role-nginx.md
+          - ansible-role-php: examples/roles/ansible-role-php.md
 
 

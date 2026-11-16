@@ -3,11 +3,11 @@
 | | |
 | --- | --- |
 | Role | [`datadog.datadog`](https://github.com/DataDog/ansible-datadog) 5.6.0 |
-| Program | [`ansible-datadog.py`](../../../examples/roles/ansible-datadog/ansible-datadog.py) |
+| Program | [`ansible-datadog.py`](https://github.com/kimjarvis/reemote/blob/main/examples/roles/ansible-datadog/ansible-datadog.py) |
 | Target | **Ubuntu** — hosts in the inventory group `"ubuntu"` |
-| Inventory | [`inventory.json`](../../../inventory.json) at the project root |
+| Inventory | [`inventory.json`](https://github.com/kimjarvis/reemote/blob/main/inventory.json) at the project root |
 | Scope | the role's Debian/Ubuntu **default path** (see [§9](#9-scoped-out)) |
-| Offline test | [`tests/test_roles_ansible_datadog.py`](../../../tests/test_roles_ansible_datadog.py) |
+| Offline test | [`tests/test_roles_ansible_datadog.py`](https://github.com/kimjarvis/reemote/blob/main/tests/test_roles_ansible_datadog.py) |
 
 This program installs and configures the Datadog Agent the way the Ansible role
 does: the apt signing keys and repository, the agent package, `/etc/datadog-agent`
@@ -479,7 +479,7 @@ Every one is recorded in a comment at its site in the program.
 
 ## 8. Offline verification
 
-[`tests/test_roles_ansible_datadog.py`](../../../tests/test_roles_ansible_datadog.py)
+[`tests/test_roles_ansible_datadog.py`](https://github.com/kimjarvis/reemote/blob/main/tests/test_roles_ansible_datadog.py)
 imports the example by path and replays `main()` barrier-for-barrier against
 persistent `SimulatedHost`s — the real driver, prepare + apply, plus a `dry=True`
 preview. Four tests:
@@ -505,8 +505,9 @@ literals in `op()`, import-time-constructible module constants) and drives every
 factory with a `SNAPSHOT_ARGS` fixture.
 
 Gates: `uv run pytest tests/ -q` → **4307 passed**; `uv run ruff check .` → clean.
-The docs build is unaffected (`examples/roles` is not in `mkdocs.yml`'s example
-scan paths).
+This document is published from `docs/examples/roles/ansible-datadog.md`
+(Examples → Roles in `mkdocs.yml`); the program itself stays outside the
+mkdocstrings example scan paths.
 
 **Not yet run against a real host.** Doing so mutates the target and needs explicit
 approval; the recipe is [§2](#2-running-it-against-inventoryjson-with-uv) — run it,

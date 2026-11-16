@@ -2,7 +2,7 @@
 
 This example migrates the [geerlingguy.docker](https://github.com/geerlingguy/ansible-role-docker)
 Ansible role to a Python program built on the reemote library
-(`ansible-role-docker.py` in this directory).
+([`ansible-role-docker.py`](https://github.com/kimjarvis/reemote/blob/main/examples/roles/ansible-role-docker/ansible-role-docker.py)).
 
 The role installs and configures Docker CE from the official Docker
 repository: the legacy key/source/package cleanup, the repository

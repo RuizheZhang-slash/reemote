@@ -2,7 +2,7 @@
 
 This example migrates the [geerlingguy.nfs](https://github.com/geerlingguy/ansible-role-nfs)
 Ansible role to a Python program built on the reemote library
-(`ansible-role-nfs.py` in this directory).
+([`ansible-role-nfs.py`](https://github.com/kimjarvis/reemote/blob/main/examples/roles/ansible-role-nfs/ansible-role-nfs.py)).
 
 The role installs the NFS server packages, creates the directories to
 export, renders `/etc/exports` from a template, starts and enables the NFS

@@ -2,7 +2,7 @@
 
 This example migrates the [geerlingguy.apache](https://github.com/geerlingguy/ansible-role-apache)
 Ansible role to a Python program built on the reemote library
-(`ansible-role-apache.py` in this directory).
+([`ansible-role-apache.py`](https://github.com/kimjarvis/reemote/blob/main/examples/roles/ansible-role-apache/ansible-role-apache.py)).
 
 The role installs and configures Apache 2.x on RHEL/CentOS, Debian/Ubuntu,
 SLES and Solaris: the distribution packages, the `ports.conf` listen lines,

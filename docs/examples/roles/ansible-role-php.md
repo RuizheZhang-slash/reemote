@@ -2,7 +2,7 @@
 
 This example migrates the [geerlingguy.php](https://github.com/geerlingguy/ansible-role-php)
 Ansible role to a Python program built on the reemote library
-(`ansible-role-php.py` in this directory).
+([`ansible-role-php.py`](https://github.com/kimjarvis/reemote/blob/main/examples/roles/ansible-role-php/ansible-role-php.py)).
 
 The role installs and configures PHP on RHEL/CentOS and Debian/Ubuntu: the
 distribution packages, the packaged APCu/OpCache ini cleanup, the

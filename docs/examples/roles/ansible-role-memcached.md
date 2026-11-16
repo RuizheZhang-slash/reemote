@@ -2,7 +2,7 @@
 
 This example migrates the [geerlingguy.memcached](https://github.com/geerlingguy/ansible-role-memcached)
 Ansible role to a Python program built on the reemote library
-(`ansible-role-memcached.py` in this directory).
+([`ansible-role-memcached.py`](https://github.com/kimjarvis/reemote/blob/main/examples/roles/ansible-role-memcached/ansible-role-memcached.py)).
 
 The role installs Memcached, writes `/etc/memcached.conf` from an
 OS-specific Jinja2 template (root:root, mode `0644`), and starts and

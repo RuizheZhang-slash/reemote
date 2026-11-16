@@ -2,7 +2,7 @@
 
 This example migrates the [geerlingguy.java](https://github.com/geerlingguy/ansible-role-java)
 Ansible role to a Python program built on the reemote library
-(`ansible-role-java.py` in this directory).
+([`ansible-role-java.py`](https://github.com/kimjarvis/reemote/blob/main/examples/roles/ansible-role-java/ansible-role-java.py)).
 
 The role installs the distribution's default OpenJDK package and
 optionally exports `JAVA_HOME` through a `/etc/profile.d` script: the

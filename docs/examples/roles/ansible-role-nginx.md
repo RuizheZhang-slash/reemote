@@ -2,7 +2,7 @@
 
 This example migrates the [geerlingguy.nginx](https://github.com/geerlingguy/ansible-role-nginx)
 Ansible role to a Python program built on the reemote library
-(`ansible-role-nginx.py` in this directory).
+([`ansible-role-nginx.py`](https://github.com/kimjarvis/reemote/blob/main/examples/roles/ansible-role-nginx/ansible-role-nginx.py)).
 
 The role installs and configures nginx on RedHat/CentOS, Debian/Ubuntu,
 Archlinux, Suse, FreeBSD and OpenBSD: the `dirmngr` prerequisite, the
