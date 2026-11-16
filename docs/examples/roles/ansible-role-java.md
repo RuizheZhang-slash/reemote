@@ -15,16 +15,15 @@ no handlers, no loops and no command/shell tasks.
 `"ubuntu"` execute the deploy; every request carries the static `when`
 guard `is_ubuntu`, so the other hosts in the shared `inventory.json`
 (Alpine, CentOS) are skipped without being contacted. The RedHat, Amazon
-and FreeBSD branches are scoped out (see §9). Unlike a role whose vars
+and FreeBSD branches are scoped out (see §8). Unlike a role whose vars
 split only by OS family, this role's Ubuntu vars split by *major version*
 (`vars/Ubuntu-12.yml` through `vars/Ubuntu-26.yml`), so the single-OS
 scope still uses the gather → snapshot → factory recipe: the major
 version is gathered once and selects a frozen package table.
 
 The migration is complete: every task on the Ubuntu default path maps to
-a covered operation or a documented recipe. **No implementation gap was
-proven** (§6) — nothing blocks the migration, no default-path feature was
-dropped, and no GitHub ticket was filed.
+a covered operation or a documented recipe; no default-path feature was
+dropped.
 
 ## 1. Prerequisites
 
@@ -107,7 +106,7 @@ The program:
    package list, freezes the ≥ 18 man-directory gate and renders the
    JAVA_HOME profile content (gather → snapshot → factory);
 4. runs the single deploy — man1 directory (when gated), `apt.packages`
-   (with the folded cache refresh, §7 D1), and the JAVA_HOME profile
+   (with the folded cache refresh, §6 D1), and the JAVA_HOME profile
    install + mode convergence (when `java_home` is set);
 5. prints the deploy twice: the `dry=True` plan (Ansible's `--check` as a
    return value — nothing is mutated) followed by the real apply log.
@@ -124,7 +123,7 @@ uv run pytest tests/test_roles_ansible_role_java.py -q
 
 The test replays the program's whole orchestration against the test
 framework's `SimulatedHost` and proves plan → apply → **second apply is a
-no-op** (§8).
+no-op** (§7).
 
 ## 3. Role variables
 
@@ -202,34 +201,13 @@ shape change).
 | # | Ansible task | reemote target | Status |
 | --- | --- | --- | --- |
 | 4 | `file: path=/usr/share/man/man1 state=directory mode=0755` when Ubuntu ≥ 18 | `files.directory(mode="0755")`; the gate frozen into the plan | covered |
-| 5 | `apt: name={{ java_packages }} state=present` | `apt.packages(packages=…, sudo=True)` (+ folded cache refresh, §7 D1) | covered |
+| 5 | `apt: name={{ java_packages }} state=present` | `apt.packages(packages=…, sudo=True)` (+ folded cache refresh, §6 D1) | covered |
 
 The Fedora/FreeBSD, Amazon and RedHat `include_vars` branches and the
 `setup-RedHat.yml` / `setup-Amazon.yml` / `setup-FreeBSD.yml` task files
-are scoped out (§9). The role has no `handlers/main.yml`.
+are scoped out (§8). The role has no `handlers/main.yml`.
 
-## 6. Implementation gaps
-
-**None.** Every task on the Ubuntu default path maps to a covered
-operation or a documented recipe:
-
-- `apt.packages` presence is fact-gated on `AptPackages` (name/version
-  match), and `update=True, cache_valid_time=600` is gated on the
-  `AptUpdateStamp` fact — Ansible's `apt` semantics directly.
-- `files.directory` converges mode on existing directories (the `Directory`
-  fact), matching the `file: state=directory mode=0755` task.
-- `files.install` + the `files.file` mode companion cover the template
-  task's content *and* mode enforcement; the two-tier `FileContents`
-  read-back (#12, closed) is not even needed here — the profile script is
-  world-readable `0644`.
-- The template needs no renderer dependency (§1.1).
-
-The library's one open gap, [#17](https://github.com/kimjarvis/reemote/issues/17)
-(`apt.sources_file(signed_by=)` cannot take a key URL), concerns apt
-repository management this role never does. **No GitHub ticket was filed
-for this migration**, and no `GAP-n` marker appears in the program.
-
-## 7. Deliberate deviations
+## 6. Deliberate deviations
 
 - **D1 — the apt cache refresh is folded into the install request.** The
   role's `apt` task carries no `update_cache`; the role's molecule
@@ -260,7 +238,7 @@ for this migration**, and no `GAP-n` marker appears in the program.
   `java_packages` override is ever consulted. The error names the
   supported majors.
 
-## 8. Offline verification
+## 7. Offline verification
 
 `tests/test_roles_ansible_role_java.py` imports the example by path and
 replays its orchestration barrier-for-barrier against persistent
@@ -275,7 +253,7 @@ everywhere. Also covered: the `java_packages` override, the empty-list
 override, the Ubuntu 16 man1-gate branch, the skipped non-Ubuntu host,
 the dry preview's zero mutation, and the pure helpers' fail-fast gates.
 
-## 9. Scoped out
+## 8. Scoped out
 
 - **RedHat / CentOS / Rocky / Alma / OracleLinux branches**
   (`setup-RedHat.yml`, `vars/RedHat-*.yml`): a Phase 0 single-OS decision
@@ -286,6 +264,6 @@ the dry preview's zero mutation, and the pure helpers' fail-fast gates.
   `/proc` and `/dev/fd` mounts): same decision.
 - **Fedora vars** (`vars/Fedora.yml`): same decision.
 
-None of these is an implementation gap — reemote's `dnf`, `apk` and
-`server` modules cover the package/mount operations they use; they are
-simply outside the agreed Ubuntu target.
+Reemote's `dnf`, `apk` and `server` modules cover the package/mount
+operations these branches use; they are simply outside the agreed Ubuntu
+target.

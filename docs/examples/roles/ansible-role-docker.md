@@ -18,14 +18,11 @@ ExecStart override, the service's running/enabled state, a single
 CentOS) are skipped without being contacted. The role's `include_vars` OS
 dispatch collapses to frozen Debian constants, and the RedHat/Suse branches
 plus the opt-in standalone docker-compose binary install are scoped out
-(see §9).
+(see §8).
 
 The migration is complete: every task on the Ubuntu default path maps to a
-covered operation or a documented recipe. The one genuine implementation
-gap that was proven — feature-only and workaroundable — has since been
-closed by [#17](https://github.com/kimjarvis/reemote/issues/17): the
-program now passes the key URL straight to `apt.sources_file(signed_by=…)`
-(§6), and no default-path feature was dropped.
+covered operation or a documented recipe, and no default-path feature was
+dropped.
 
 ## 1. Prerequisites
 
@@ -51,7 +48,9 @@ plain `uv run python …`, no `--with`.
 - This repository, with dependencies synced: `uv sync`.
 - Internet egress to `download.docker.com`: the signing key is fetched
   **control-side** by `apt.sources_file`'s URL `signed_by` form (the target
-  never needs `curl`/`wget`).
+  never needs `curl`/`wget`). The key must be ASCII-armored text — a binary
+  key URL raises `ValueError` — and is fetched once per phase with no
+  checksum pin.
 
 ### 1.3 Target host
 
@@ -126,7 +125,7 @@ uv run pytest tests/test_roles_ansible_role_docker.py -q
 
 The test replays the program's whole orchestration against the test
 framework's `SimulatedHost` and proves plan → apply → **second apply is a
-no-op** (§8).
+no-op** (§7).
 
 ## 3. Role variables
 
@@ -144,12 +143,12 @@ keys. The `vars/Debian.yml` obsolete-package list is a frozen constant
 | `docker_service_manage` | `true` | manage the service state and fire the restart handler |
 | `docker_service_state` | `"started"` | `started`/`stopped`/`restarted`/`reloaded` |
 | `docker_service_enabled` | `true` | enable the service on boot |
-| `docker_service_start_command` | `""` | when set, override the unit's `ExecStart` (drop-in, §7 D2) |
+| `docker_service_start_command` | `""` | when set, override the unit's `ExecStart` (drop-in, §6 D2) |
 | `docker_restart_handler_state` | `"restarted"` | the handler's verb: `restarted`/`reloaded`/`started` |
 | `docker_install_compose_plugin` | `true` | install the compose plugin package |
 | `docker_compose_package` | `"docker-compose-plugin"` | the plugin package name |
 | `docker_compose_package_state` | `"present"` | `present`/`latest`/`absent` for the plugin |
-| `docker_install_compose` | `false` | **scoped out** — a truthy value raises (§9) |
+| `docker_install_compose` | `false` | **scoped out** — a truthy value raises (§8) |
 | `docker_add_repo` | `true` | `false` removes the `.sources` file and the managed key |
 | `docker_repo_url` | `"https://download.docker.com/linux"` | base for the derived repo/key URLs |
 | `docker_apt_release_channel` | `"stable"` | the repository component (`stable`/`nightly`/…) |
@@ -201,12 +200,12 @@ the user tasks, exactly as the role's `meta: flush_handlers` orders the
 play; the `Groups` gather sits **after** the package install, when the
 docker-ce postinst has created the group. The role's first flush (the
 `apt update` handler) needs no barrier at all: `update_cache=True` chains
-the index refresh onto the sources change itself (§7 D1).
+the index refresh onto the sources change itself (§6 D1).
 
 ## 5. Coverage table
 
 Status vocabulary: **covered** (direct operation), **recipe** (documented
-shape change), **workaround** (possible with a recorded deviation).
+shape change).
 
 ### `tasks/setup-Debian.yml`
 
@@ -217,10 +216,10 @@ shape change), **workaround** (possible with a recorded deviation).
 | 3 | `package: name={{ docker_obsolete_packages }} state=absent` | `apt.packages(present=False)` | covered |
 | 4 | `file: path=…/docker.list state=absent` | `files.file(present=False)` | covered |
 | 5 | `apt: name=[ca-certificates, python3-debian] state=present` | `apt.packages` | covered |
-| 6 | `deb822_repository: … signed_by={{ docker_apt_gpg_key }} (a URL)` | `apt.sources_file(signed_by=<URL>)` — fetches and installs `/etc/apt/keyrings/docker.asc` itself | covered ([#17](https://github.com/kimjarvis/reemote/issues/17), closed) |
+| 6 | `deb822_repository: … signed_by={{ docker_apt_gpg_key }} (a URL)` | `apt.sources_file(signed_by=<URL>)` — fetches and installs `/etc/apt/keyrings/docker.asc` itself | covered |
 | 7 | `suites: {{ ansible_facts.distribution_release }}` | `LinuxDistribution` gather → `release_meta["VERSION_CODENAME"]` snapshot → factory | recipe |
 | 8 | `state: present/absent` (`docker_add_repo`) | `apt.sources_file(present=…)` — the URL form removes the managed keyring when absent | covered |
-| 9 | `notify: apt update` + `meta: flush_handlers` | `apt.sources_file(update_cache=True)` — refresh chained on a real change only (#14, closed) | covered |
+| 9 | `notify: apt update` + `meta: flush_handlers` | `apt.sources_file(update_cache=True)` — refresh chained on a real change only | covered |
 
 ### `tasks/main.yml`
 
@@ -231,13 +230,13 @@ shape change), **workaround** (possible with a recorded deviation).
 | 12 | `package: name={{ docker_compose_package }} allow_downgrade=true` | `apt.packages(allow_downgrades=True)` | covered |
 | 13 | `file: path=/etc/docker state=directory mode=0755` | `files.directory(mode="0755")` | covered |
 | 14 | `copy: content={{ docker_daemon_options \| to_nice_json }} dest=/etc/docker/daemon.json` | `json.dumps(indent=4, sort_keys=True)` + `files.install` | covered |
-| 15 | `systemd_service` register + `replace: FragmentPath ^ExecStart=.*$` | `systemd.dropin` ExecStart override (§7 D2) | recipe |
+| 15 | `systemd_service` register + `replace: FragmentPath ^ExecStart=.*$` | `systemd.dropin` ExecStart override (§6 D2) | recipe |
 | 16 | `service: daemon_reload=true` when the patch changed | `dropin(daemon_reload=True)` — chained on a real content change only | covered |
 | 17 | `service: name=docker state=… enabled=…` when `docker_service_manage` | `systemd.service(running/restarted/reloaded, enabled)` | covered |
 | 18 | `meta: flush_handlers` | deploy barrier + handler deploy (§4) | recipe |
-| 19 | `include_tasks: docker-compose.yml` when `docker_install_compose` | — | scoped out (§9) |
+| 19 | `include_tasks: docker-compose.yml` when `docker_install_compose` | — | scoped out (§8) |
 | 20 | `getent: database=group key=docker` | `Groups` gather between runs; missing group → fail-fast | recipe |
-| 21 | `set_fact: at_least_one_user_to_modify` | subsumed by `server.user(append=True)` membership idempotence (§7 D4) | deviation |
+| 21 | `set_fact: at_least_one_user_to_modify` | subsumed by `server.user(append=True)` membership idempotence (§6 D4) | deviation |
 | 22 | `user: groups=docker append=true` loop (`docker-users.yml`) | `server.user(groups=("docker",), append=True)` per user | covered |
 | 23 | `meta: reset_connection` | every `run()` builds fresh hosts — structural no-op | recipe |
 
@@ -248,41 +247,7 @@ shape change), **workaround** (possible with a recorded deviation).
 | 24 | `restart docker` (`state={{ docker_restart_handler_state }}`, when `docker_service_manage`) | `service_handler(notified ∩ manage, ("docker",), action=…)` | recipe |
 | 25 | `apt update` (`update_cache: true`) | folded into `apt.sources_file(update_cache=True)` (row 9) | covered |
 
-## 6. Implementation gaps
-
-### GAP-1 ([#17](https://github.com/kimjarvis/reemote/issues/17)): `apt.sources_file(signed_by=)` cannot take a key URL — **closed**
-
-- **Ansible behavior**: `deb822_repository`'s `signed_by` accepts a URL (as
-  well as a path, a fingerprint or an inline armored block); given a URL the
-  module downloads the key itself and manages the keyring file named after
-  the repository (`key_filename` return value, e.g.
-  `/etc/apt/keyrings/debian.gpg`).
-- **reemote at migration time**: `apt.sources_file(signed_by=…)` accepted an
-  existing keyring *path* only and wrote it verbatim into `Signed-By:`; no
-  operation in the apt module fetched a key URL into a keyring (`apt.key`
-  rejects a URL `src` too). The migration worked around it with one extra
-  request — `files.download(url=docker_apt_gpg_key,
-  dest=/etc/apt/keyrings/docker.asc, mode="0644", sudo=True)` — plus a
-  key-removal request when `docker_add_repo=false`.
-- **Resolution (#17, closed)**: `apt.sources_file(signed_by=<URL>)` now
-  fetches the ASCII-armored key control-side (once per phase) and installs
-  the repo-named `/etc/apt/keyrings/<filename>.asc` keyring itself through
-  its spool-and-install pair, idempotent on content; `Signed-By` references
-  that path, and `present=False` removes the managed `.asc`/`.gpg` keyrings
-  too. The workaround download and the separate key-removal request are
-  deleted; the program passes `docker_apt_gpg_key` straight to `signed_by`.
-- **Remaining caveats**: the key is still fetched once per phase — a URL
-  whose body changes mid-run would plan one content and install another
-  (no checksum pin; the role pins nothing, so neither does this migration).
-  A *binary* key URL override raises `ValueError` (armored text only) — the
-  role default is armored; the error names the `apt.key` + path alternative.
-
-No other gap was found: `allow_downgrades`, fact-gated `latest` (#13),
-`update_cache` (#14), `files.download` (#3), `systemd.dropin`,
-`server.user(append=True)` and the `service_handler` family all cover their
-tasks directly.
-
-## 7. Deliberate deviations
+## 6. Deliberate deviations
 
 - **D1 — the `apt update` handler is folded into the sources request.**
   Ansible notifies a separate handler and flushes it immediately; reemote's
@@ -315,7 +280,7 @@ tasks directly.
   is reemote's plural keyword; same `--allow-downgrades` semantics. The two
   version-split install tasks collapse to the modern (≥ 2.12) one.
 
-## 8. Offline verification
+## 7. Offline verification
 
 `tests/test_roles_ansible_role_docker.py` imports the example by path and
 replays its orchestration barrier-for-barrier against persistent
@@ -327,7 +292,7 @@ names only, so the docker group the real docker-ce postinst creates is
 appended to `os_groups` by hand. The load-bearing assertion: the second pass
 reports `changed=False` everywhere and queues no handler.
 
-## 9. Scoped out
+## 8. Scoped out
 
 - **RedHat / Suse branches** (`setup-RedHat.yml`, `setup-Suse.yml`,
   `docker_yum_*`): a Phase 0 single-OS decision — the target is Ubuntu.

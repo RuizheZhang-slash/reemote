@@ -15,14 +15,13 @@ consumed `register:` outcomes.
 guard `is_ubuntu`, so the other hosts in the shared `inventory.json`
 (Alpine, CentOS) are skipped without being contacted. The RedHat branch
 (`vars/RedHat.yml`, `memcached-RedHat.conf.j2`, the sysconfig destination)
-is scoped out (§9). The vars split only by OS family, so the single-OS
+is scoped out (§8). The vars split only by OS family, so the single-OS
 scope collapses the `include_vars` dispatch to frozen module constants —
 no `LinuxDistribution` gather is needed (the nginx precedent).
 
 The migration is complete: every task on the Ubuntu default path maps to
-a covered operation or a documented recipe. **No implementation gap was
-proven** (§6) — nothing blocks the migration, no default-path feature was
-dropped, and no GitHub ticket was filed.
+a covered operation or a documented recipe; no default-path feature was
+dropped.
 
 ## 1. Prerequisites
 
@@ -111,7 +110,7 @@ The program:
 3. renders `memcached-Debian.conf.j2` control-side with Ansible's Jinja2
    environment and freezes the content into a per-host plan;
 4. runs the main deploy — the apt cache refresh, the `memcached`
-   package, the config install plus its metadata companion (§7 D3), and
+   package, the config install plus its metadata companion (§6 D3), and
    the started-and-enabled service;
 5. reads the apply report between the runs (`changed_hosts`) and runs
    the `restart memcached` handler deploy on the notified hosts only;
@@ -131,7 +130,7 @@ uv run pytest tests/test_roles_ansible_role_memcached.py -q
 
 The test replays the program's whole orchestration against the test
 framework's `SimulatedHost` and proves plan → apply → **second apply is a
-no-op with an empty handler set** (§8). `jinja2` comes from the `dev`
+no-op with an empty handler set** (§7). `jinja2` comes from the `dev`
 group here, so no `--with` is needed.
 
 ## 3. Role variables
@@ -203,41 +202,13 @@ shape change).
 | --- | --- | --- | --- |
 | 1 | `include_vars: "{{ ansible_facts.os_family }}.yml"` | frozen `DEBIAN_VARS` constants (single-OS collapse — no gather needed) | recipe |
 | 2 | `set_fact: memcached_user={{ __memcached_user }}` when `memcached_user is not defined` | `role_settings` merges the vars-table default under `host.extra` | recipe |
-| 3 | `apt: update_cache=yes cache_valid_time=86400` when `os_family == 'Debian'` | `apt.update(cache_valid_time=86400, sudo=True, when=is_ubuntu)` — gated on the `AptUpdateStamp` fact (#9, closed) | covered |
-| 4 | `package: name=memcached state=present` (`register: memcached_install`) | `apt.packages(packages=("memcached",), sudo=True, when=is_ubuntu)`; the register is never consumed → dropped (§7 D2) | covered |
+| 3 | `apt: update_cache=yes cache_valid_time=86400` when `os_family == 'Debian'` | `apt.update(cache_valid_time=86400, sudo=True, when=is_ubuntu)` — gated on the `AptUpdateStamp` fact | covered |
+| 4 | `package: name=memcached state=present` (`register: memcached_install`) | `apt.packages(packages=("memcached",), sudo=True, when=is_ubuntu)`; the register is never consumed → dropped (§6 D2) | covered |
 | 5 | `template: memcached-Debian.conf.j2 dest={{ memcached_config_file }} owner=root group=root mode=0644` `notify: restart memcached` | control-side Jinja2 render + `files.install(mode="0644", user="root", group="root")` + `files.file` metadata companion; both names notify | recipe |
 | 6 | `service: name=memcached state=started enabled=yes` | `systemd.service("memcached", running=True, enabled=True, sudo=True, when=is_ubuntu)` | covered |
 | H | handler `restart memcached`: `service: name=memcached state=restarted` | `changed_hosts(report, NOTIFY_RESTART)` between runs → `restart_handler(frozen_set, "memcached", when=is_ubuntu)` | recipe |
 
-## 6. Implementation gaps
-
-**None.** Every task on the Ubuntu default path maps to a covered
-operation or a documented recipe:
-
-- `apt.update(cache_valid_time=86400)` is idempotent within the window
-  via the `AptUpdateStamp` fact — Ansible's `cache_valid_time` semantics
-  directly (#9, closed). The stamp age is computed against the
-  *controller's* UTC clock (reemote's documented approximation of
-  Ansible's target-side check).
-- `apt.packages` presence is fact-gated on `AptPackages`.
-- `files.install` + the `files.file` metadata companion cover the
-  template task's content *and* owner/group/mode enforcement; the config
-  is world-readable `0644`, so the two-tier `FileContents` read-back
-  (#12, closed) is not even needed.
-- `systemd.service` gates `running`/`enabled` on the
-  `SystemdServiceState`/`SystemdServiceEnabled` facts; the handler's
-  `restarted=True` acts on a running unit and starts a stopped one
-  (the operation's default `running=True`).
-- The handler split is the library's own `changed_hosts` /
-  `restart_handler` pair — first-class since the handler-pattern
-  promotion.
-
-Every library issue this role could touch is closed (#9, #12, #13); a
-read-only check of the whole tracker at migration time showed no open
-issue. **No GitHub ticket was filed for this migration**, and no `GAP-n`
-marker appears in the program.
-
-## 7. Deliberate deviations
+## 6. Deliberate deviations
 
 - **D1 — `ansible_managed` is frozen to `"Ansible managed"`.** Ansible's
   ansible.cfg default is a *timestamped* string ("Ansible managed:
@@ -255,13 +226,13 @@ marker appears in the program.
   precedent), and its name joins `NOTIFY_RESTART` because Ansible's
   template module reports a change on owner/group/mode drift too.
 - **D4 — the RedHat path is scoped out.** A Phase 0 single-OS decision:
-  the target is Ubuntu (§9).
+  the target is Ubuntu (§8).
 - **D5 — type gates fail fast.** Ansible renders whatever YAML gives it;
   the program raises `TypeError` on a wrongly typed variable before any
   host is contacted (reemote's hashability and render-sanity convention,
   the java precedent).
 
-## 8. Offline verification
+## 7. Offline verification
 
 `tests/test_roles_ansible_role_memcached.py` imports the example by path
 and replays its orchestration barrier-for-barrier against persistent
@@ -281,11 +252,10 @@ metadata-drift companion convergence *with* notification, content-drift
 re-install, the skipped non-Ubuntu host, the dry preview's zero mutation,
 and the pure helpers' fail-fast gates.
 
-## 9. Scoped out
+## 8. Scoped out
 
 - **RedHat / CentOS branches** (`vars/RedHat.yml`: the `memcached` user,
   the `/etc/sysconfig/memcached` destination;
   `templates/memcached-RedHat.conf.j2`): a Phase 0 single-OS decision —
-  the target is Ubuntu. None of this is an implementation gap: reemote's
-  `dnf` and `systemd` modules cover the operations the RedHat path uses;
-  it is simply outside the agreed target.
+  the target is Ubuntu. Reemote's `dnf` and `systemd` modules cover the
+  operations the RedHat path uses; it is simply outside the agreed target.

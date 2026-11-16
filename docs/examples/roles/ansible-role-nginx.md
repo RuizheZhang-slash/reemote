@@ -18,17 +18,14 @@ legacy `vhosts.conf` cleanup, the rendered `nginx.conf` installed behind
 `is_ubuntu`, so the other hosts in the shared `inventory.json` (Alpine,
 CentOS) are skipped without being contacted. The role's `include_vars` OS
 dispatch collapses to frozen Debian constants, and the RedHat, Suse,
-Archlinux, FreeBSD and OpenBSD branches are scoped out (see §9). Both Ubuntu
+Archlinux, FreeBSD and OpenBSD branches are scoped out (see §8). Both Ubuntu
 opt-in toggles (`nginx_ppa_use`, `nginx_remove_default_vhost`) **are**
 implemented — unlike a build-from-source branch, every task they gate maps
 to a covered operation.
 
 The migration is complete: every task on the Ubuntu path maps to a covered
-operation or a documented recipe — **zero library-runtime gaps**. One
-genuine gap was proven in the *test framework* (`SimulatedHost`),
-feature-only and workaroundable — since closed (§6,
-[#18](https://github.com/kimjarvis/reemote/issues/18)); nothing blocked the
-migration and no feature was dropped.
+operation or a documented recipe; nothing blocked the migration and no
+feature was dropped.
 
 ## 1. Prerequisites
 
@@ -168,7 +165,7 @@ uv run pytest tests/test_roles_ansible_role_nginx.py -q
 
 The test replays the program's whole orchestration against the test
 framework's `SimulatedHost` and proves plan → apply → **second apply is a
-no-op** (§8). `jinja2` comes from the `dev` group here, so no `--with` is
+no-op** (§7). `jinja2` comes from the `dev` group here, so no `--with` is
 needed.
 
 ## 3. Role variables
@@ -212,8 +209,8 @@ shape: `nginx_user` (the `set_fact` fallback to `__nginx_user`) and
 | `nginx_vhosts` | `[]` | list of vhost mappings (§3.1) |
 | `nginx_upstreams` | `[]` | list of `{name, servers, strategy?, keepalive?}` upstream blocks |
 | `nginx_log_format` | the role's `main` format | the `log_format main` body |
-| `nginx_yum_repo_enabled` | `true` | accepted for parity, **inert** — a RedHat-only knob (§9) |
-| `nginx_zypper_repo_enabled` | `true` | accepted for parity, **inert** — a Suse-only knob (§9) |
+| `nginx_yum_repo_enabled` | `true` | accepted for parity, **inert** — a RedHat-only knob (§8) |
+| `nginx_zypper_repo_enabled` | `true` | accepted for parity, **inert** — a Suse-only knob (§8) |
 
 Invalid values (a bad `nginx_service_state` enum, a non-list
 `nginx_vhosts`/`nginx_upstreams`, a vhost without `server_name` or
@@ -287,7 +284,7 @@ shape change), **dead** (never runs in the role either).
 | --- | --- | --- | --- |
 | 1 | `include_vars: "{{ ansible_facts.os_family }}.yml"` | frozen `DEBIAN_VARS` (single-OS scope) | recipe |
 | 2 | `set_fact: nginx_user={{ __nginx_user }}` when undefined | `role_settings()` `None` → `www-data` | covered |
-| 3 | `include_tasks: setup-RedHat/FreeBSD/OpenBSD/Archlinux/Suse.yml` | scoped out (§9) | out of scope |
+| 3 | `include_tasks: setup-RedHat/FreeBSD/OpenBSD/Archlinux/Suse.yml` | scoped out (§8) | out of scope |
 | 4 | `include_tasks: setup-Ubuntu.yml` (distribution == Ubuntu) | deploys 1 + 2 | covered |
 | 5 | `include_tasks: setup-Debian.yml` (os_family == Debian) | deploy 2 | covered |
 | 6 | `import_tasks: vhosts.yml` | deploy 3 | covered |
@@ -299,7 +296,7 @@ shape change), **dead** (never runs in the role either).
 | # | Ansible task | reemote target | Status |
 | --- | --- | --- | --- |
 | 9 | `apt: name=dirmngr state=present` | `apt.packages(packages=("dirmngr",))` | covered |
-| 10 | `apt_repository: ppa:nginx/{{ nginx_ppa_version }}`, `update_cache: true`, `register: nginx_ppa_added`, when `nginx_ppa_use` | `apt.ppa(src="ppa:nginx/…", update_cache=True)` behind the static flag; idempotent via `AptSources`, refreshes only on a real add (#14, closed) | covered |
+| 10 | `apt_repository: ppa:nginx/{{ nginx_ppa_version }}`, `update_cache: true`, `register: nginx_ppa_added`, when `nginx_ppa_use` | `apt.ppa(src="ppa:nginx/…", update_cache=True)` behind the static flag; idempotent via `AptSources`, refreshes only on a real add | covered |
 | 11 | `apt: name=nginx state=absent` when `nginx_ppa_added is changed` | `changed_hosts(setup report, (PPA_NAME,))` → `build_install(ppa_added)` conditional removal | recipe |
 
 ### `tasks/setup-Debian.yml` → deploy 2
@@ -327,39 +324,7 @@ shape change), **dead** (never runs in the role either).
 | 20 | `validate nginx configuration` (`command: nginx -t …`) | never notified by any task — dead in the role, documented not implemented (D4) | dead |
 | 21 | `reload nginx` (`service: state=reloaded`, when `nginx_service_state == "started"`), notified by 7, 15–18 | `changed_hosts(report, reload names)` → static per-host filter → `service_handler(action="reloaded")` | recipe |
 
-## 6. Implementation gaps
-
-**Zero library-runtime gaps**: every task above maps to a covered
-operation or a documented recipe. The historical nginx-path gaps (validate
-hook, reload handler factory, `apt.ppa` idempotence, `default_release`,
-`cache_valid_time`) all landed in the library before this migration.
-
-One genuine gap was proven in the test framework (absence protocol: the
-mutator's full body read against the fact's seam read, corroborated by the
-`remove_tree` counterpart), tracked as
-**[GAP-1 (#18)](https://github.com/kimjarvis/reemote/issues/18)** — closed:
-
-### GAP-1 (#18) — `SimulatedHost.remove_file` leaves `remote_files` (closed)
-
-- **What**: the simulated `rm -f` (`tests/simulated_host.py`,
-  `remove_file`) cleared `existing_files` and `file_stats` but not
-  `remote_files`, while `FileContents` reads its seam straight from
-  `remote_files` (`src/reemote/modules/files/files.py`). After a simulated
-  `files.file(present=False)` the fact still answered the removed file's
-  bytes; a real `rm -f` removes the content. `remove_link` shared the
-  trait; `remove_tree` already models the removal correctly.
-- **Class**: genuine *test-framework* gap (real hosts are correct).
-  **Rank**: feature-only — it affects offline assertions and any
-  multi-operation sequence that re-creates a removed path with identical
-  content, never the migration itself.
-- **Fix (landed)**: `remove_file` and `remove_link` now pop `remote_files`
-  too, mirroring `remove_tree`'s store order;
-  `tests/test_simulated_host.py` proves the content read-backs stop
-  answering and a follow-up install of the removed bytes is not skipped.
-  The workaround is retired: the removal assertions read `remote_files`
-  directly (§10).
-
-## 7. Deliberate deviations from Ansible semantics
+## 6. Deliberate deviations from Ansible semantics
 
 - **D1 — OS dispatch frozen.** `include_vars` per OS family becomes the
   module constant `DEBIAN_VARS`; the Ubuntu target needs no run-time
@@ -369,8 +334,8 @@ mutator's full body read against the fact's seam read, corroborated by the
   `force=False` raises on it — Ubuntu's default vhost **is** a symlink.
   `files.file(present=False, force=True)` reproduces Ansible's
   type-agnostic removal (`rm -rf` on a symlink removes only the link,
-  never its target). This is a deviation, not a gap: the operation covers
-  the behavior with the right flag.
+  never its target). The operation covers the behavior with the right
+  flag.
 - **D3 — `changed_when: false` has no analogue.** The cache-refresh task
   suppresses its `changed` flag in Ansible; reemote's log reports the real
   fact-resolved delta. Moot: the task notifies nothing, so the flag has no
@@ -409,9 +374,9 @@ mutator's full body read against the fact's seam read, corroborated by the
   notifying requests changed, so a converged play restarts nothing.
 - **D9 — RedHat/Suse knobs inert.** `nginx_yum_repo_enabled` and
   `nginx_zypper_repo_enabled` are accepted for inventory parity, unused on
-  Ubuntu (§9).
+  Ubuntu (§8).
 
-## 8. Offline verification
+## 7. Offline verification
 
 `tests/test_roles_ansible_role_nginx.py` imports the example by path (its
 file name is not a valid module identifier), never calls its `main()`, and
@@ -451,31 +416,15 @@ install records package names only, so the package's own files
 vhosts, the `/etc/nginx` tree) are seeded as its post-install state; the
 Cpus gather reads the `cpus` attribute seam; the PPA codename comes from
 the `lsb_release` seam. The removal assertions read `remote_files`
-directly (GAP-1 (#18) closed, §6).
+directly.
 
-## 9. Scoped out
+## 8. Scoped out
 
 - The RedHat/Rocky/AlmaLinux, Suse, Archlinux, FreeBSD and OpenBSD branches
   (`setup-RedHat.yml`, `setup-Suse.yml`, `setup-Archlinux.yml`,
   `setup-FreeBSD.yml`, `setup-OpenBSD.yml` and their repo/key tasks) — a
-  Phase 0 single-OS decision, not a library gap.
+  Phase 0 single-OS decision.
 - `nginx_yum_repo_enabled` / `nginx_zypper_repo_enabled` (RedHat/Suse-only;
   D9).
 - The dead `validate nginx configuration` handler (D4) — dead in the role
   itself.
-
-## 10. Second pass
-
-Done — [GAP-1 (#18)](https://github.com/kimjarvis/reemote/issues/18) is
-closed. The `SimulatedHost` fix landed (`remove_file`/`remove_link` pop
-`remote_files`, mirroring `remove_tree`):
-
-1. the `GAP-1 (#18)` workaround comments in
-   `tests/test_roles_ansible_role_nginx.py` are dropped and the removal
-   assertions read `remote_files` directly;
-2. the `GAP-1` paragraph in the program's module docstring and §6 of this
-   document are marked closed;
-3. the gates were re-run: `uv run pytest tests/ -q`, `uv run ruff check .`,
-   and the two-pass no-op proof.
-
-No program behaviour changed — the gap was test-framework-only.

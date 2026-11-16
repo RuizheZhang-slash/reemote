@@ -17,17 +17,13 @@ extension conf path, the optional CLI disable, and the two chained handlers
 `is_ubuntu`, so the other hosts in the shared `inventory.json` (Alpine,
 CentOS) are skipped without being contacted. The role's `include_vars` OS
 dispatch collapses to the frozen `vars/Debian.yml` constants, and the
-RHEL/CentOS branch (`yum: '@development'`) is scoped out (§9). Unlike the
+RHEL/CentOS branch (`yum: '@development'`) is scoped out (§8). Unlike the
 sibling `geerlingguy.php` migration — where build-from-source is an opt-in
 `php_install_from_source` branch — **here the build *is* the role's default and
 only path**, so it is fully migrated, not scoped out.
 
 The migration is complete: every task on the Ubuntu path maps to a covered
-operation or a documented recipe. **No open implementation gap remains** (§6) —
-the two gaps this migration originally found (`files.unarchive`, issue #21;
-`files.copy` remote-copy parity, issue #22) were both **closed on `main`**
-before this pass, so the program uses the clean native operations rather than
-the former workarounds.
+operation or a documented recipe.
 
 ## 1. Prerequisites
 
@@ -47,7 +43,7 @@ the role's template. No Jinja2, no PyYAML — the inventory is read with the
 standard library's `json`, and the role defaults are frozen module constants.
 
 The control machine needs **internet egress to `xdebug.org`**: the tarball is
-fetched control-side as binary bytes by `files.unarchive` (issue #21, closed),
+fetched control-side as binary bytes by `files.unarchive`,
 spooled to the host's `/tmp`, extracted and cleaned up. The host itself never
 downloads anything.
 
@@ -149,7 +145,7 @@ uv run pytest tests/test_roles_ansible_role_php_xdebug.py -q
 
 The test replays the program's whole orchestration against the test
 framework's `SimulatedHost` and proves plan → apply → **second apply is a
-no-op** (§8).
+no-op** (§7).
 
 ## 3. Role variables
 
@@ -208,8 +204,8 @@ state) and both passes must yield the identical request sequence. The role
 reads the distribution major version (`include_vars` dispatch) and gates the
 build on a `creates:` path — mutable reads a single deploy may not branch on.
 Each becomes a **gather → snapshot → factory** step, and the build itself is a
-`Shell` action *between* deploys (the build-from-source recipe, issue #8
-closed: commands never live inside a deploy):
+`Shell` action *between* deploys (the build-from-source recipe: commands
+never live inside a deploy):
 
 ```
 main()
@@ -220,15 +216,15 @@ main()
  ├─ deploy 1: build_setup              apt.packages(build-essential)
  │                                     files.directory(module_path, 0755)
  │                                     files.unarchive(url, dest=workspace,
- │                                       creates=src_dir)   #21 closed
+ │                                       creates=src_dir)
  ├─ gather_fact(FileExists, built_so)  the build's creates: gate, read AFTER
  │                                     the extraction → frozen need_build set
  │                                     (hosts closed manually afterwards)
  ├─ ACTION: gather_action(Shell)       cd src_dir && phpize && ./configure
  │                                     && make, on need_build hosts only (sudo;
- │                                     non-zero exit → CommandError)   #8 closed
+ │                                     non-zero exit → CommandError)
  ├─ deploy 2: build_install            files.copy(built_so → installed_so,
- │                                       rename, 0644, overwrite)   #22 closed
+ │                                       rename, 0644, overwrite)
  │                                     files.install(xdebug.ini) per ini_dest
  │                                     files.file(cli_ini, present=False)
  │                                       when cli_disable
@@ -236,7 +232,7 @@ main()
  │                                     + the handlers' when guards
  └─ deploy 3: build_handler            service_handler per host: webserver
                                        first, then the chained FPM restart
-                                       (compose)   #10 closed
+                                       (compose)
 ```
 
 The barriers are load-bearing:
@@ -265,12 +261,12 @@ shape change).
 | 1 | `include_vars: "{{ os_family }}.yml"` | frozen `vars/Debian.yml` constants (single-OS scope) | recipe |
 | 2 | `set_fact: php_xdebug_module_path` when undefined | `resolved_vars()` — the `__php_xdebug_module_path` fallback | covered |
 | 3 | `set_fact: php_xdebug_config_filename` when undefined | `resolved_vars()` — the `__php_xdebug_config_filename` fallback | covered |
-| 4 | `yum: name='@development'` (RedHat) | scoped out (§9) | out of scope |
+| 4 | `yum: name='@development'` (RedHat) | scoped out (§8) | out of scope |
 | 5 | `apt: name=build-essential state=present` (Debian, **no** `update_cache`) | `apt.packages(packages=("build-essential",), present=True)` — no cache refresh (D7) | covered |
-| 6 | `unarchive: src=<url> dest=workspace creates=src_dir copy=false mode=0755` | `files.unarchive(src=url, dest=workspace, creates=src_dir)` — #21 closed; `mode` dropped (D2) | covered |
+| 6 | `unarchive: src=<url> dest=workspace creates=src_dir copy=false mode=0755` | `files.unarchive(src=url, dest=workspace, creates=src_dir)` — `mode` dropped (D2) | covered |
 | 7 | `command: {{ item }} chdir=src_dir creates=…/modules/xdebug.so` loop `[phpize, ./configure, make]` | `gather_action(Shell)` between deploys, `&&` chain; `creates` gate via `FileExists` snapshot (D3) | recipe |
 | 8 | `file: path=module_path state=directory root:root 0755` | `files.directory(mode="0755", user="root", group="root")` | covered |
-| 9 | `copy: src=built_so dest=installed_so remote_src=true mode=0644` `notify: restart webserver` | `files.copy(src, dest, overwrite=True, mode="0644", user="root", group="root")` — rename form, #22 closed (D9) | covered |
+| 9 | `copy: src=built_so dest=installed_so remote_src=true mode=0644` `notify: restart webserver` | `files.copy(src, dest, overwrite=True, mode="0644", user="root", group="root")` — rename form (D9) | covered |
 | 10 | `include_tasks: configure.yml` | deploy 2 (`build_install`) | covered |
 
 ### `tasks/configure.yml` → deploy 2
@@ -290,35 +286,7 @@ the dependency's handlers.
 | 13 | `restart webserver`: `service: state=restarted`, `when: php_enable_webserver`, `notify: restart php-fpm` | `changed_hosts` over `WEBSERVER_NOTIFY_NAMES` → `service_handler(action="restarted")` per host | recipe |
 | 14 | `restart php-fpm`: `service: state={{ php_fpm_handler_state }}`, `when: php_enable_php_fpm and php_fpm_state == 'started'` | the chain collapses to an upstream-first `compose`: the webserver set (chained) ∪ the direct configure notifications, filtered by the guards → `service_handler(action=…)` (D6) | recipe |
 
-## 6. Implementation gaps
-
-**Zero open implementation gaps.** Both gaps this migration originally found
-were filed, then **closed on `main`** before this pass, and the program uses
-the clean native operations:
-
-- **[#21](https://github.com/kimjarvis/reemote/issues/21)** — `files: no
-  unarchive operation` — closed by commit `efd354f`. The role's
-  `unarchive: src=<url> creates=<src_dir> copy=false` task is now ONE
-  in-deploy `files.unarchive` request: the URL is fetched control-side as
-  binary bytes, spooled to `/tmp`, extracted and cleaned up, with Ansible's
-  `creates:` idempotence resolved in-operation through the `FileExists` fact
-  (a converged host is a no-op and never fetches). The former three-piece
-  workaround (a `urllib` fetch, a `files.put` spool deploy and an
-  out-of-deploy `tar` action) is gone.
-- **[#22](https://github.com/kimjarvis/reemote/issues/22)** — `files:
-  copy/move lack Ansible remote-copy parity` — closed by commit `dbfccf0`.
-  The role's `copy: remote_src=true mode=0644` task (which *renames*
-  `xdebug.so` → `xdebug-<version>.so`) is now ONE `files.copy` request with a
-  file `dest` (the rename form), `mode`/`user`/`group` converged in the same
-  request, and a sha1-gated `overwrite=True` (Ansible's `force: yes`
-  idempotence). The former versioned-basename staging `cp` and the separate
-  metadata-convergence deploy are gone.
-
-The build-from-source `command:` loop and the handler chain are **recipes**,
-not gaps: issue #8 (build-from-source) and issue #10 (handler chaining) were
-already closed, and the documented shape changes apply directly.
-
-## 7. Deliberate deviations from Ansible semantics
+## 6. Deliberate deviations from Ansible semantics
 
 - **D1 — OS dispatch frozen, version table still gathered.** `include_vars`
   per OS family becomes module constants (Ubuntu-only scope); the PHP version
@@ -350,7 +318,7 @@ already closed, and the documented shape changes apply directly.
 - **D6 — handler chain collapses to an upstream-first `compose`.** The
   `restart webserver` → `restart php-fpm` chain becomes a `compose` of
   `service_handler` deploys, webserver first (the documented handler-chaining
-  recipe, issue #10 closed). `service_handler` offers
+  recipe). `service_handler` offers
   `restarted`/`reloaded`/`running`; `php_fpm_handler_state: started` maps to
   `running`. Each host gets its own `service_handler` call so per-host daemon
   names resolve correctly.
@@ -360,8 +328,8 @@ already closed, and the documented shape changes apply directly.
   on a stock host; the `File` fact reads a symlink as a non-file, so
   `files.file(present=False, force=True)` removes the link itself — what
   Ansible's `state: absent` does to a symlink.
-- **D9 — `overwrite=True` is sha1-gated.** The new `files.copy` (issue #22,
-  closed) compares `RemoteFileSha1`: an equal-content target is a no-op, a
+- **D9 — `overwrite=True` is sha1-gated.** `files.copy` compares
+  `RemoteFileSha1`: an equal-content target is a no-op, a
   drifted target converges once. This is Ansible's `force: yes` idempotence,
   so a repeat run does not re-copy.
 - **D10 — check mode.** reemote's `run(dry=True)` is Ansible's `--check` as a
@@ -373,7 +341,7 @@ already closed, and the documented shape changes apply directly.
   role's string `"false"` as `false`, where a Python `False` would render
   `False`.
 
-## 8. Offline verification
+## 7. Offline verification
 
 [`tests/test_roles_ansible_role_php_xdebug.py`](https://github.com/kimjarvis/reemote/blob/main/tests/test_roles_ansible_role_php_xdebug.py)
 imports the example by path (its file name is not a valid module identifier),
@@ -411,25 +379,13 @@ between-pass bridge repairs a *simulation* limit (not a library bug): the
 action — what `make` produces for real. The remaining seeding choices are
 documented in the test docstring.
 
-## 9. Scoped out
+## 8. Scoped out
 
 - The RHEL/CentOS branch (`yum: '@development'`, `vars/RedHat.yml`'s
-  `/usr/lib64/php/modules` + `xdebug.ini`) — a Phase 0 single-OS decision, not
-  a library gap.
+  `/usr/lib64/php/modules` + `xdebug.ini`) — a Phase 0 single-OS decision.
 - Installing PHP itself — the `geerlingguy.php` dependency's job (§1.3); this
   program resolves the dependency's variables but assumes PHP + `phpize` are
   present.
 
 The build-from-source path is **not** scoped out: it is this role's default
 and only path, fully migrated as the `Shell` action between deploys 1 and 2.
-
-## 10. Second pass
-
-Both gaps (#21, #22) were already filled and incorporated in **this** pass —
-the program uses the clean native `files.unarchive` and parity `files.copy`,
-not the former workarounds, so no `GAP-n` marker remains to retire. No open
-gap remains. Should a future audit file a gap against this example, the
-convention is ready: the code tags every workaround `GAP-n (#issue)`, and the
-second pass retires the marker, updates this document (§6, §8) and re-runs the
-gates (`uv run pytest tests/ -q`, `uv run ruff check .`, and the two-pass no-op
-proof).

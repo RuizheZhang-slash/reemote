@@ -16,14 +16,11 @@ optional PHP-FPM pools and service, and two chained handlers
 `is_ubuntu`, so the other hosts in the shared `inventory.json` (Alpine,
 CentOS) are skipped without being contacted. The role's `include_vars` OS
 dispatch collapses to a frozen Ubuntu version table, and the RHEL/CentOS
-branch and the opt-in `php_install_from_source` path are scoped out (see §9).
+branch and the opt-in `php_install_from_source` path are scoped out (see §8).
 
 The migration is complete: every task on the Ubuntu default path maps to a
-covered operation or a documented recipe. **No open implementation gap
-remains** (§6) — the one test-framework gap found during the sibling nginx
-migration (`SimulatedHost.remove_file` leaving `remote_files`, issue #18) was
-already closed on this branch before the migration started, so nothing
-blocks the migration and no feature was dropped.
+covered operation or a documented recipe; nothing blocks the migration and
+no feature was dropped.
 
 ## 1. Prerequisites
 
@@ -125,7 +122,7 @@ uv run pytest tests/test_roles_ansible_role_php.py -q
 
 The test replays the program's whole orchestration against the test
 framework's `SimulatedHost` and proves plan → apply → **second apply is a
-no-op** (§8).
+no-op** (§7).
 
 ## 3. Role variables
 
@@ -141,13 +138,13 @@ distribution major.
 | --- | --- | --- |
 | `php_packages` | `null` → the version-specific list | package list; `null` reproduces the role's `__php_packages` fallback (13 packages, plus `php{v}-json` when PHP < 8.0) |
 | `php_packages_extra` | `[]` | extra packages appended to the list |
-| `php_packages_state` | `"present"` | `present`/`latest`/`absent`; `latest` gates on `AptUpgradable` (#13, closed) |
+| `php_packages_state` | `"present"` | `present`/`latest`/`absent`; `latest` gates on `AptUpgradable` |
 | `php_install_recommends` | `true` | `false` adds `--no-install-recommends` |
 | `php_default_version_debian` | `null` → per-Ubuntu table | overrides the version selection (7.4 / 8.1 / 8.3, else 8.2) |
 | `php_enable_webserver` | `true` | whether the `restart webserver` handler fires |
 | `php_webserver_daemon` | `null` → `"apache2"` | the webserver service the handler restarts |
-| `php_enablerepo` | `""` | accepted for parity, **inert** — a RHEL-only knob (§9) |
-| `php_executable` | `"php"` | accepted for parity, **inert** — a source-path knob (§9) |
+| `php_enablerepo` | `""` | accepted for parity, **inert** — a RHEL-only knob (§8) |
+| `php_executable` | `"php"` | accepted for parity, **inert** — a source-path knob (§8) |
 
 ### PHP-FPM
 
@@ -269,7 +266,7 @@ handlers at the end of the play.
 ## 5. Coverage table
 
 Status vocabulary: **covered** (direct operation), **recipe** (documented
-shape change), **workaround** (possible with a recorded deviation).
+shape change).
 
 ### `tasks/main.yml`
 
@@ -280,9 +277,9 @@ shape change), **workaround** (possible with a recorded deviation).
 | 3 | `set_fact:` version + `__php_*` fallback chain (9 tasks) | `resolved_vars()` — pure, control-side | covered |
 | 4 | `set_fact:` JSON package for PHP < 8.0 (2 tasks) | `resolved_vars()` appends `php{v}-json` when version < 8.0 | covered |
 | 5 | Ubuntu 16.04 `php_opcache_conf_filename` special case | scoped out — 16.04 is EOL and not in the version table; the default `10-opcache.ini` is identical anyway | out of scope |
-| 6 | `include_tasks: setup-RedHat.yml` | scoped out (§9) | out of scope |
+| 6 | `include_tasks: setup-RedHat.yml` | scoped out (§8) | out of scope |
 | 7 | `include_tasks: setup-Debian.yml` | deploys 1 + 2 | covered |
-| 8 | `include_tasks: install-from-source.yml` | scoped out — opt-in, default-false (§9) | out of scope |
+| 8 | `include_tasks: install-from-source.yml` | scoped out — opt-in, default-false (§8) | out of scope |
 | 9 | `include_tasks: configure*.yml` | deploy 3 | covered |
 
 ### `tasks/setup-Debian.yml` → deploys 1 + 2
@@ -327,27 +324,7 @@ shape change), **workaround** (possible with a recorded deviation).
 | 25 | `restart webserver`: `service: state=restarted`, `when: php_enable_webserver`, `notify: restart php-fpm` | `changed_hosts` union over `WEBSERVER_NOTIFY_NAMES` across the three reports → `service_handler(action="restarted")` per host | recipe |
 | 26 | `restart php-fpm`: `service: state={{ php_fpm_handler_state }}`, `when: php_enable_php_fpm and php_fpm_state == 'started'` | the chain collapses to an upstream-first service listing: the webserver set (chained) ∪ the direct pool notifications, filtered by the guards → `service_handler(action=…)` (D5) | recipe |
 
-## 6. Implementation gaps
-
-**Zero open implementation gaps.** Every task on the Ubuntu default path
-maps to a covered operation or a documented recipe; no ticket was filed
-because no gap remains to track.
-
-The one candidate found during the sibling nginx migration —
-**[#18](https://github.com/kimjarvis/reemote/issues/18)**
-(`SimulatedHost.remove_file` left `remote_files`, so `FileContents` answered
-for a removed file) — was verified **closed** on this branch before the
-migration started: `remove_file`/`remove_link` now pop `remote_files` first
-(commit `2fa29f4`), the issue is closed on the tracker, and
-`tests/test_simulated_host.py` proves the fix. The offline test therefore
-asserts removals against the content store directly, with no workaround.
-
-Non-gaps considered and rejected during the audit (the `find`/`grep`
-semantics, `follow`, symlink removal, the handler verbs, `ansible_managed`,
-custom pool templates) are recorded as deviations below, not gaps: each is
-either faithful on the target platform or a documented, bounded difference.
-
-## 7. Deliberate deviations from Ansible semantics
+## 6. Deliberate deviations from Ansible semantics
 
 - **D1 — OS dispatch frozen, version table still gathered.**
   `include_vars` per OS family becomes module constants (Ubuntu-only scope);
@@ -406,7 +383,7 @@ either faithful on the target platform or a documented, bounded difference.
   handler deploy is honest (it consults the frozen outcome); a dry preview of
   a notifying deploy cannot know whether handlers will fire.
 
-## 8. Offline verification
+## 7. Offline verification
 
 `tests/test_roles_ansible_role_php.py` imports the example by path (its file
 name is not a valid module identifier), never calls its `main()`, and replays
@@ -430,8 +407,8 @@ pass 1). It proves:
 
 The `find`/`grep` sweeps are answered offline by seeding the `grep_files`
 seam keyed `(path, pattern)`; the distribution read by seeding
-`linux_distribution`. Removals are asserted against `remote_files` directly
-— issue #18 is closed, so no workaround is needed. Two between-pass bridges
+`linux_distribution`. Removals are asserted against `remote_files` directly.
+Two between-pass bridges
 repair *simulation* limits (not library bugs): `make_directory` records a
 `directory_stats` row but not an `existing_files` entry, so the test syncs the
 two stores before pass 2 (the `FileExists` pool-dir gate reads the latter); and
@@ -441,10 +418,10 @@ packaged ini files are seeded as a mix of symlinks and regular files to
 exercise both `files.file` removal branches. The remaining seeding choices are
 documented in the test docstring.
 
-## 9. Scoped out
+## 8. Scoped out
 
 - The RHEL/CentOS branch (`setup-RedHat.yml`, `vars/RedHat.yml`,
-  `php_enablerepo`) — a Phase 0 single-OS decision, not a library gap.
+  `php_enablerepo`) — a Phase 0 single-OS decision.
 - `install-from-source.yml` and its `php_source_*` variables — opt-in,
   `php_install_from_source` defaults false. Its `command:`/`shell:` steps
   would migrate as `Shell`/`Script` actions gathered outside deploys (the
@@ -453,13 +430,3 @@ documented in the test docstring.
 - Custom `pool_template` values (D7) — a template-engine workstream.
 - The Ubuntu 16.04 `php_opcache_conf_filename` special case — EOL, and the
   value equals the default anyway.
-
-## 10. Second pass
-
-No open gap remains to incorporate: the migration landed complete, and the
-only candidate gap (#18) was already closed before it started. Should a
-future audit file a gap against this example, the convention is ready: the
-code tags every workaround `GAP-n (#issue)`, and the second pass retires the
-marker, updates this document (§6, §8) and re-runs the gates
-(`uv run pytest tests/ -q`, `uv run ruff check .`, and the two-pass no-op
-proof).

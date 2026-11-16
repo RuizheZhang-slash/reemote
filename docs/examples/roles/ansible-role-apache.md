@@ -16,12 +16,10 @@ default-vhost removal, the service's running/enabled state, and a single
 `is_ubuntu`, so the other hosts in the shared `inventory.json` (Alpine,
 CentOS) are skipped without being contacted. The role's `include_vars` OS
 dispatch collapses to frozen Debian constants, and the RHEL/SLES/Solaris/
-Amazon Linux branches are scoped out (see §9).
+Amazon Linux branches are scoped out (see §8).
 
 The migration is complete: every task on the Ubuntu default path maps to a
-covered operation or a documented recipe. One genuine implementation gap was
-proven — a *test-framework* gap, feature-only and workaroundable (§6) — so
-nothing blocks the migration and no feature was dropped.
+covered operation or a documented recipe; no feature was dropped.
 
 ## 1. Prerequisites
 
@@ -115,7 +113,7 @@ uv run pytest tests/test_roles_ansible_role_apache.py -q
 
 The test replays the program's whole orchestration against the test
 framework's `SimulatedHost` and proves plan → apply → **second apply is a
-no-op** (§8). `jinja2` comes from the `dev` group here, so no `--with` is
+no-op** (§7). `jinja2` comes from the `dev` group here, so no `--with` is
 needed.
 
 ## 3. Role variables
@@ -151,8 +149,8 @@ Every `defaults/main.yml` variable is honoured under its original
 | `apache_restart_state` | `"restarted"` | the handler's verb: `restarted`/`reloaded`/`started` |
 | `apache_packages_state` | `"present"` | `present`/`latest`/`absent` for the packages |
 | `apache_packages` | `null` → `("apache2", "apache2-utils")` | package list; `null` reproduces the role's `__apache_packages` fallback |
-| `apache_enablerepo` | `""` | accepted for parity, **inert** — a RHEL-only knob (§9) |
-| `apache_ssl_no_log` | `true` | accepted for parity, **inert** — reemote has no log masking (§7, D3) |
+| `apache_enablerepo` | `""` | accepted for parity, **inert** — a RHEL-only knob (§8) |
+| `apache_ssl_no_log` | `true` | accepted for parity, **inert** — reemote has no log masking (§6, D3) |
 
 Invalid values (a bad enum, a vhost without `servername`, an SSL vhost
 without its certificate paths) raise before any host is contacted.
@@ -195,14 +193,14 @@ deploy — exactly as Ansible flushes handlers at the end of the play.
 ## 5. Coverage table
 
 Status vocabulary: **covered** (direct operation), **recipe** (documented
-shape change), **workaround** (possible with a recorded deviation).
+shape change).
 
 ### `tasks/main.yml`
 
 | # | Ansible task | reemote target | Status |
 | --- | --- | --- | --- |
 | 1 | `include_vars: "{{ ansible_os_family }}.yml"` | frozen `DEBIAN_VARS` (single-OS scope) | recipe |
-| 2 | Amazon Linux `include_vars` override | scoped out (§9) | out of scope |
+| 2 | Amazon Linux `include_vars` override | scoped out (§8) | out of scope |
 | 3 | `set_fact: apache_packages` fallback | `role_settings()` `None` → `DEBIAN_PACKAGES` | covered |
 | 4 | `include_tasks: setup-Debian.yml` | deploy 1 | covered |
 | 5 | `command: apache2 -v` + `register` + `set_fact` version | `gather_action(Shell)` between runs + `parse_apache_version` | recipe |
@@ -215,7 +213,7 @@ shape change), **workaround** (possible with a recorded deviation).
 | # | Ansible task | reemote target | Status |
 | --- | --- | --- | --- |
 | 9 | `apt: update_cache=yes cache_valid_time=3600` | `apt.update(cache_valid_time=3600)` — gates on `AptUpdateStamp`, no-op inside the window | covered |
-| 10 | `apt: name={{ apache_packages }} state={{ apache_packages_state }}` | `apt.packages(packages=…, present=…, latest=…)` — `latest` gates on `AptUpgradable` (#13, closed) | covered |
+| 10 | `apt: name={{ apache_packages }} state={{ apache_packages_state }}` | `apt.packages(packages=…, present=…, latest=…)` — `latest` gates on `AptUpgradable` | covered |
 
 ### `tasks/configure-Debian.yml` → deploy 2 (every task notifies `restart apache`)
 
@@ -237,38 +235,7 @@ shape change), **workaround** (possible with a recorded deviation).
 | --- | --- | --- | --- |
 | 20 | `service: name=apache2 state={{ apache_restart_state }}` notified by 11–19 | `changed_hosts(report, notifying_names)` → `service_handler(action=…)` partitioned per host's `apache_restart_state` | recipe |
 
-## 6. Implementation gaps
-
-One genuine gap was proven (absence protocol: full surface enumeration +
-identifier greps, re-proved at report time), tracked as
-**[GAP-1 (#16)](https://github.com/kimjarvis/reemote/issues/16)** — now
-closed:
-
-### GAP-1 (#16) — `SimulatedHost` had no action transport seam (closed)
-
-- **What**: `Shell`/`Script` actions gathered with `gather_action` ride
-  `Host.run_shell_result` → `Host._run_shell` → real `asyncssh`.
-  `tests/simulated_host.py` provided `execute_command` (the command seam)
-  and the fact state seams, but no `_run_shell` override — so the version
-  probe could not be gathered offline.
-- **Class**: genuine *test-framework* gap (the real `Host` runs the probe
-  fine). **Rank**: feature-only — it blocked offline verification, never
-  the migration itself.
-- **Resolution**: `SimulatedHost` now overrides `_run_shell`, answering
-  `gather_action`'s `Shell`/`Script` gathers from a seeded `shell_results`
-  map (the exact shell string is the key; an unseeded command is a hard
-  `UnseededShellResult` error) and recording every shell in `ran_shells`.
-  The seam is proven in `tests/test_simulated_host.py`; the former
-  test-local `ApacheSimulatedHost` shim is retired — `seed()` plants the
-  canned `apache2 -v` record and the exactly-once assertions read
-  `ran_shells`.
-
-Everything else mapped to a covered operation or a documented recipe; the
-non-gaps considered and rejected during the audit (symlink `mode`, `no_log`,
-the Jinja2 dependency, `lineinfile`, `state=absent` via `files.link`) are
-recorded as deviations below, not gaps.
-
-## 7. Deliberate deviations from Ansible semantics
+## 6. Deliberate deviations from Ansible semantics
 
 - **D1 — OS dispatch frozen.** `include_vars` per OS family becomes module
   constants (`DEBIAN_VARS`, `DEBIAN_PACKAGES`); the 2.2/2.4 tables are still
@@ -312,7 +279,7 @@ recorded as deviations below, not gaps.
   and then runs the configure tasks anyway. The migration is faithful to
   that (unusual) shape rather than silently improving it.
 
-## 8. Offline verification
+## 7. Offline verification
 
 `tests/test_roles_ansible_role_apache.py` imports the example by path (its
 file name is not a valid module identifier), never calls its `main()`, and
@@ -336,32 +303,16 @@ pass 2 observes pass 1). It proves:
   ports items) are unit-tested directly.
 
 The version probe runs offline through the first-class `SimulatedHost`
-action seam (#16): `seed()` plants the canned `apache2 -v` record in
+action seam: `seed()` plants the canned `apache2 -v` record in
 `shell_results`; the remaining seeding choices are documented in the test
 docstring.
 
-## 9. Scoped out
+## 8. Scoped out
 
 - The RHEL/CentOS, SLES, Solaris and Amazon Linux branches (`setup-RedHat`,
   `configure-RedHat`, `setup-Suse`, `configure-Suse`, `setup-Solaris`,
   `configure-Solaris`, the Amazon `include_vars` override) — a Phase 0
-  single-OS decision, not a library gap.
+  single-OS decision.
 - `apache_enablerepo` (RHEL-only; D9).
 - Ansible check mode as an in-deploy concept (D6) — reemote's `dry=True`
   covers the use case.
-
-## 10. Second pass
-
-Done. The [GAP-1 (#16)](https://github.com/kimjarvis/reemote/issues/16)
-resolution landed:
-
-1. the test-local `ApacheSimulatedHost` shim in
-   `tests/test_roles_ansible_role_apache.py` is replaced by the first-class
-   `SimulatedHost` action seam (`seed()` plants the canned `apache2 -v`
-   record in `shell_results`);
-2. the `GAP-1` markers are gone from the test and from the program's
-   `main()` comment and module docstring;
-3. the gates were re-run: `uv run pytest tests/ -q`, `uv run ruff check .`,
-   and the two-pass no-op proof.
-
-No program behaviour changed — the gap was test-framework-only.

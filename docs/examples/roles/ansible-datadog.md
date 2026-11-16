@@ -6,7 +6,7 @@
 | Program | [`ansible-datadog.py`](https://github.com/kimjarvis/reemote/blob/main/examples/roles/ansible-datadog/ansible-datadog.py) |
 | Target | **Ubuntu** — hosts in the inventory group `"ubuntu"` |
 | Inventory | [`inventory.json`](https://github.com/kimjarvis/reemote/blob/main/inventory.json) at the project root |
-| Scope | the role's Debian/Ubuntu **default path** (see [§9](#9-scoped-out)) |
+| Scope | the role's Debian/Ubuntu **default path** (see [§8](#8-scoped-out)) |
 | Offline test | [`tests/test_roles_ansible_datadog.py`](https://github.com/kimjarvis/reemote/blob/main/tests/test_roles_ansible_datadog.py) |
 
 This program installs and configures the Datadog Agent the way the Ansible role
@@ -150,7 +150,7 @@ restart datadog-agent: ['ubuntu']
 Each deploy is **previewed then applied** in the same invocation: `run(..., dry=True)`
 stops after the prepare phase (Ansible's `--check` as a return value) and prints
 `format_plan`, then the real `run` prints `format_log`. There is no dry-run-only
-flag — for a rehearsal that touches nothing, use the offline test ([§8](#8-offline-verification)).
+flag — for a rehearsal that touches nothing, use the offline test ([§7](#7-offline-verification)).
 
 **Run it twice.** The second invocation must report `0 changed request(s)` and an
 empty handler notification set. That is the migration's idempotence claim, and it
@@ -240,7 +240,7 @@ fetch_keys(5 URLs)                                                        (contr
 │                                agent repo, custom-file removal (each apt.repo update_cache=True)
 │
 ├─ run 4  deploy_agent           datadog-agent (pinned or latest), datadog-signing-keys
-│                                (latest=True directly — GAP-3 closed by #13)
+│                                (latest=True directly)
 │
 ├─ gather: SystemdUnitFiles, SystemdServiceState(datadog-agent-exp.service)
 │          + render every template control-side      ← the role's service_facts
@@ -276,8 +276,7 @@ serves the dry run and the real run alike.
 ## 5. Coverage table
 
 Status vocabulary: **covered** (direct operation) · **recipe** (documented shape
-change) · **workaround** (possible with a deviation) · **GAP** (library gap, ticket
-filed) · **out** (scoped out).
+change) · **workaround** (possible with a deviation) · **out** (scoped out).
 
 ### `tasks/main.yml`
 
@@ -316,18 +315,18 @@ filed) · **out** (scoped out).
 | Install `apt-transport-https` / `gnupg` (`update_cache: true`) | `apt.packages(update=True, cache_valid_time=3600)` × 2 | covered (D5) |
 | Check if keyring exists with correct mode (`stat`) | folded into `files.file(present=True, mode, user, group)` — content/attr idempotence needs no probe | recipe |
 | Ensure keyring exists (`file state=touch mode=0644 root:root`) | `files.file(present=True, mode="0644", user="root", group="root")` | workaround (D6) |
-| Install apt keys from default URLs (5 × `_apt-key-import.yml`) | `fetch_keys()` control-side + **five** `gpg.import_key(src=stream, dest=USR_SHARE_KEYRING, keyid=fingerprint)` requests | covered (GAP-1 closed by [#11](https://github.com/kimjarvis/reemote/issues/11)) |
+| Install apt keys from default URLs (5 × `_apt-key-import.yml`) | `fetch_keys()` control-side + **five** `gpg.import_key(src=stream, dest=USR_SHARE_KEYRING, keyid=fingerprint)` requests | covered |
 | Install apt keys from custom URL (`datadog_apt_key_url_new`) | — | out |
 | Copy keyring to `trusted.gpg.d` (Debian < 9 / Ubuntu < 16) | — | out |
-| Deprecate non-https / non-`signed-by` repositories (6 × `apt_repository state=absent`, **no filename**, `update_cache: true`) | six `apt.repo(present=False, update_cache=True)` requests, **no filename** — the operation consults the `AptSource` filename provenance and removes the line from every file that holds it | covered (GAP-5 closed by [#15](https://github.com/kimjarvis/reemote/issues/15)) |
-| Ensure Datadog repository is up-to-date (`with_dict {6,7}`, `filename=ansible_datadog_<major>`) | `apt.repo(src=AGENT_REPOS[major], present=(major == chosen), filename=…, update_cache=True)` × 2 | covered (GAP-4 closed by [#14](https://github.com/kimjarvis/reemote/issues/14)) |
+| Deprecate non-https / non-`signed-by` repositories (6 × `apt_repository state=absent`, **no filename**, `update_cache: true`) | six `apt.repo(present=False, update_cache=True)` requests, **no filename** — the operation consults the `AptSource` filename provenance and removes the line from every file that holds it | covered |
+| Ensure Datadog repository is up-to-date (`with_dict {6,7}`, `filename=ansible_datadog_<major>`) | `apt.repo(src=AGENT_REPOS[major], present=(major == chosen), filename=…, update_cache=True)` × 2 | covered |
 | Custom repo: init flag / `stat` / `slurp` / compare | — | out (`datadog_apt_repo` rejected) |
 | (Custom) Remove Datadog custom repository file | `files.file(CUSTOM_REPO_FILE, present=False)` — the `datadog_apt_repo | length == 0` half | covered |
 | (Custom) Ensure Datadog repository is up-to-date | — | out |
 | `install-pinned.yml` | `apt.packages(packages=("<flavor>=<pin>",), allow_downgrades=…, update=True, cache_valid_time=…)` | covered |
-| `install-latest.yml` | `apt.packages(packages=(flavor,), latest=True, …)` in `deploy_agent` — the operation gates upgrades on its own `AptUpgradable` read | covered (GAP-3 closed by [#13](https://github.com/kimjarvis/reemote/issues/13)) |
-| Install latest `datadog-signing-keys` (`state=latest`, no `update_cache`) | `apt.packages(latest=True)` | covered (GAP-3 closed) |
-| `update_cache: true` on every `apt_repository` | `update_cache=True` on each `apt.repo` request — the operation yields `apt-get update` after a real sources change | covered (GAP-4 closed by [#14](https://github.com/kimjarvis/reemote/issues/14)) |
+| `install-latest.yml` | `apt.packages(packages=(flavor,), latest=True, …)` in `deploy_agent` — the operation gates upgrades on its own `AptUpgradable` read | covered |
+| Install latest `datadog-signing-keys` (`state=latest`, no `update_cache`) | `apt.packages(latest=True)` | covered |
+| `update_cache: true` on every `apt_repository` | `update_cache=True` on each `apt.repo` request — the operation yields `apt-get update` after a real sources change | covered |
 
 ### `tasks/_apt-key-import.yml` (the 5-key loop)
 
@@ -337,7 +336,7 @@ filed) · **out** (scoped out).
 | tempfile + `get_url force=true mode=600` | `fetch_keys()` control-side (`urllib`) | recipe (D7) |
 | `cat … \| gpg --dearmor` | not needed — `gpg --import` reads armored input natively | recipe |
 | export the single key / `copy` for CURRENT | not needed — each URL's body imports as-is; CURRENT is fingerprint-pinned (D7) | recipe |
-| `cat single.gpg \| gpg --no-default-keyring --keyring … --import --batch` | `gpg.import_key(dest=USR_SHARE_KEYRING)` — **additive merge**, keys already in the file stay | covered (GAP-1 closed) |
+| `cat single.gpg \| gpg --no-default-keyring --keyring … --import --batch` | `gpg.import_key(dest=USR_SHARE_KEYRING)` — **additive merge**, keys already in the file stay | covered |
 | remove tempdir | nothing to clean — no host-side tempdir is created | covered |
 
 ### `tasks/agent-linux.yml` → deploy 5
@@ -351,7 +350,7 @@ filed) · **out** (scoped out).
 | Include configuration setup tasks | `_agent-linux-macos-shared.yml` → deploy 5 | covered |
 | Set system probe installed | `"datadog-agent-sysprobe.service" in units` | covered |
 | Set system probe enabled (4 version-gated blocks) | `sysprobe_is_enabled()` — the intended `(any enabled flag or other config) and installed` | workaround (D8, D9) |
-| Create system-probe configuration file (`0640 root:dd-agent`, notify) | `render_system_probe_yaml()` + `files.install`, named | covered (GAP-2 closed) |
+| Create system-probe configuration file (`0640 root:dd-agent`, notify) | `render_system_probe_yaml()` + `files.install`, named | covered |
 | Remove system-probe configuration file | `files.file(present=False)`, named | covered |
 | Ensure `datadog-agent` is running | `systemd.service(running=True, enabled=True)` gated on enabled ∧ exp not running ∧ unit exists | covered |
 | Ensure `datadog-agent-sysprobe` is running | `systemd.service(...)` gated on enabled ∧ sysprobe_enabled ∧ unit exists | covered |
@@ -365,11 +364,11 @@ filed) · **out** (scoped out).
 | Ansible task | reemote target | Status |
 | --- | --- | --- |
 | Create Datadog agent config directory (`0755`) | `files.directory(mode="0755", user, group)` | covered |
-| Create main Datadog agent configuration file (`0640`, notify) | `render_datadog_yaml()` + `files.install`, named | covered (GAP-2 closed) |
+| Create main Datadog agent configuration file (`0640`, notify) | `render_datadog_yaml()` + `files.install`, named | covered |
 | Register all check configs (`find`, gated on untracked **or** default) | `gather_fact(FindFiles, CONF_D, fname="conf.yaml*", maxdepth=2)` between runs 5 and 6, gated on **all three** flags | recipe (D10) |
 | Delete checks not in tracked / all default / all example (3 loops, notify) | `files.file(present=False)` per stale path, named, in deploy 6 | recipe (D11) |
 | Ensure configuration directories per check (`0755`) | `files.directory` per check | covered |
-| Create a configuration file per check (`checks.yaml.j2`, `0640`, notify) | `render_check_yaml()` + `files.install`, named | covered (GAP-2 closed) |
+| Create a configuration file per check (`checks.yaml.j2`, `0640`, notify) | `render_check_yaml()` + `files.install`, named | covered |
 | Remove old configuration file per check (`conf.d/<check>.yaml`, notify) | `files.file(present=False)`, named | covered |
 | Create custom check file per custom check (`copy`, `0755`, notify) | controller-side `Path.read_text()` + `files.install(content=…)`, named | recipe (D12) |
 | Create installation information file (`install_info.j2`, `0644`) | `render_install_info()` + `files.install` — **`tool: reemote`** | covered (D13) |
@@ -392,67 +391,7 @@ each handler's own `when:`.
 
 ---
 
-## 6. Implementation gaps
-
-Five genuine library gaps were proven (full module surface enumerated, then
-corroborated by identifier greps), classified and ranked. **All five are
-bridgeable, so the migration completes.** All five have since been closed by
-#11, #12, #13, #14 and #15 and their workarounds removed from the program
-([§10](#10-second-pass)).
-Each gap was marked `GAP-n (#issue)` at its point of use in the program, and each
-ticket carries the evidence, the workaround, the acceptance criteria and the
-second-pass plan.
-
-| Gap | Ticket | Rank | Workaround | Deviation it costs |
-| --- | --- | --- | --- | --- |
-| **G1** `gpg.import_key` had no `dest`/`keyring` — **closed** | [#11](https://github.com/kimjarvis/reemote/issues/11) | core | none left — five additive `gpg.import_key(dest=USR_SHARE_KEYRING, keyid=…)` requests | none left; the retired bundle workaround overwrote the whole file, left CURRENT unpinned and failed all five on one bad URL |
-| **G2** `files.install` read the destination back **unprivileged**, so `0640` service-owned files re-installed every deploy — **closed** | [#12](https://github.com/kimjarvis/reemote/issues/12) | core | none left — `FileContents` re-reads a present-but-unreadable file elevated (`run_shell_privileged`), so `install`/`transform`/`download` converge on service-owned configs | none left; the retired workaround added the login user to `dd-agent` in an earlier run — an extra privileged change the role never makes, widening API-key readability |
-| **G3** `apt.packages(latest=True)` upgraded unconditionally — non-idempotent — **closed** | [#13](https://github.com/kimjarvis/reemote/issues/13) | core | none left — `deploy_agent` passes `latest=True` directly; the operation gates the upgrade set on its own in-namespace `AptUpgradable` read | none left; the retired workaround froze the decision from pre-state, so a candidate appearing between gather and apply waited for the next run |
-| **G4** `apt.repo` had no `update_cache` (`**kwargs` absorbed it silently) — **closed** | [#14](https://github.com/kimjarvis/reemote/issues/14) | core (ordering) | none left — each `apt.repo` request carries `update_cache=True`, so the operation yields `apt-get update` after a real sources change and nothing on a no-op | none left; the retired workaround froze the refresh decision one barrier early and ran a whole-index `apt.update()` separate from the change |
-| **G5** `apt.repo` removal was file-scoped and `AptSources` discarded provenance — **closed** | [#15](https://github.com/kimjarvis/reemote/issues/15) | core for the deprecation path | none left — `AptSource` carries its `filename` and six global `apt.repo(present=False, update_cache=True)` requests remove each line wherever it lives | none left; the retired workaround kept a hand-written ERE in sync, fanned `6 × files` requests out, dropped deb822 / `.list.save` hits it could not edit, and added an extra barrier |
-
-Evidence highlights (line numbers in `src/reemote/modules/`):
-
-- **G1** — closed: `gpg/gpg.py` `import_key` now takes `dest` and renders
-  `gpg --batch --yes --no-default-keyring --keyring <dest> --import <spool>`
-  (additive), with idempotence decided against `GpgKeyrings` on the dest's parent
-  directory. `GpgKeyDeleteKeysCommand`'s `--no-default-keyring --keyring`
-  rendering was the in-repo precedent.
-- **G2** — closed: `files/files.py` `FileContents` now distinguishes *present but
-  unreadable* (the `cat` fails and prints an `UNREADABLE` marker) from absent and
-  empty, and `process` re-reads it with `run_shell_privileged(..., sudo=True)` —
-  elevation from the host's inventory `privilege`, no API change. `install`,
-  `transform` and `download` inherit the fix. The `SimulatedHost` seam gained a
-  mode-aware `login_can_read`, so the offline suite proves the fallback.
-- **G3** — closed: `apt/apt.py` `packages` now intersects the *installed ∧
-  unpinned* set with the `AptUpgradable` fact (read in-operation, only when
-  there are candidates), so `latest=True` upgrades only pending names and the
-  reason lists each `pkg -> candidate` jump. A converged host yields nothing.
-- **G4** — closed: `apt/apt.py` `repo`, `sources_file`, `key` and `ppa` now take
-  `update_cache` (plus `cache_valid_time` for Ansible spelling parity) and yield
-  `AptUpdateCommand` *after* the install on a real change; a no-op yields nothing.
-  `apt.packages(update=…)` was the in-repo precedent, `dnf/dnf.py`
-  `packages(update_cache=…)` the cross-namespace one.
-- **G5** — closed: `apt/apt.py` `AptSource` gained a `filename` field and
-  `AptSources.parse` now attaches the `#reemote-aptsource <path>` marker it used
-  to discard (the `DnfRepository.filename` precedent). `apt.repo(present=False)`
-  with no `filename` consults that provenance and edits *every* line-based file
-  holding the line (one upload+install pair each); a scoped removal that misses
-  now names the file the line really lives in, and a deb822-only match is a named
-  no-op. `apt.sources_file` compares repository identity ignoring `filename`.
-
-**Not ticketed** (deliberate boundaries, not gaps): no per-request `become_user`;
-`files.file(touch=True)` being stateless (it matches Ansible); the host-side
-`install.json` UUID (opt-in feature, scoped out).
-
-**A stale ticket:** [#9](https://github.com/kimjarvis/reemote/issues/9) ("apt
-`cache_valid_time` is dropped") is **factually wrong** — `AptUpdateStamp`
-(`apt.py` L1302-L1400) plus the gate at L2802-L2810 and the update prefix at
-L2635-L2650 implement it. This migration uses `cache_valid_time` successfully.
-
----
-
-## 7. Deliberate deviations from Ansible semantics
+## 6. Deliberate deviations from Ansible semantics
 
 Every one is recorded in a comment at its site in the program.
 
@@ -477,7 +416,7 @@ Every one is recorded in a comment at its site in the program.
 
 ---
 
-## 8. Offline verification
+## 7. Offline verification
 
 [`tests/test_roles_ansible_datadog.py`](https://github.com/kimjarvis/reemote/blob/main/tests/test_roles_ansible_datadog.py)
 imports the example by path and replays `main()` barrier-for-barrier against
@@ -515,7 +454,7 @@ inspect the plans, then run it again and confirm `0 changed request(s)`.
 
 ---
 
-## 9. Scoped out
+## 8. Scoped out
 
 Agreed in Phase 0: one target OS, the role's default path, opt-in branches excluded.
 
@@ -533,22 +472,3 @@ Agreed in Phase 0: one target OS, the role's default path, opt-in branches exclu
   cleanup half runs (remove the leftover `ansible_datadog_custom.list`).
 - **Debian < 9 / Ubuntu < 16** — the `copy remote_src` of the keyring into
   `trusted.gpg.d`. Both are far below any supported Ubuntu target.
-
----
-
-## 10. Second pass
-
-As the tickets land, the workarounds come out and the program gets closer to the
-role's own shape. #11, #12, #13, #14 and #15 have landed:
-
-| Ticket | What disappears from the program |
-| --- | --- |
-| [#11](https://github.com/kimjarvis/reemote/issues/11) — **done** | `fetch_key_bundle()`'s concatenation and the single-bundle `gpg.key` are gone: `fetch_keys()` keeps the five bodies separate and deploy 3 issues five additive `gpg.import_key(dest=…)` imports, CURRENT fingerprint-pinned |
-| [#12](https://github.com/kimjarvis/reemote/issues/12) — **done** | the login-user group-membership deploy is gone (and its deviation): `FileContents` re-reads unreadable files elevated, so the `0640` configs stay service-owned and converge. The eight-deploy sequence is now seven, with `datadog_additional_groups` folded into the configure deploy |
-| [#13](https://github.com/kimjarvis/reemote/issues/13) — **done** | the `AptUpgradable` gather, its snapshot and `build_agent` are gone: `deploy_agent` passes `latest=True` directly and the operation gates upgrades on its own fact read — one barrier fewer |
-| [#14](https://github.com/kimjarvis/reemote/issues/14) — **done** | `repository_snapshot`'s `needs_update` boolean, its `sources`/`repo_files` reads and the gated `apt.update` are gone: each `apt.repo` request carries `update_cache=True` and refreshes the index itself on a real change |
-| [#15](https://github.com/kimjarvis/reemote/issues/15) — **done** | `LEGACY_REPO_PATTERN`, `legacy_repo_targets()`, the `FindInFiles` gather and the per-file fan-out are gone: six global `apt.repo(present=False)` requests exactly as the role has them, the operation consulting the `AptSource` filename provenance itself |
-
-The offline test's between-pass bridges have shrunk accordingly: the simulated
-install retires a pending upgrade itself, so only the keyring fingerprints and
-the systemd unit table are bridged by hand.

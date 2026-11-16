@@ -17,15 +17,14 @@ handler.
 `"ubuntu"` execute the deploy; every request carries the static `when`
 guard `is_ubuntu`, so the other hosts in the shared `inventory.json`
 (Alpine, CentOS) are skipped without being contacted. The RedHat and
-Fedora branches are scoped out (see §9). The role's vars split only by OS
+Fedora branches are scoped out (see §8). The role's vars split only by OS
 family, so the single-OS scope collapses the `include_vars` dispatch to
 frozen module constants — no fact gather is needed: the template consumes
 only the static `nfs_exports` list.
 
 The migration is complete: every task on the Ubuntu default path maps to
-a covered operation or a documented recipe. **No implementation gap was
-proven** (§6) — nothing blocks the migration, no default-path feature was
-dropped, and no GitHub ticket was filed.
+a covered operation or a documented recipe; no default-path feature was
+dropped.
 
 ## 1. Prerequisites
 
@@ -109,7 +108,7 @@ The program:
    directories, the rendered `/etc/exports` content and the service gate
    (no gather — every input is static inventory data);
 4. runs the single deploy — `apt.packages` (with the folded cache
-   refresh, §7 D1), one `files.directory` per export directory, the
+   refresh, §6 D1), one `files.directory` per export directory, the
    exports install + mode/owner convergence, and the gated service
    start/enable;
 5. prints the deploy twice: the `dry=True` plan (Ansible's `--check` as a
@@ -130,7 +129,7 @@ uv run pytest tests/test_roles_ansible_role_nfs.py -q
 
 The test replays the program's whole orchestration against the test
 framework's `SimulatedHost` and proves plan → apply → **second apply is a
-no-op** with an empty handler set (§8).
+no-op** with an empty handler set (§7).
 
 ## 3. Role variables
 
@@ -149,7 +148,7 @@ Invalid values (a non-list `nfs_exports`, a non-string, empty or
 path-less entry) raise before any host is contacted — Ansible's
 `map('first')` on an empty split yields Undefined and fails the `file`
 task the same way. The `nfs_rpcbind_state` / `nfs_rpcbind_enabled`
-defaults are consumed only by `setup-RedHat.yml` and are scoped out (§9).
+defaults are consumed only by `setup-RedHat.yml` and are scoped out (§8).
 
 ## 4. Program shape: one deploy, one action gather
 
@@ -198,7 +197,7 @@ Two mapping decisions are load-bearing:
   `CommandError`. (The skill's non-systemd-handler guidance says to
   "yield your requests" from a hand-built handler deploy — impossible for
   a bare command; this gather is the faithful shape. Reported as skill
-  feedback, not a library gap: every piece is public API.)
+  feedback; every piece is public API.)
 - **The template task becomes two notifying requests.**
   `files.install`'s idempotence is content-only, so the paired
   `files.file` converges the `mode: 0644 owner: root group: root` the
@@ -217,8 +216,8 @@ shape change).
 | # | Ansible task | reemote target | Status |
 | --- | --- | --- | --- |
 | 1 | `include_vars: "{{ ansible_facts.os_family }}.yml"` | frozen `NFS_SERVER_DAEMON` / `NFS_PACKAGES` constants (Ubuntu is Debian-family; single-OS collapse, no gather) | recipe |
-| 2 | `include_vars: Fedora.yml` when RedHat+Fedora | scoped out (§9) | — |
-| 3 | `include_tasks: setup-RedHat.yml` when RedHat | scoped out (§9) | — |
+| 2 | `include_vars: Fedora.yml` when RedHat+Fedora | scoped out (§8) | — |
+| 3 | `include_tasks: setup-RedHat.yml` when RedHat | scoped out (§8) | — |
 | 4 | `include_tasks: setup-Debian.yml` when Debian | the Ubuntu path's install (row 8) | covered |
 | 5 | `file: path={{ item }} state=directory` over `nfs_exports \| map('split') \| map('first') \| unique` | `files.directory(path=dir)` per directory, mode deliberately unset (the role's ansible-lint noqa 208 exemption): create when absent, leave existing permissions untouched | covered |
 | 6 | `template: exports.j2 dest=/etc/exports owner=root group=root mode=0644 notify: reload nfs` | `render_exports` join + `files.install(mode="0644", user="root", group="root")` + `files.file` metadata companion; both notify | recipe |
@@ -228,7 +227,7 @@ shape change).
 
 | # | Ansible task | reemote target | Status |
 | --- | --- | --- | --- |
-| 8 | `apt: name=[nfs-common, nfs-kernel-server] state=present` | `apt.packages(packages=NFS_PACKAGES, sudo=True)` (+ folded cache refresh, §7 D1) | covered |
+| 8 | `apt: name=[nfs-common, nfs-kernel-server] state=present` | `apt.packages(packages=NFS_PACKAGES, sudo=True)` (+ folded cache refresh, §6 D1) | covered |
 
 ### `handlers/main.yml`
 
@@ -236,34 +235,7 @@ shape change).
 | --- | --- | --- | --- |
 | 9 | `reload nfs: command: 'exportfs -ra'` | `changed_hosts(report, NOTIFYING)` → `gather_action(Shell, command="exportfs -ra", sudo=True)` on notified hosts only (§4) | recipe |
 
-## 6. Implementation gaps
-
-**None.** Every task on the Ubuntu default path maps to a covered
-operation or a documented recipe:
-
-- `apt.packages` presence is fact-gated on `AptPackages` (name/version
-  match), and `update=True, cache_valid_time=600` is gated on the
-  `AptUpdateStamp` fact — Ansible's `apt` semantics directly.
-- `files.directory` with no mode creates a missing path (`mkdir -p`) and
-  leaves an existing directory alone — the role's mode-less
-  `state: directory` exactly.
-- `files.install` + the `files.file` metadata companion cover the
-  template task's content *and* owner/group/mode enforcement; the
-  two-tier `FileContents` read-back (#12, closed) is not even needed —
-  `/etc/exports` is world-readable `0644`.
-- `systemd.service` `running`/`enabled` are fact-gated, so a converged
-  host yields no `systemctl` command.
-- The command handler composes public API (`changed_hosts` +
-  `gather_action` + `Shell`); the offline test answers it through the
-  action transport seam (#16, closed).
-- The template needs no renderer dependency (§1.1).
-
-The library's one open gap, [#20](https://github.com/kimjarvis/reemote/issues/20)
-(no control-side HTTP content fetch for `uri` `return_content` parity),
-concerns a module this role never uses. **No GitHub ticket was filed for
-this migration**, and no `GAP-n` marker appears in the program.
-
-## 7. Deliberate deviations
+## 6. Deliberate deviations
 
 - **D1 — the apt cache refresh is folded into the install request.** The
   role's `apt` task carries no `update_cache`; the role's molecule
@@ -292,7 +264,7 @@ it runs the same command under the same condition. It is a deviation
 from the skill's suggested shape for non-systemd handlers, reported as
 guidance feedback.
 
-## 8. Offline verification
+## 7. Offline verification
 
 `tests/test_roles_ansible_role_nfs.py` imports the example by path and
 replays its orchestration barrier-for-barrier against persistent
@@ -312,13 +284,12 @@ drift convergence (install no-op, companion changes, handler queues),
 a failed `exportfs` raising `CommandError`, the skipped non-Ubuntu host,
 the dry preview's zero mutation, and the pure helpers' fail-fast gates.
 
-## 9. Scoped out
+## 8. Scoped out
 
 - **RedHat / CentOS / Fedora branches** (`setup-RedHat.yml`,
   `vars/RedHat.yml`, `vars/Fedora.yml`, the Fedora override include, and
   the `nfs_rpcbind_state` / `nfs_rpcbind_enabled` defaults they
   consume): a Phase 0 single-OS decision — the target is Ubuntu.
 
-None of these is an implementation gap — reemote's `dnf` and `systemd`
-modules cover the package/service operations they use; they are simply
-outside the agreed Ubuntu target.
+Reemote's `dnf` and `systemd` modules cover the package/service operations
+these branches use; they are simply outside the agreed Ubuntu target.
