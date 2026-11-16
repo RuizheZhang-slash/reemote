@@ -364,6 +364,21 @@ SNAPSHOT_ARGS = {
             "cli_ini": "/etc/php/8.3/cli/conf.d/20-xdebug.ini",
         }
     },
+    # The Drush role migration: one factory closing over the frozen launcher
+    # plan (the stat reads -- is_symlink/dest_exists -- already resolved). The
+    # absent-destination shape drains the directory + download requests.
+    (
+        "examples/roles/ansible-role-drush/ansible-role-drush.py",
+        "build_launcher",
+    ): lambda name: {
+        name: {
+            "path": "/usr/local/bin/drush",
+            "path_dir": "/usr/local/bin",
+            "phar_url": "https://github.com/drush-ops/drush-launcher/releases/download/0.10.1/drush.phar",
+            "is_symlink": False,
+            "dest_exists": False,
+        }
+    },
 }
 
 # Entrypoints that only behave inside a driver run. The in-deploy action guard
