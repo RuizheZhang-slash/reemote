@@ -943,6 +943,101 @@ twice to prove the second is a no-op — is the
   `/tmp` spool name avoids collisions, not a hostile local user — the same
   trade-off every spool-and-install operation makes.
 
+## Migrating an INI option edit (ini_file)
+
+Ansible sets one option in one section of an INI file with `ini_file` — the
+canonical case is a repository role's enable/disable toggle, where the
+RPM-shipped `/etc/yum.repos.d/epel.repo` carries three sections (`[epel]`,
+`[epel-debuginfo]`, `[epel-source]`), each with its own `enabled=` line, and
+only the `[epel]` one may flip. Every other section, option, comment and
+blank line must survive.
+
+reemote's answer is
+[`files.ini_option`][reemote.modules.files.files.ini_option]: pass `path`,
+`section`, `option` and `value`, and the operation reads the file with the
+[`FileContents`][reemote.modules.files.files.FileContents] fact, applies a
+pure section-scoped edit, and — only when the result differs — writes it
+back through the spool-and-install path it shares with
+[`files.install`][reemote.modules.files.files.install]. It is
+[`files.transform`][reemote.modules.files.files.transform] with the
+section-scoped edit built in: no transform to write, no factory to keep a
+fixpoint — the section, option and value are plain hashable strings, so the
+request is deterministic across phases by construction and a second
+identical request is a guaranteed no-op.
+
+Neither neighbour fits this shape. `dnf.repo` constructs a whole
+*single-section* `.repo` file from its arguments, so it would clobber the
+other sections; `files.edit` is line-scoped, so a bare `^enabled=` replace
+would also hit `[epel-debuginfo]`/`[epel-source]` (both ship `enabled=0`).
+
+### The mapping
+
+| Ansible | reemote |
+| --- | --- |
+| `ini_file: {path, section, option, value}` | `files.ini_option(path=…, section=…, option=…, value=…)` |
+| `no_extra_spaces: true` (`option=value`) | `no_extra_spaces=True` (the default renders `option = value`, Ansible's own default) |
+| `create: no` (fail on an absent file) | `create=False` (raises `ValueError`; the default creates the file holding just the section and option) |
+| a missing section or option | free: the option is inserted after the section's last non-blank line; a missing section is appended blank-line-separated at EOF |
+| `mode:` / `owner:` / `group:` | `mode=`/`user=`/`group=` forwarded to the install — applied on the write, content-only idempotence (a metadata-only drift is [`files.file`][reemote.modules.files.files.file]'s job) |
+| `state: absent` (remove an option/section) | deliberately unshipped — a `files.transform` drop-line transform owns removal |
+| `backup: yes` | dropped — the timestamped `cp` is non-deterministic across phases |
+| the module's own privilege escalation | `sudo=True` on the [`op(...)`][reemote.core.op]: the spool transfer stays unprivileged, only the install elevates |
+
+### Before / after
+
+```yaml
+# Ansible -------------------------------------------------------------
+# roles/repo-epel/tasks/main.yml
+- name: Ensure EPEL repo is enabled / disabled.
+  ini_file:
+    path: /etc/yum.repos.d/epel.repo
+    section: epel
+    option: enabled
+    value: "{{ epel_repo_disable | ternary(0, 1) }}"
+    no_extra_spaces: true
+    mode: "0644"
+```
+
+```python
+# reemote -------------------------------------------------------------
+from reemote import files, op
+
+EPEL_REPO_DISABLE = False   # the role's epel_repo_disable variable
+
+def configure_epel(host):
+    yield op(files.ini_option, name="Ensure EPEL repo is enabled / disabled",
+             path="/etc/yum.repos.d/epel.repo",
+             section="epel", option="enabled",
+             value="0" if EPEL_REPO_DISABLE else "1",
+             no_extra_spaces=True, mode="0644", sudo=True)
+```
+
+The `ternary` filter collapses to an ordinary Python conditional evaluated
+control-side, before the request is built — the value reaching the operation
+is a plain literal string, identical in both phases.
+
+The runnable version — the same option set twice to prove the second is a
+no-op — is the
+[`files.ini_option` example](examples/modules/files.md#setting-one-ini-option-in-a-root-owned-file-ansible-ini_file-parity).
+
+### What to watch
+
+- **The edit is line surgery, not a configparser round-trip.** A stdlib
+  `configparser` write drops comments, normalizes spacing and reorders
+  options; the operation instead rewrites only the one active option line
+  (`=` and `:` separators both recognized) and preserves everything else,
+  including the file's trailing-newline state.
+- **Matching is case-sensitive and first-occurrence-wins.** A section
+  duplicating an option edits its first active line; a commented
+  `# enabled=…` is not an option line.
+- **Idempotence is content-equality.** A line already rendered exactly as
+  requested (separator style included) is returned verbatim, so switching
+  `no_extra_spaces` between runs rewrites the line once, then converges.
+- **`sudo=True` elevates the install, not the transfer** — the same
+  two-privilege-level signature every spool-and-install operation carries,
+  and a file the login user cannot read is re-read elevated, so a
+  restrictive mode does not re-install every deploy.
+
 ## Migrating a URL download (get_url)
 
 Ansible pulls a file from a URL onto the target with `get_url` (a `url`, a

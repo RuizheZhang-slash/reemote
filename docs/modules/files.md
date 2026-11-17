@@ -35,6 +35,7 @@
         - file
         - flags
         - get
+        - ini_option
         - install
         - link
         - move
@@ -54,7 +55,7 @@ in a single source, so the read side (`FileLink`, `FileExists`,
 `FileFlags`, `FindFiles`, `FindDirectories`, `FindLinks`, `FindInFile`,
 `FindInFiles`, `FindFilesInfo`, `DirectoryEntries`)
 sits beside the `files.link`, `files.file`, `files.put`, `files.get`,
-`files.edit`, `files.install`, `files.transform`, `files.move`, `files.copy`, `files.directory`,
+`files.edit`, `files.install`, `files.transform`, `files.ini_option`, `files.move`, `files.copy`, `files.directory`,
 `files.unarchive`
 and `files.flags`
 operations that consume it.
@@ -229,7 +230,7 @@ leading `~/` stays unquoted so the remote shell expands it.
 
 Operations live in namespace modules so a deploy reads `files.link`,
 `files.file`, `files.put`, `files.get`, `files.edit`, `files.install`,
-`files.transform`,
+`files.transform`, `files.ini_option`,
 `files.move`,
 `files.copy`, `files.directory`, `files.unarchive` and `files.flags`,
 mirroring the baseline's
@@ -371,6 +372,35 @@ re-install — `files.file` converges metadata), and the read-back is install's
 too — a file the login user cannot read is re-read elevated, so a restrictive
 mode does not re-install every deploy. Editing under `/etc` needs root, so
 flag the request `sudo=True`; the spool transfer stays unprivileged regardless.
+
+`files.ini_option` is Ansible `ini_file` parity (issue #24): it sets one
+option in one section of a root-owned INI file, preserving every other
+section, option, comment and blank line. It is `files.transform` with the
+section-scoped edit built in — read `FileContents`, apply a pure helper that
+rewrites only the one active option line inside the named section (`=` and
+`:` separators both recognized, case-sensitive, first occurrence wins),
+inserts a missing option after the section's last non-blank line, or appends
+a missing section blank-line-separated at EOF — then delegate the write to
+`files.install` above. Neither neighbour fits the shape: `dnf.repo`
+constructs a whole *single-section* `.repo` file (it would clobber the
+RPM-shipped `epel.repo`'s `[epel-debuginfo]`/`[epel-source]` sections), and
+`files.edit` is line-scoped (a bare `^enabled=` replace would flip every
+section's `enabled` line). The edit is hand-rolled line surgery rather than a
+stdlib `configparser` round-trip on purpose: configparser drops comments,
+normalizes spacing and reorders options, breaking both preservation and
+content idempotence. A line already rendered exactly as requested returns
+the content verbatim, so the edit is a fixpoint and a second identical
+request reports no change; the file's trailing-newline state is preserved.
+`no_extra_spaces=True` renders `option=value` instead of Ansible's default
+`option = value`; `create=False` mirrors `ini_file`'s `create: no` (an absent
+file raises `ValueError` instead of being created). Deliberately unshipped:
+`state: absent` removal (a `files.transform` drop-line transform owns it),
+`allow_no_value`, `backup` (non-deterministic, the project-wide drop) and
+interpolation (values are literal text). `mode`/`user`/`group`/`validate`
+forward straight to the install and idempotence stays content-only, exactly
+as for `files.transform`; flag the request `sudo=True` for `/etc` targets.
+See [Migrating an INI option edit](../migrating.md#migrating-an-ini-option-edit-ini_file)
+for the `ini_file` mapping.
 
 `files.download` is the general download-to-path operation and a reemote
 original: it takes an `http(s)` `url` and lands its body at a (root-owned)

@@ -349,6 +349,31 @@ the same deploy again to show every request reporting no change.
     options:
       members: []
 
+## Setting one INI option in a root-owned file (Ansible ini_file parity)
+
+`files.ini_option` (Ansible `ini_file` parity, issue #24) sets one option in
+one section of an INI file, preserving every other section, option, comment
+and blank line — the shape a repository role's enable/disable toggle needs,
+where the RPM-shipped `epel.repo`'s three sections each carry their own
+`enabled=` line and only `[epel]`'s may flip. It is `files.transform` with
+the section-scoped edit built in: read `FileContents`, rewrite the one active
+option line inside the named section (or insert a missing option / append a
+missing section), and delegate the write to `files.install` — unprivileged
+scp spool plus elevated `sh -c` install. No transform to write and no factory
+to keep a fixpoint: the section, option and value are plain hashable strings,
+and a line already rendered exactly as requested is returned verbatim, so
+the second identical request is a guaranteed no-op. `no_extra_spaces=True`
+renders `enabled=1` (the repo-file style); `mode`/`user`/`group`/`validate`
+forward to the install and idempotence stays content-only. See
+[Migrating an INI option edit](../../migrating.md#migrating-an-ini-option-edit-ini_file)
+for the `ini_file` mapping. The script sets the same option in a demo INI
+under `/etc` with `sudo=True` twice, then runs the same deploy again to show
+every request reporting no change.
+
+::: files_ini_option
+    options:
+      members: []
+
 ## Downloading a URL to a root-owned path
 
 `files.download` (a reemote original) is the general download-to-path operation

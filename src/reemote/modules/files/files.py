@@ -3082,6 +3082,193 @@ async def transform(
         yield command
 
 
+def _ini_set_option(
+    current: str | None,
+    section: str,
+    option: str,
+    value: str,
+    no_extra_spaces: bool,
+    create: bool,
+) -> str:
+    """Pure section-scoped INI edit behind ``ini_option`` (no host contact)."""
+    if not section.strip() or any(c in section for c in "[]\r\n"):
+        raise ValueError(f"Invalid INI section name: {section!r}")
+    if not option.strip() or any(c in option for c in "=:[]\r\n"):
+        raise ValueError(f"Invalid INI option name: {option!r}")
+    if any(c in value for c in "\r\n"):
+        raise ValueError(f"Invalid INI value: {value!r} (a single line expected)")
+    rendered = f"{option}={value}" if no_extra_spaces else f"{option} = {value}"
+    if current is None:
+        if not create:
+            raise ValueError(
+                f"INI file is absent and create=False: cannot set "
+                f"[{section}] {option}"
+            )
+        return f"[{section}]\n{rendered}\n"
+
+    lines = current.splitlines()
+    trailing_newline = "\n" if current.endswith("\n") else ""
+    header = re.compile(r"^\s*\[([^]]+)\]\s*(?:[;#].*)?$")
+    key = re.compile(r"^\s*([^=:]+?)\s*[:=]")
+
+    # Locate the section's bounds: its header line, then the next header
+    # (any section) or EOF. Everything outside stays untouched.
+    start: int | None = None
+    end = len(lines)
+    for index, line in enumerate(lines):
+        match = header.match(line)
+        if match is None:
+            continue
+        if start is not None:
+            end = index
+            break
+        if match.group(1).strip() == section:
+            start = index
+
+    if start is None:
+        # Missing section: append it (blank-line separated, configparser's
+        # own section spacing) with the option as its first line.
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend((f"[{section}]", rendered))
+        return "\n".join(lines) + "\n"
+
+    # An active option line inside the section: not a comment/blank, keyed
+    # by the text before the first '=' or ':' (configparser's separators).
+    for index in range(start + 1, end):
+        stripped = lines[index].strip()
+        if not stripped or stripped[0] in "#;":
+            continue
+        match = key.match(lines[index])
+        if match is not None and match.group(1) == option:
+            if lines[index] == rendered:
+                return current
+            lines[index] = rendered
+            return "\n".join(lines) + trailing_newline
+
+    # Missing option: insert after the section's last non-blank line, so
+    # the blank lines separating it from the next section stay in place.
+    insert = end
+    while insert > start + 1 and not lines[insert - 1].strip():
+        insert -= 1
+    lines.insert(insert, rendered)
+    return "\n".join(lines) + trailing_newline
+
+
+async def ini_option(
+    ctx: OpContext,
+    path: str,
+    section: str,
+    option: str,
+    value: str,
+    no_extra_spaces: bool = False,
+    create: bool = True,
+    mode: str = "0644",
+    user: str | None = None,
+    group: str | None = None,
+    validate: str | None = None,
+    **kwargs: Any,
+) -> AsyncGenerator[Command]:
+    """Set one option in one section of a root-owned INI file.
+
+    Args:
+        ctx (OpContext): Execution context for the operation.
+        path (str): The remote INI file to edit (eg ``/etc/yum.repos.d/epel.repo``).
+        section (str): The section holding the option, without brackets
+            (eg ``"epel"``). Appended as a new section when missing.
+        option (str): The option name to set (eg ``"enabled"``). Inserted
+            into the section when missing.
+        value (str): The option's desired value as text (eg ``"1"``).
+        no_extra_spaces (bool, optional): Render the line as ``option=value``
+            instead of ``option = value``. Defaults to False.
+        create (bool, optional): Create the file (holding just the section
+            and option) when it is absent; when False an absent file raises
+            ``ValueError``. Defaults to True.
+        mode (str, optional): The installed file's permissions as octal-digit
+            text (``"0644"``, ``"600"``). Defaults to "0644".
+        user (str | None, optional): The user to own the file after the
+            install. Defaults to None (leaves the file's owner unchanged).
+        group (str | None, optional): The group to own the file after the
+            install. Defaults to None (leaves the file's group unchanged).
+        validate (str | None, optional): A command template run on the spooled
+            ``/tmp`` file between the transfer and the install, forwarded
+            straight to ``files.install``; a non-zero exit aborts the install
+            and leaves the file untouched. The ``{spool}``/``{dest}``
+            placeholders are substituted with the shell-quoted paths.
+            Defaults to None (no validation).
+        **kwargs: Additional keyword arguments.
+
+    Yields:
+        Command: The spool transfer and the elevated install command, when the
+            edited content differs from the file's current text.
+
+    **Raises:**
+
+    ```python
+    CommandNotFoundError, HostConnectionError, ValueError
+    ```
+
+    Examples:
+        Examples can be found in ``examples/modules/files/files_ini_option.py``.
+    """
+
+    # Ansible ``ini_file`` parity: one option in one section, preserving every
+    # other section, option, comment and blank line. Neither neighbour fits
+    # that shape: ``dnf.repo`` constructs a whole SINGLE-section ``.repo`` file
+    # from its arguments (it would clobber the RPM-shipped ``epel.repo``'s
+    # ``[epel-debuginfo]``/``[epel-source]`` sections), and ``files.edit`` is
+    # line-scoped -- a bare ``^enabled=`` replace would also hit the other
+    # sections' ``enabled=0`` lines. This operation is ``files.transform`` with
+    # the section-scoped edit built in: read the file's text with the
+    # ``FileContents`` fact, apply the pure ``_ini_set_option`` helper, and
+    # delegate the write to ``files.install`` (spool over unprivileged scp to a
+    # dest-derived ``/tmp`` path, then an elevated ``sh -c`` install), so one
+    # ``sudo=True`` request converges a root-owned config in ONE deploy.
+    #
+    # The edit is hand-rolled line surgery rather than a stdlib
+    # ``configparser`` round-trip on purpose: configparser rewrites the whole
+    # file (comments dropped, spacing normalized, options reordered), which
+    # breaks both the preservation contract and content idempotence. The
+    # helper rewrites only the one active option line (``=`` and ``:``
+    # separators both recognized, matching is case-sensitive, the first
+    # occurrence wins when a section duplicates an option), inserts a missing
+    # option after the section's last non-blank line, and appends a missing
+    # section blank-line-separated at EOF. A line already rendered exactly as
+    # requested returns the content verbatim, so the edit is a fixpoint and
+    # install's content comparison reports no change on the second request.
+    # The file's trailing-newline state is preserved.
+    #
+    # ``no_extra_spaces`` and ``create`` are Ansible's own option names and
+    # defaults (``ini_file`` renders ``option = value`` unless
+    # ``no_extra_spaces: true``, and creates an absent file unless
+    # ``create: no``). Deliberately unshipped: ``state: absent`` removal (a
+    # ``files.transform`` drop-line transform owns it), ``allow_no_value``,
+    # ``backup`` (non-deterministic, the project-wide drop) and interpolation
+    # (values are literal text). ``mode``/``user``/``group``/``validate`` ride
+    # install's contract: applied on every write, but idempotence is
+    # content-only -- a mode- or owner-only drift does not re-install (use
+    # ``files.file`` to converge metadata). The read-back is install's too: a
+    # file the login user cannot read is re-read elevated, so a restrictive
+    # mode does not re-install every deploy. ``/etc`` targets are root-owned,
+    # so flag the request ``sudo=True`` (or ``su=True``); the run-as user and
+    # any password come from the inventory ``privilege`` data, never the
+    # operation. ``**kwargs`` absorbs any further global arguments (``op()``
+    # already strips ``name``/``sudo``/``su``).
+    current = await ctx.facts.get(FileContents, path)
+    new = _ini_set_option(current, section, option, value, no_extra_spaces, create)
+    async for command in install(
+        ctx,
+        new,
+        path,
+        mode=mode,
+        user=user,
+        group=group,
+        validate=validate,
+        **kwargs,
+    ):
+        yield command
+
+
 def _fetch_url_bytes(url: str) -> bytes:
     """Fetch an ``http(s)`` ``url`` control-side and return its body bytes.
 
@@ -4386,6 +4573,7 @@ __all__ = [
     "file",
     "flags",
     "get",
+    "ini_option",
     "install",
     "link",
     "move",
