@@ -19,7 +19,7 @@
 # name/version (``RpmPackageInfo``) of a ``.rpm`` file or an
 # installed package that ``dnf.rpm`` reads to decide idempotence, and
 # ``RpmGpgKeys``, the GPG keys imported into the rpm keyring (``RpmGpgKey``
-# entries) that ``dnf.key``'s removal direction reads. Like every
+# entries) that both ``dnf.key`` directions read. Like every
 # fact they are phase-unaware: each ``process`` coroutine just gathers the raw
 # value.
 #
@@ -69,12 +69,16 @@
 # ``dnf.rpm`` (``src``, ``present``) installs a ``.rpm``
 # file already on the target host; a URL source -- which downloads the
 # file mid-deploy -- is dropped for the same reason, so a URL ``src`` raises
-# ``ValueError``. ``dnf.key`` is non-idempotent and
-# takes the GPG key content as an IO-like *stream* -- reemote has no
-# controller-side file locations -- spooling it to a ``/tmp`` path over scp and
-# running an elevated ``rpm --import`` on it, so a ``str`` ``src`` raises
-# ``ValueError``. ``dnf.key``'s ``present=False`` direction is a reemote
-# extension (import alone would not cover removal), mirroring
+# ``ValueError``. ``dnf.key`` takes the GPG key content as an IO-like
+# *stream* -- reemote has no controller-side file locations -- spooling it to
+# a ``/tmp`` path over scp and running an elevated ``rpm --import`` on it, so
+# a ``str`` ``src`` raises ``ValueError``. The import direction is idempotent
+# when ``keyid`` names the key (the ``gpg.import_key`` precedent, Ansible's
+# ``rpm_key state=present`` parity): it reads ``RpmGpgKeys`` and skips the
+# upload/import pair when a matching ``gpg-pubkey`` entry is already
+# imported; without ``keyid`` it stays stateless (the stream's key id is
+# unknown controller-side). ``dnf.key``'s ``present=False`` direction is a
+# reemote extension (import alone would not cover removal), mirroring
 # Ansible's ``rpm_key state=absent``: it reads ``RpmGpgKeys`` and erases the
 # named key's ``gpg-pubkey`` pseudo-package with an elevated ``rpm -e`` only
 # when the key is present. ``dnf.update`` is non-idempotent:
@@ -1086,7 +1090,7 @@ class RpmGpgKeys:
     """
 
     # A reemote-original fact (there is no other rpm-keyring fact): it fills the
-    # observation gap ``dnf.key``'s ``present=False`` direction needs.
+    # observation gap both ``dnf.key`` directions need.
     # ``rpm --import`` stores each key in the rpm database as a
     # ``gpg-pubkey-<keyid>-<release>`` pseudo-package -- invisible to
     # ``dnf list installed`` and to the ``gpg`` namespace's keyring facts --
@@ -2235,20 +2239,23 @@ async def key(
             a file opened with ``open()``, ...), rewound to position 0 before
             it is read. Required when ``present=True``; rejected when
             ``present=False``. Defaults to None.
-        keyid (str | None, optional): The key to remove when ``present=False``:
-            8 hex digits (rpm's short key id) or 16 (the long form, matched by
-            its last 8 digits), case-insensitive. Required when
-            ``present=False``, ignored when ``present=True``. Defaults to None.
+        keyid (str | None, optional): 8 hex digits (rpm's short key id) or 16
+            (the long form, matched by its last 8 digits), case-insensitive.
+            Required when ``present=False``, naming the key to remove.
+            Optional when ``present=True``, where it makes the import
+            idempotent: a key already in the rpm keyring is not re-imported
+            (the ``gpg.import_key`` precedent); without it the import always
+            runs. Defaults to None.
         present (bool, optional): ``True`` imports ``src`` into the rpm
             keyring; ``False`` removes the key ``keyid`` names from it.
             Defaults to True.
         **kwargs: Additional keyword arguments.
 
     Yields:
-        Command: The key transfer and import commands, always, when
-            ``present=True`` (that direction is stateless); the removal
-            command only when ``present=False`` and the key is in the rpm
-            keyring.
+        Command: The key transfer and import commands when ``present=True``
+            and the key is not already imported (always, when no ``keyid``
+            is given); the removal command only when ``present=False`` and
+            the key is in the rpm keyring.
 
     **Raises:**
 
@@ -2262,13 +2269,18 @@ async def key(
 
     # ``dnf.key`` -- import direction.
     #
-    # The ``present=True`` direction is
-    # **non-idempotent**: it always imports, so it always reports a change and
-    # yields its commands on every run (rpm itself deduplicates an
-    # already-imported key). It yields *two* descriptors from the one request
-    # -- a ``DnfKeyUploadCommand`` transfer that spools the stream to a
-    # ``/tmp`` path over scp, then a ``DnfKeyImportCommand`` running the
-    # elevated ``rpm --import`` on that spool file and removing it. Because
+    # The ``present=True`` direction is idempotent when ``keyid`` names the
+    # key (the ``gpg.import_key`` keyid-gating precedent, Ansible's
+    # ``rpm_key state=present`` parity): the same-namespace ``RpmGpgKeys``
+    # fact reports the imported keys, and a matching entry short-circuits to
+    # a no-op. Without ``keyid`` it stays **stateless** -- the stream's key
+    # id is unknown controller-side (reading it would mean parsing OpenPGP
+    # packets) -- so it always imports and always reports a change (rpm
+    # itself deduplicates an already-imported key). It yields *two*
+    # descriptors from the one request -- a ``DnfKeyUploadCommand`` transfer
+    # that spools the stream to a ``/tmp`` path over scp, then a
+    # ``DnfKeyImportCommand`` running the elevated ``rpm --import`` on that
+    # spool file and removing it. Because
     # the import needs root, flag the request ``sudo=True`` (or ``su=True``);
     # the transfer stays unprivileged regardless (transfers ride the
     # connection as the login user), so the two commands of one request run at
@@ -2308,6 +2320,18 @@ async def key(
                 "IO streams, not controller-side file locations); pass the "
                 f"key content as an IO-like object, got: {src!r}"
             )
+        if keyid and keyid.strip():
+            # The keyid gate: same normalization as the removal direction --
+            # rpm stores the short id lowercased, and a 16-digit long form
+            # matches by its last 8 digits. Anything else matches no entry
+            # and the import proceeds.
+            wanted = keyid.strip().lower()
+            if len(wanted) == 16:
+                wanted = wanted[-8:]
+            keys = await ctx.facts.get(RpmGpgKeys)
+            if any(entry["keyid"] == wanted for entry in keys):
+                ctx.reason = f"GPG key {wanted} already in the rpm keyring"
+                return
         ctx.changed = True
         ctx.reason = f"import GPG key from {getattr(src, 'name', '<stream>')}"
         spool = _key_spool_path()

@@ -62,7 +62,8 @@
 # of the baseline's ``apt.key``: a GPG key stream is spooled over scp and
 # installed as a keyring file for ``signed-by=`` references, dearmored on
 # the target when the content is ASCII-armored; it is deliberately
-# non-idempotent (always installs, like ``dnf.key``), and the baseline's
+# non-idempotent (always installs, like a ``dnf.key`` import without
+# ``keyid``), and the baseline's
 # ``keyserver``/``keyid`` fetch and ``present=False`` removal are dropped.
 # ``apt.mark`` is a reemote original -- the baseline ships no operation managing
 # package hold states -- holding packages back from upgrades (or releasing

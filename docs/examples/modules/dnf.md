@@ -182,8 +182,14 @@ the removal is `sudo dnf remove -y sl`, which works the same way.
 
 The key operation: `dnf.key` manages the target host's rpm keyring in both
 directions. The import direction (`present=True`, the default) is
-**non-idempotent**: like the baseline's `dnf.key` it reads no fact and always
-reports a change (rpm itself deduplicates an already-imported key). Where
+**idempotent when `keyid` names the key** (the `gpg.import_key` precedent,
+Ansible `rpm_key state=present` parity): it reads the
+[`RpmGpgKeys`][reemote.modules.dnf.dnf.RpmGpgKeys] fact and skips the import
+when a matching `gpg-pubkey` entry is already present — the example passes
+`keyid="621E9F35"`, the short id of the Docker key it imports (the last 8
+hex digits of the key's fingerprint). Without `keyid` the direction stays
+stateless: the stream's key id is unknown control-side, so it always reports
+a change (rpm itself deduplicates an already-imported key). Where
 the baseline's `src` is a *filename or URL* the target host reads directly
 (`rpm --import <src>`), reemote has no controller-side file locations, so the
 source is a *stream only* — the example uses a module-level `io.BytesIO`,
@@ -191,7 +197,7 @@ defined once so both phases pass the identical object (request equality
 compares it by identity), and a `str` `src` raises `ValueError`. The stream
 embeds the **real** Docker Release (CE rpm) signing key (the armored body of
 `https://download.docker.com/linux/centos/gpg`), so `rpm --import` accepts it
-rather than rejecting placeholder bytes. The one
+rather than rejecting placeholder bytes. When it does import, the one
 request yields *two* commands at different privilege levels: a transfer that
 spools the stream to a `/tmp` path over scp as the login user (transfers are
 never elevated), then an elevated `rpm --import` of that spool file — wrapped

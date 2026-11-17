@@ -4,9 +4,9 @@
 """Manage the rpm keyring: import a GPG key from a stream, remove a legacy key.
 
 This is a *usage* example, not part of the library. It shows reemote's
-``dnf.key`` operation -- a non-idempotent import direction plus an idempotent
-``present=False`` removal direction -- driven end to end over a **real SSH
-transport** (asyncssh):
+``dnf.key`` operation -- an import direction made idempotent by ``keyid``
+plus an idempotent ``present=False`` removal direction -- driven end to end
+over a **real SSH transport** (asyncssh):
 
 1. Read ``inventory.json`` in the project root and parse it as JSON
    -- an inventory is just a list of dictionaries, which is exactly what
@@ -40,10 +40,15 @@ is read. And because ``OperationRequest`` equality compares a stream
 hence the module-level constant rather than a fresh ``BytesIO`` inside the
 generator (a new object per phase would trip the determinism guard).
 
-The ``present=True`` direction is **non-idempotent** -- like the baseline's
-``dnf.key`` it reads no fact, always reports a change and always imports (rpm
-itself deduplicates an already-imported key), so the plan and the apply log
-agree. The one request
+The ``present=True`` direction is **idempotent when ``keyid`` names the key**
+(the ``gpg.import_key`` precedent, Ansible's ``rpm_key state=present``
+parity): the ``RpmGpgKeys`` fact lists the imported keys, and the import is
+skipped when a matching ``gpg-pubkey`` entry is already present -- so a run
+against a host that already holds the key plans a no-op. The request passes
+``keyid="621E9F35"``, the short id of the Docker key below (the last 8 hex
+digits of its fingerprint); without ``keyid`` the direction stays stateless
+(the stream's key id is unknown control-side, and rpm itself deduplicates an
+already-imported key). When it does import, the one request
 yields *two* commands at different privilege levels: a transfer that spools
 the stream to a ``/tmp`` path over scp as the login user (transfers are never
 elevated), then an elevated ``rpm --import`` of that spool file -- wrapped in
@@ -122,7 +127,9 @@ from reemote import (
 # the real Docker Release (CE rpm) signing key, ASCII-armored -- the body of
 # https://download.docker.com/linux/centos/gpg -- so ``rpm --import`` on the
 # host accepts it instead of rejecting placeholder bytes. Replace the armor
-# with your own vendor key to trust a different repository.
+# with your own vendor key to trust a different repository. Its fingerprint
+# ends ``C52FEB6B621E9F35``, so rpm's short key id is ``621E9F35`` -- the
+# ``keyid`` the import request gates on.
 _DOCKER_RPM_KEY_ARMOR = """\
 -----BEGIN PGP PUBLIC KEY BLOCK-----
 
@@ -196,16 +203,24 @@ def deploy(host: Host) -> Generator[OperationRequest]:
     apply phases (a branch on a mutable fact would raise DeterminismError),
     and identical on every host: eligibility is expressed with the
     ``when=is_centos`` guard each request carries, not with an ``if``.
-    The import request is non-idempotent -- it always imports -- and yields
-    two commands at different privilege levels: an unprivileged scp spool of
+    Both requests are idempotent on ``RpmGpgKeys``. The import request names
+    the Docker key's short id (``keyid="621E9F35"``), so it yields its two
+    commands at different privilege levels -- an unprivileged scp spool of
     ``GPG_KEY`` to a ``/tmp`` path, then the elevated ``rpm --import`` of that
-    path. The removal request is idempotent: it reads ``RpmGpgKeys`` and
-    yields the elevated ``rpm -e`` only when the legacy ``4172A230`` key is
+    path -- only when the key is not yet imported. The removal request yields
+    the elevated ``rpm -e`` only when the legacy ``4172A230`` key is
     in the rpm keyring. Both write to the root-owned rpm database, so both
     requests are flagged ``sudo=True``; the scp transfer stays unprivileged
     regardless.
     """
-    yield op(dnf.key, name="Import GPG key", src=GPG_KEY, sudo=True, when=is_centos)
+    yield op(
+        dnf.key,
+        name="Import GPG key",
+        src=GPG_KEY,
+        keyid="621E9F35",
+        sudo=True,
+        when=is_centos,
+    )
     yield op(
         dnf.key,
         name="Remove legacy GPG key",
@@ -223,8 +238,9 @@ async def main() -> None:
         print(", ".join(entry["host"] for entry in inventory))
 
         # --dry: prepare phase only. Nothing is transferred, imported or
-        # erased, so the plan shows the import change (that direction is
-        # non-idempotent) and the removal's present/absent decision without
+        # erased, so the plan shows the import's present/absent decision (a
+        # host already holding the Docker key plans a no-op) and the
+        # removal's present/absent decision without
         # touching a host. A request the ``when`` guard rejects is planned as
         # [skipped: when guard is_centos] without materializing it.
         plans, _, _hosts = await run(inventory, deploy, dry=True)
@@ -233,8 +249,9 @@ async def main() -> None:
 
         # Real run: prepare, then apply in lockstep across hosts over SSH. Each
         # eligible host spools the key over scp, runs the elevated
-        # rpm --import and removes the spool directory, then erases the legacy
-        # key's pseudo-package if the RpmGpgKeys fact reports it present.
+        # rpm --import and removes the spool directory only when the RpmGpgKeys
+        # fact reports the Docker key absent, then erases the legacy
+        # key's pseudo-package if the fact reports it present.
         plans, report, _hosts = await run(inventory, deploy)
         print("\n== Run log (apply phase) ==")
         assert report is not None

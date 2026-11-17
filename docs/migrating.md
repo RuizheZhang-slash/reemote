@@ -1100,9 +1100,11 @@ signature: an *unprivileged* scp transfer plus an *elevated* `sh -c` install.
 4. **Import a downloaded key as a separate step.** `files.download` lands the key
    *file*; loading it into the rpm keyring is
    [`dnf.key`][reemote.modules.dnf.dnf.key], which takes the key *content* as a
-   control-side IO stream — fetch the same bytes into an `io.BytesIO` for it (its
-   import direction is **non-idempotent**: rpm dedupes, so it re-imports every
-   run). Or skip the explicit import and let the downloaded `.repo`'s `gpgkey=`
+   control-side IO stream — fetch the same bytes into an `io.BytesIO` for it,
+   and pass `keyid=` (the key's short id) to make the import idempotent
+   against the `RpmGpgKeys` fact; without `keyid` the import direction is
+   stateless — rpm dedupes, so it re-imports every run. Or skip the explicit
+   import and let the downloaded `.repo`'s `gpgkey=`
    point dnf at the key.
 
 ### Before / after

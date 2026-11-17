@@ -24,6 +24,7 @@ without decorators.
 
 import asyncio
 import copy
+import hashlib
 import io
 import shlex
 from collections.abc import Generator
@@ -3103,8 +3104,9 @@ KEY_SPOOL_DIR = KEY_SPOOL.rsplit("/", 1)[0]
 
 
 async def test_dnf_key_yields_upload_then_import():
-    """dnf.key is non-idempotent: it always reports a change and yields the
-    spool transfer followed by the elevated import, reading no fact."""
+    """Without keyid the dnf.key import is stateless: it always reports a
+    change and yields the spool transfer followed by the elevated import,
+    reading no fact."""
     host = SimulatedHost(name="h")
     stream = io.BytesIO(GPG_KEY_BYTES)
     ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
@@ -3212,8 +3214,9 @@ async def test_dnf_key_end_to_end_imports_over_run():
 
 
 async def test_dnf_key_dry_run_plans_without_importing():
-    """dry=True materializes the plan (non-idempotent -> changed, two commands)
-    but sends nothing, so no key is imported and no spool file is written."""
+    """dry=True materializes the plan (no keyid -> stateless, changed, two
+    commands) but sends nothing, so no key is imported and no spool file is
+    written."""
     stream = io.BytesIO(GPG_KEY_BYTES)
 
     def key_deploy(host):
@@ -3411,7 +3414,8 @@ async def test_dnf_key_remove_end_to_end_over_run():
     """Through run(): the first removal request erases the seeded key (the
     log shows the elevated rpm -e), and the identical second request is a
     no-op in the apply phase because the fresh per-step fact cache sees the
-    erase -- the idempotence the import direction deliberately lacks."""
+    erase -- the same fact-gated idempotence the import direction has with
+    ``keyid``."""
 
     def key_deploy(host):
         yield op(
@@ -3474,6 +3478,151 @@ async def test_dnf_key_remove_dry_run_plans_without_removing():
     assert planned.changed
     assert len(planned.commands) == 1
     assert host.rpm_gpg_keys == [LEGACY_KEY_ENTRY]
+
+
+# --- dnf.key present=True with keyid (rpm_key state=present idempotence) -----
+
+
+async def test_dnf_key_import_keyid_already_present_is_noop():
+    """With keyid naming a key already in the rpm keyring the import is the
+    idempotent no-op: no change, no commands (Ansible rpm_key state=present
+    parity); the uppercase id normalizes to rpm's lowercase form."""
+    host = SimulatedHost(name="h", rpm_gpg_keys=[dict(LEGACY_KEY_ENTRY)])
+    stream = io.BytesIO(GPG_KEY_BYTES)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in dnf.key(ctx, src=stream, keyid="4172A230")]
+    assert not ctx.changed
+    assert ctx.reason == "GPG key 4172a230 already in the rpm keyring"
+    assert commands == []
+
+
+async def test_dnf_key_import_keyid_absent_still_imports():
+    """With keyid naming a key not yet imported, the upload/import pair is
+    yielded and the request reports a change -- the gate only skips keys the
+    RpmGpgKeys fact actually reports."""
+    host = SimulatedHost(name="h")
+    stream = io.BytesIO(GPG_KEY_BYTES)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in dnf.key(ctx, src=stream, keyid="4172A230")]
+    assert ctx.changed
+    assert ctx.reason == "import GPG key from <stream>"
+    assert commands == [
+        DnfKeyUploadCommand(src=stream, dest=KEY_SPOOL),
+        DnfKeyImportCommand(path=KEY_SPOOL),
+    ]
+
+
+async def test_dnf_key_import_keyid_accepts_a_long_keyid():
+    """A 16-digit long key id matches by its last 8 digits -- the same
+    normalization the removal direction uses."""
+    host = SimulatedHost(name="h", rpm_gpg_keys=[dict(LEGACY_KEY_ENTRY)])
+    stream = io.BytesIO(GPG_KEY_BYTES)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c async for c in dnf.key(ctx, src=stream, keyid="A1B2C3D44172A230")
+    ]
+    assert not ctx.changed
+    assert commands == []
+
+
+async def test_dnf_key_import_without_keyid_stays_stateless():
+    """Without keyid the import reads no fact and always imports, even when
+    the key is already in the rpm keyring (the gpg.import_key precedent: the
+    stream's key id is unknown controller-side)."""
+    host = SimulatedHost(name="h", rpm_gpg_keys=[dict(LEGACY_KEY_ENTRY)])
+    stream = io.BytesIO(GPG_KEY_BYTES)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in dnf.key(ctx, src=stream)]
+    assert ctx.changed
+    assert commands == [
+        DnfKeyUploadCommand(src=stream, dest=KEY_SPOOL),
+        DnfKeyImportCommand(path=KEY_SPOOL),
+    ]
+
+
+async def test_dnf_key_import_blank_keyid_stays_stateless():
+    """A blank keyid is no gate (gpg.import_key's ``if keyid:`` shape): the
+    import runs rather than raising the removal direction's ValueError."""
+    host = SimulatedHost(name="h")
+    stream = io.BytesIO(GPG_KEY_BYTES)
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [c async for c in dnf.key(ctx, src=stream, keyid="   ")]
+    assert ctx.changed
+    assert commands == [
+        DnfKeyUploadCommand(src=stream, dest=KEY_SPOOL),
+        DnfKeyImportCommand(path=KEY_SPOOL),
+    ]
+
+
+async def test_dnf_key_import_keyid_second_deploy_is_noop():
+    """Through run(), twice over one persistent host: the first deploy
+    imports (the simulated seam records a stub gpg-pubkey entry whose keyid
+    is the content hash's last 8 digits), and the identical second deploy is
+    a full no-op -- no transfer, no import, changed=False."""
+    stub_keyid = hashlib.sha256(GPG_KEY_BYTES).hexdigest()[-8:]
+    stream = io.BytesIO(GPG_KEY_BYTES)
+
+    def key_deploy(host):
+        yield op(
+            dnf.key,
+            name="Import GPG key",
+            src=stream,
+            keyid=stub_keyid,
+            sudo=True,
+        )
+
+    host = SimulatedHost(name="h")
+
+    def factory(entry):
+        return host
+
+    _plans, report, _hosts = await run(
+        [{"host": "h", "connection": {}}], key_deploy, host_factory=factory
+    )
+    (entry,) = report.log
+    assert entry.changed
+    assert entry.commands == (
+        DnfKeyUploadCommand(src=stream, dest=KEY_SPOOL),
+        DnfKeyImportCommand(path=KEY_SPOOL),
+    )
+    assert host.imported_keys == {GPG_KEY_BYTES}
+    _plans, report, _hosts = await run(
+        [{"host": "h", "connection": {}}], key_deploy, host_factory=factory
+    )
+    (entry,) = report.log
+    assert not entry.changed
+    assert entry.commands == ()
+    assert host.imported_keys == {GPG_KEY_BYTES}
+    assert len(host.rpm_gpg_keys) == 1
+
+
+async def test_dnf_key_import_keyid_dry_run_noop_when_present():
+    """dry=True with the key already imported plans the no-op (changed=False,
+    zero commands) and sends nothing -- the plan a converged host sees."""
+    stream = io.BytesIO(GPG_KEY_BYTES)
+
+    def key_deploy(host):
+        yield op(
+            dnf.key,
+            name="Import GPG key",
+            src=stream,
+            keyid="4172A230",
+            sudo=True,
+        )
+
+    host = SimulatedHost(name="h", rpm_gpg_keys=[dict(LEGACY_KEY_ENTRY)])
+    plans, report, _hosts = await run(
+        [{"host": "h", "connection": {}}],
+        key_deploy,
+        host_factory=lambda entry: host,
+        dry=True,
+    )
+    assert report is None
+    (planned,) = plans["h"]
+    assert not planned.changed
+    assert planned.commands == ()
+    assert host.imported_keys == set()
+    assert host.remote_files == {}
 
 
 # --- dnf.module operation (baseline parity) -----------------------------------

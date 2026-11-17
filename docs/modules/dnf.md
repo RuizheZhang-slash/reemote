@@ -63,8 +63,12 @@ full system upgrade) and `clean=True` (`dnf clean all`) cannot express.
 `proxy_username`, `proxy_password`); each is omitted from the constructed
 file when unset, and a `proxy_password` installs the file `0600` instead
 of `0644`. `dnf.key` is bidirectional: the import
-direction (`present=True`, the default) stays non-idempotent and uploads a
-GPG key stream, while the removal direction (`present=False`, Ansible
+direction (`present=True`, the default) uploads a
+GPG key stream and is idempotent when `keyid` names the key — it reads
+`RpmGpgKeys` and skips the upload/import pair when a matching `gpg-pubkey`
+entry is already imported (the `gpg.import_key` precedent, Ansible
+`rpm_key state=present` parity); without `keyid` it stays stateless. The
+removal direction (`present=False`, Ansible
 `rpm_key state=absent` parity) reads `RpmGpgKeys` and idempotently erases the
 matching `gpg-pubkey` pseudo-packages with an elevated `rpm -e`.
 
